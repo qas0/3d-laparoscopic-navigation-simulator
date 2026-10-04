@@ -6,14 +6,16 @@ import numpy as np
 import pyvista as pv
 from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFrame, QGroupBox, QHBoxLayout, QLabel,
-    QMainWindow, QPushButton, QScrollArea, QSlider, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame,
+    QGroupBox, QHBoxLayout, QLabel, QMainWindow, QPushButton, QScrollArea,
+    QSlider, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 from pyvistaqt import QtInteractor
 
 from astar import find_path
 from geometry import movement_is_clear, shaft_clearance, tip_position
 from scenarios import SCENARIOS
+from sensors import measure_position
 
 
 class SimulatorWindow(QMainWindow):
@@ -57,8 +59,11 @@ class SimulatorWindow(QMainWindow):
             QPushButton:hover { background: #e8f0f6; }
             QPushButton:checked { background: #dbeaf5; border-color: #4688b6; }
             QPushButton:disabled { color: #8997a3; background: #f0f3f5; }
-            QComboBox { background: white; border: 1px solid #bdcbd6;
-                        border-radius: 5px; padding: 5px; }
+            QComboBox, QDoubleSpinBox, QSpinBox { background: white;
+                        border: 1px solid #bdcbd6; border-radius: 5px; padding: 5px; }
+            QTabWidget::pane { border: none; }
+            QTabBar::tab { background: #e8eef3; padding: 8px 16px; }
+            QTabBar::tab:selected { background: white; color: #286e9f; }
             QSlider::groove:horizontal { height: 5px; background: #d4dfe7; border-radius: 2px; }
             QSlider::handle:horizontal { background: #286e9f; width: 15px;
                                         margin: -5px 0; border-radius: 7px; }
@@ -80,11 +85,13 @@ class SimulatorWindow(QMainWindow):
         control_layout = QVBoxLayout(controls)
         control_layout.setContentsMargins(16, 16, 16, 16)
         control_scroll = QScrollArea()
-        control_scroll.setFixedWidth(320)
         control_scroll.setWidgetResizable(True)
         control_scroll.setFrameShape(QFrame.Shape.NoFrame)
         control_scroll.setWidget(controls)
-        body.addWidget(control_scroll)
+        self.control_tabs = QTabWidget()
+        self.control_tabs.setFixedWidth(320)
+        self.control_tabs.addTab(control_scroll, "Navigation")
+        body.addWidget(self.control_tabs)
 
         scenario_title = QLabel("Scenario")
         scenario_title.setStyleSheet("font-weight: bold;")
@@ -169,6 +176,69 @@ class SimulatorWindow(QMainWindow):
         scene_note.setWordWrap(True)
         control_layout.addWidget(scene_note)
 
+        sensor_controls = QFrame()
+        sensor_controls.setObjectName("controls")
+        sensor_layout = QVBoxLayout(sensor_controls)
+        sensor_layout.setContentsMargins(16, 16, 16, 16)
+        sensor_scroll = QScrollArea()
+        sensor_scroll.setWidgetResizable(True)
+        sensor_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        sensor_scroll.setWidget(sensor_controls)
+        self.control_tabs.addTab(sensor_scroll, "Sensors")
+
+        sensor_group = QGroupBox("Position measurements")
+        sensor_settings = QFormLayout(sensor_group)
+        self.tool_noise = QDoubleSpinBox()
+        self.target_noise = QDoubleSpinBox()
+        for setting, value in [(self.tool_noise, 1.0), (self.target_noise, 2.0)]:
+            setting.setRange(0.0, 10.0)
+            setting.setDecimals(1)
+            setting.setSingleStep(0.1)
+            setting.setSuffix(" mm")
+            setting.setKeyboardTracking(False)
+            setting.setValue(value)
+            setting.setToolTip("Gaussian noise standard deviation for each coordinate.")
+        sensor_settings.addRow("Tool noise σ", self.tool_noise)
+        sensor_settings.addRow("Target noise σ", self.target_noise)
+        self.sensor_seed = QSpinBox()
+        self.sensor_seed.setRange(0, 999999)
+        self.sensor_seed.setValue(42)
+        self.sensor_seed.setKeyboardTracking(False)
+        self.sensor_seed.setToolTip("Repeats the same sequence of sensor noise.")
+        sensor_settings.addRow("Noise seed", self.sensor_seed)
+        sensor_layout.addWidget(sensor_group)
+        self.restart_sensor_button = QPushButton("Restart noise sequence")
+        self.restart_sensor_button.clicked.connect(self.reset_measurements)
+        sensor_layout.addWidget(self.restart_sensor_button)
+        self.measurements_checkbox = QCheckBox("Show measurement markers")
+        self.measurements_checkbox.setChecked(True)
+        self.measurements_checkbox.toggled.connect(self.toggle_measurements)
+        sensor_layout.addWidget(self.measurements_checkbox)
+        sensor_note = QLabel("σ is the standard deviation for each coordinate.\n"
+                            "Sampling rate: 10 Hz.\n\n"
+                            "The seed repeats sensor noise. Instrument resets stay random.")
+        sensor_note.setWordWrap(True)
+        sensor_layout.addWidget(sensor_note)
+        measurements_group = QGroupBox("Latest observations")
+        measurements_layout = QVBoxLayout(measurements_group)
+        self.tool_measurement_label = QLabel()
+        self.target_measurement_label = QLabel()
+        self.measurement_error_label = QLabel()
+        for label in (self.tool_measurement_label, self.target_measurement_label,
+                      self.measurement_error_label):
+            label.setWordWrap(True)
+            measurements_layout.addWidget(label)
+        sensor_layout.addWidget(measurements_group)
+        self.measurement_count_label = QLabel()
+        sensor_layout.addWidget(self.measurement_count_label)
+        sensor_layout.addStretch()
+        sensor_baseline = QLabel("Markers show raw measurements.\n"
+                                "Navigation currently uses true positions.")
+        sensor_baseline.setWordWrap(True)
+        sensor_layout.addWidget(sensor_baseline)
+        for setting in (self.tool_noise, self.target_noise, self.sensor_seed):
+            setting.valueChanged.connect(self.reset_measurements)
+
         self.viewport = QtInteractor(central, auto_update=False)
         body.addWidget(self.viewport.interactor, 1)
         self.viewport.set_background("#f2f6f9")
@@ -184,6 +254,8 @@ class SimulatorWindow(QMainWindow):
         self.message_label = QLabel("Ready for manual movement.")
         self.message_label.setWordWrap(True)
         layout.addWidget(self.message_label)
+        self.sensor_timer = QTimer(self)
+        self.sensor_timer.timeout.connect(self.update_measurements)
         self.load_scenario(self.scenario_combo.currentIndex())
         self.scenario_combo.currentIndexChanged.connect(self.load_scenario)
 
@@ -209,6 +281,7 @@ class SimulatorWindow(QMainWindow):
         self.viewport.clear()
         self.build_scene()
         self.update_instrument()
+        self.reset_measurements()
         self.message_label.setText(f"{self.scenario_name} loaded. Plan a route or use manual controls.")
 
     def build_scene(self):
@@ -230,6 +303,14 @@ class SimulatorWindow(QMainWindow):
             color="#526b80", smooth_shading=True)
         self.tip_actor = self.viewport.add_mesh(pv.Sphere(radius=self.tool_radius),
                                                 color="#d59420", smooth_shading=True)
+        self.tool_measurement_actor = self.viewport.add_mesh(
+            pv.Sphere(radius=2.0, theta_resolution=16, phi_resolution=12),
+            color="#287dc0", style="wireframe", line_width=2)
+        self.target_measurement_actor = self.viewport.add_mesh(
+            pv.Sphere(radius=2.4, theta_resolution=16, phi_resolution=12),
+            color="#b050a2", style="wireframe", line_width=2)
+        for actor in (self.tool_measurement_actor, self.target_measurement_actor):
+            actor.SetVisibility(self.measurements_checkbox.isChecked())
         self.label_actor = self.viewport.add_point_labels(
             np.array([self.port, self.target, self.structure_centre,
                       self.organ_centre + np.array([0.0, 0.0, 22.0])]),
@@ -242,7 +323,9 @@ class SimulatorWindow(QMainWindow):
             ["Instrument", "#526b80", "line"], ["Tool tip", "#d59420", "circle"],
             ["Target", "#199a78", "circle"], ["Protected structure", "#bc4046", "circle"],
             ["Planned tip trajectory", "#7757b5", "line"],
-        ], bcolor="white", border=False, size=(0.31, 0.16), loc="upper left", font_family="arial")
+            ["Measured tool tip", "#287dc0", "circle"],
+            ["Measured target", "#b050a2", "circle"],
+        ], bcolor="white", border=False, size=(0.31, 0.22), loc="upper left", font_family="arial")
         self.reset_camera()
 
     def reset_camera(self):
@@ -404,7 +487,42 @@ class SimulatorWindow(QMainWindow):
         self.scenario_description.setText("Random start. Target and protected structure stay fixed.")
         self.update_instrument()
         self.viewport.reset_camera()
+        self.reset_measurements()
         self.message_label.setText("Instrument reset to a new random starting position. Plan a new route or use manual controls.")
+
+    def reset_measurements(self):
+        # restarts sensor noise separately from random instrument positions
+        self.sensor_generator = np.random.default_rng(self.sensor_seed.value())
+        self.measurement_count = 0
+        self.sensor_timer.start(100)
+        self.update_measurements()
+
+    def update_measurements(self):
+        tool_tip = tip_position(self.port, *self.configuration)
+        self.tool_measurement = measure_position(
+            tool_tip, self.tool_noise.value(), self.sensor_generator)
+        self.target_measurement = measure_position(
+            self.target, self.target_noise.value(), self.sensor_generator)
+        self.measurement_count += 1
+        self.tool_measurement_actor.SetPosition(*self.tool_measurement)
+        self.target_measurement_actor.SetPosition(*self.target_measurement)
+        self.tool_measurement_label.setText(
+            "Measured tool tip (mm)\n" + " / ".join(
+                f"{axis} {value:.2f}" for axis, value in zip("XYZ", self.tool_measurement)))
+        self.target_measurement_label.setText(
+            "Measured target (mm)\n" + " / ".join(
+                f"{axis} {value:.2f}" for axis, value in zip("XYZ", self.target_measurement)))
+        tool_error = np.linalg.norm(self.tool_measurement - tool_tip)
+        target_error = np.linalg.norm(self.target_measurement - self.target)
+        self.measurement_error_label.setText(
+            f"Noise error at sample (mm)\nTool {tool_error:.2f} · Target {target_error:.2f}")
+        self.measurement_count_label.setText(f"Measurement samples: {self.measurement_count}")
+        self.viewport.render()
+
+    def toggle_measurements(self, visible):
+        self.tool_measurement_actor.SetVisibility(visible)
+        self.target_measurement_actor.SetVisibility(visible)
+        self.viewport.render()
 
     def toggle_labels(self, visible):
         self.label_actor.SetVisibility(visible)
@@ -510,6 +628,7 @@ class SimulatorWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.timer.stop()
+        self.sensor_timer.stop()
         if self.planning_cancel is not None:
             self.planning_cancel.set()
         self.executor.shutdown(wait=False, cancel_futures=True)
