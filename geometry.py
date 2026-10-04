@@ -26,7 +26,7 @@ def shaft_clearance(port, tip, tool_radius, structure_centre, structure_radius):
     offset = np.asarray(structure_centre) - port
     squared_length = np.dot(shaft, shaft)
     projection = 0.0 if squared_length == 0 else np.dot(offset, shaft) / squared_length
-    closest_point = port + np.clip(projection, 0.0, 1.0) * shaft
+    closest_point = port + min(max(projection, 0.0), 1.0) * shaft
     return float(np.linalg.norm(np.asarray(structure_centre) - closest_point)
                  - structure_radius - tool_radius)
 

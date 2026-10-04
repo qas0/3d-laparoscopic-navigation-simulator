@@ -135,6 +135,69 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(find_path(start=[0, 0, 35], **dict(settings, target=[200, 0, 0]))
                          ["status"], "invalid_target")
 
+    def test_optional_target_insertion_reaches_an_off_grid_observation(self):
+        settings = dict(self.settings, target=np.array([90.0, -2.5, 1.5]))
+        start = np.array([0.0, 0.0, 35.0])
+        self.assertEqual(find_path(start=start, **settings)["status"], "no_grid_goal")
+        result = find_path(start=start, include_target=True, **settings)
+        self.check_route(result, start, settings)
+        # follows supplied observation rather than the original scene target
+        self.assertLess(tip_position(settings["port"], *result["path"][-1])[1], -1.0)
+
+    def test_optional_target_insertion_preserves_an_off_grid_start(self):
+        settings = dict(self.settings, target=np.array([90.0, -2.5, 1.5]))
+        start = np.array([np.deg2rad(1.3), np.deg2rad(-2.1), 36.7])
+        result = find_path(start=start, include_target=True, **settings)
+        self.check_route(result, start, settings)
+
+    def test_optional_target_insertion_handles_an_exact_off_grid_goal(self):
+        settings = dict(self.settings, target_tolerance=0.0,
+                        structure_centre=np.array([500.0, 500.0, 500.0]))
+        configuration = np.array([np.deg2rad(-1.3), np.deg2rad(0.7), 91.4])
+        settings["target"] = tip_position(settings["port"], *configuration)
+        start = np.array([0.0, 0.0, 35.0])
+        self.assertEqual(find_path(start=start, **settings)["status"], "no_grid_goal")
+        result = find_path(start=start, include_target=True, **settings)
+        self.check_route(result, start, settings)
+        np.testing.assert_allclose(result["path"][-1], configuration, atol=1e-12, rtol=0)
+
+    def test_optional_target_insertion_uses_the_nearest_legal_depth(self):
+        settings = dict(self.settings)
+        settings["target"] = tip_position(settings["port"], np.deg2rad(-1.6),
+                                          np.deg2rad(1.1), 111.5)
+        start = np.array([0.0, 0.0, 35.0])
+        self.assertEqual(find_path(start=start, **settings)["status"], "no_grid_goal")
+        result = find_path(start=start, include_target=True, **settings)
+        self.check_route(result, start, settings)
+        self.assertTrue(np.all(result["path"] >= settings["lower_limits"]))
+        self.assertTrue(np.all(result["path"] <= settings["upper_limits"]))
+        self.assertAlmostEqual(result["path"][-1, 2], 110.0)
+
+    def test_optional_target_insertion_still_rejects_infeasible_goals(self):
+        start = np.array([0.0, 0.0, 35.0])
+        for changes in [{"target": np.array([200.0, 0.0, 0.0])},
+                        {"structure_centre": np.array([65.0, 0.0, 0.0])}]:
+            with self.subTest(changes=changes):
+                result = find_path(start=start, include_target=True,
+                                   **dict(self.settings, **changes))
+                self.assertEqual(result["status"], "invalid_target")
+                self.assertIsNone(result["path"])
+
+    def test_optional_target_insertion_does_not_skip_a_blocked_sweep(self):
+        settings = dict(self.settings, tool_radius=1.0, structure_radius=3.0,
+                        structure_centre=np.array([50.0, 0.0, 0.0]),
+                        lower_limits=np.array([-0.3, 0, 100.0]),
+                        upper_limits=np.array([0.3, 0, 100.0]),
+                        grid_step=np.array([0.6, 0.1, 5.0]), required_clearance=0.0)
+        start = np.array([-0.3, 0, 100.0])
+        settings["target"] = tip_position(settings["port"], 0.27, 0, 100.0)
+        self.assertGreater(shaft_clearance(settings["port"], settings["target"],
+                                          settings["tool_radius"], settings["structure_centre"],
+                                          settings["structure_radius"]), 0)
+        result = find_path(start=start, include_target=True, **settings)
+        self.assertEqual(result["status"], "no_path")
+        self.assertIsNone(result["path"])
+
     def test_target_tolerance_can_include_a_point_outside_insertion_limits(self):
         settings = dict(self.settings, target=np.array([112.0, 0, 0]))
         start = np.array([0.0, 0.0, 35.0])

@@ -25,7 +25,8 @@ def reconstruct_path(parents, node):
 
 def find_path(start, target, port, tool_radius, structure_centre, structure_radius,
               lower_limits, upper_limits, required_clearance=2.0, target_tolerance=2.0,
-              grid_step=None, max_expansions=10000, time_limit=5.0, cancel_event=None):
+              grid_step=None, max_expansions=10000, time_limit=5.0, cancel_event=None,
+              include_target=False):
     # searches yaw, pitch + insertion; angles use radians, distances use mm
     started = perf_counter()
     expanded = 0
@@ -67,16 +68,19 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
     offset = target - port
     target_yaw = np.arctan2(offset[1], offset[0])
     best_projection = -np.inf
+    best_yaw, best_pitch = lower_limits[:2]
     for yaw in (lower_limits[0], upper_limits[0],
                 np.clip(target_yaw, lower_limits[0], upper_limits[0])):
         horizontal = offset[0] * np.cos(yaw) + offset[1] * np.sin(yaw)
         pitch = np.clip(np.arctan2(offset[2], horizontal), lower_limits[1], upper_limits[1])
         for angle in (lower_limits[1], upper_limits[1], pitch):
             projection = horizontal * np.cos(angle) + offset[2] * np.sin(angle)
-            best_projection = max(best_projection, projection)
+            if projection > best_projection:
+                best_projection = projection
+                best_yaw, best_pitch = yaw, angle
     depth = np.clip(best_projection, lower_limits[2], upper_limits[2])
-    closest_distance = np.sqrt(max(0.0, np.dot(offset, offset)
-                                   + depth * depth - 2 * depth * best_projection))
+    closest_configuration = np.array([best_yaw, best_pitch, depth])
+    closest_distance = np.linalg.norm(tip_position(port, *closest_configuration) - target)
     target_clearance = shaft_clearance(port, target, tool_radius,
                                        structure_centre, structure_radius)
     # rejects a target only when its entire tolerance region is infeasible
@@ -99,6 +103,10 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
             values[matching[0]] = start[axis]
         else:
             values = np.sort(np.append(values, start[axis]))
+        # includes a supplied target configuration while preserving the actual start
+        if include_target and not np.any(np.isclose(
+                values, closest_configuration[axis], atol=1e-12, rtol=0)):
+            values = np.sort(np.append(values, closest_configuration[axis]))
         axes.append(values)
         start_node.append(int(np.argmin(abs(values - start[axis]))))
     start_node = tuple(start_node)
@@ -124,7 +132,6 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
     costs = {start_node: 0.0}
     parents = {}
     visited = set()
-    valid_edges = {}
     while frontier:
         if cancel_event is not None and cancel_event.is_set():
             return finish("cancelled")
@@ -161,12 +168,8 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
             candidate_cost = cost + travel
             if candidate_cost >= costs.get(neighbour, np.inf):
                 continue
-            edge = tuple(sorted((node, neighbour)))
-            if edge not in valid_edges:
-                valid_edges[edge] = movement_is_clear(
-                    port, configuration, proposed, tool_radius,
-                    structure_centre, structure_radius, required_clearance)
-            if not valid_edges[edge]:
+            if not movement_is_clear(port, configuration, proposed, tool_radius,
+                                     structure_centre, structure_radius, required_clearance):
                 continue
             costs[neighbour] = candidate_cost
             parents[neighbour] = node
