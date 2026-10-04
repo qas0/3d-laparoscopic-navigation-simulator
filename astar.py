@@ -37,16 +37,16 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
     grid_step = np.asarray(grid_step, dtype=float)
     vectors = (start, target, port, structure_centre, lower_limits, upper_limits, grid_step)
     if any(value.shape != (3,) or not np.all(np.isfinite(value)) for value in vectors):
-        raise ValueError("Positions, limits and grid steps must contain three finite values.")
+        raise ValueError("Expected three finite values.")
     scalars = [tool_radius, structure_radius, required_clearance, target_tolerance, time_limit]
     if not np.all(np.isfinite(scalars)) or min(scalars) < 0 or time_limit == 0:
-        raise ValueError("Radii and tolerances must be nonnegative; time limit must be positive.")
+        raise ValueError("Invalid radius, tolerance or time limit.")
     if (np.any(grid_step <= 0) or np.any(lower_limits > upper_limits)
             or lower_limits[2] < 0 or max_expansions < 1):
-        raise ValueError("Grid steps and search budget must be positive; limits must be ordered.")
+        raise ValueError("Invalid grid, limits or search budget.")
     if (lower_limits[0] < -np.pi or upper_limits[0] > np.pi
             or lower_limits[1] < -np.pi / 2 or upper_limits[1] > np.pi / 2):
-        raise ValueError("Yaw limits must lie within +/-180 degrees; pitch within +/-90 degrees.")
+        raise ValueError("Yaw or pitch limits out of range.")
 
     def finish(status, path=None, cost=None):
         return {"status": status, "path": path, "cost": cost,

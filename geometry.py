@@ -12,14 +12,14 @@ def instrument_direction(yaw, pitch):
 
 def tip_position(port, yaw, pitch, insertion_depth):
     if insertion_depth < 0:
-        raise ValueError("Insertion depth cannot be negative.")
+        raise ValueError("Negative insertion depth.")
     return np.asarray(port) + insertion_depth * instrument_direction(yaw, pitch)
 
 
 def shaft_clearance(port, tip, tool_radius, structure_centre, structure_radius):
     # calculates shaft clearance in mm; negative values mean overlap
     if tool_radius < 0 or structure_radius < 0:
-        raise ValueError("Radii cannot be negative.")
+        raise ValueError("Negative radius.")
 
     port = np.asarray(port)
     shaft = np.asarray(tip) - port
@@ -35,12 +35,17 @@ def movement_is_clear(port, start, end, tool_radius, structure_centre,
                       structure_radius, required_clearance=0.0, max_step=0.5):
     # checks linear movement between (yaw, pitch, depth) configurations
     # uses radians + mm; max_step bounds shaft displacement per interval
-    start = np.asarray(start, dtype=float)
-    end = np.asarray(end, dtype=float)
-    if not np.all(np.isfinite(start)) or not np.all(np.isfinite(end)):
-        raise ValueError("Configurations must contain finite values.")
+    port, start, end, structure_centre = (
+        np.asarray(value, dtype=float) for value in (port, start, end, structure_centre))
+    vectors = (port, start, end, structure_centre)
+    if any(value.shape != (3,) or not np.all(np.isfinite(value)) for value in vectors):
+        raise ValueError("Expected three finite values.")
+    if not np.all(np.isfinite([tool_radius, structure_radius, required_clearance, max_step])):
+        raise ValueError("Non-finite radius, clearance or step.")
+    if tool_radius < 0 or structure_radius < 0:
+        raise ValueError("Negative radius.")
     if start[2] < 0 or end[2] < 0 or max_step <= 0 or required_clearance < 0:
-        raise ValueError("Depth and clearance must be nonnegative; max_step must be positive.")
+        raise ValueError("Invalid depth, clearance or step.")
 
     change = end - start
     if not np.any(change[:2]):

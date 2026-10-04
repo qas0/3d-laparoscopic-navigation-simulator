@@ -36,6 +36,22 @@ class GeometryTests(unittest.TestCase):
                                               1, centre, 3), 0)
         self.assertFalse(movement_is_clear(port, start, end, 1, centre, 3))
 
+    def test_movement_rejects_invalid_geometry(self):
+        settings = {
+            "port": [0, 0, 0], "start": [-0.3, 0, 100], "end": [0.3, 0, 100],
+            "tool_radius": 1, "structure_centre": [50, 0, 0], "structure_radius": 3,
+        }
+        self.assertFalse(movement_is_clear(**settings))
+        # rejects non-finite geometry before checking shaft movement
+        for values in [
+            {"structure_centre": [50, np.nan, 0]}, {"structure_radius": np.nan},
+            {"tool_radius": np.inf}, {"required_clearance": np.nan},
+            {"max_step": np.nan}, {"port": [np.inf, 0, 0]}, {"start": [0, 100]},
+            {"tool_radius": -1},
+        ]:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                movement_is_clear(**dict(settings, **values))
+
     def test_guard_detects_collision_between_midpoint_samples(self):
         # checks a crossing at yaw zero between clear samples at +/-0.01 radians
         start, end = [-0.02, 0, 100], [0.02, 0, 100]
