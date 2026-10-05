@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from sensors import measure_position
+from sensors import ApplyDropout, measure_position
 
 
 class SensorTests(unittest.TestCase):
@@ -65,6 +65,49 @@ class SensorTests(unittest.TestCase):
         for sigma in [-1.0, np.nan, np.inf, -np.inf, [1.0], [[1.0]]]:
             with self.subTest(sigma=sigma), self.assertRaises(ValueError):
                 measure_position([1, 2, 3], sigma, np.random.default_rng(1))
+
+    def test_DropoutExtremesKeepReadingsAndDrawSequence(self):
+        position = np.array([90.0, -4.0, 3.0])
+        original = position.copy()
+        random_generator = np.random.default_rng(62)
+        repeated = np.random.default_rng(62)
+        self.assertIs(ApplyDropout(position, 0.0, random_generator), position)
+        self.assertIsNone(ApplyDropout(position, 1.0, random_generator))
+        np.testing.assert_array_equal(position, original)
+        repeated.random(2)
+        self.assertEqual(random_generator.random(), repeated.random())
+
+    def test_DropoutSeedRepeatsMasksWithMonotonicThresholds(self):
+        position = np.array([90.0, -4.0, 3.0])
+        low_generator = np.random.default_rng(63)
+        repeated_generator = np.random.default_rng(63)
+        high_generator = np.random.default_rng(63)
+        for _ in range(200):
+            low = ApplyDropout(position, 0.25, low_generator) is None
+            repeated = ApplyDropout(position, 0.25, repeated_generator) is None
+            high = ApplyDropout(position, 0.75, high_generator) is None
+            self.assertEqual(low, repeated)
+            if low:
+                self.assertTrue(high)
+
+    def test_DropoutAvailabilityMatchesProbability(self):
+        probability = 0.3
+        count = 10000
+        random_generator = np.random.default_rng(64)
+        position = np.array([90.0, -4.0, 3.0])
+        available = sum(ApplyDropout(position, probability, random_generator) is not None
+                        for _ in range(count))
+        # checks the availability fraction within six Bernoulli standard errors
+        standard_error = np.sqrt(probability * (1 - probability) / count)
+        self.assertLess(abs(available / count - (1 - probability)), 6 * standard_error)
+
+    def test_InvalidDropoutInputsAreRejected(self):
+        for probability in [-0.1, 1.1, np.nan, np.inf, -np.inf, [0.5], [[0.5]], "invalid"]:
+            with self.subTest(probability=probability), self.assertRaises(ValueError):
+                ApplyDropout([1, 2, 3], probability, np.random.default_rng(1))
+        for position in [None, [], [1, 2], [[1, 2, 3]], [np.nan, 0, 0], [np.inf, 0, 0]]:
+            with self.subTest(position=position), self.assertRaises(ValueError):
+                ApplyDropout(position, 1.0, np.random.default_rng(1))
 
 
 if __name__ == "__main__":

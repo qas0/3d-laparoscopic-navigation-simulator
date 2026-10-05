@@ -20,7 +20,11 @@ from feedback import get_target_feedback
 from geometry import movement_is_clear, shaft_clearance, tip_position
 from kalman import KalmanFilter
 from scenarios import SCENARIOS
-from sensors import measure_position
+from sensors import ApplyDropout, measure_position
+
+
+def FormatReading(value):
+    return "—" if value is None or not np.isfinite(value) else f"{value:.2f}"
 
 
 class SimulatorWindow(QMainWindow):
@@ -41,6 +45,7 @@ class SimulatorWindow(QMainWindow):
         self.speed_limits = np.array([np.deg2rad(20), np.deg2rad(20), 15.0])
         self.target_tolerance = 2.0
         self.arrival_dwell = 0.5
+        self.tracking_timeout = 0.25
         self.route_feedback_active = False
         self.route_finished_time = None
         self.route_result = None
@@ -117,8 +122,7 @@ class SimulatorWindow(QMainWindow):
         self.scenario_combo = QComboBox()
         self.scenario_combo.addItems(list(SCENARIOS))
         control_layout.addWidget(self.scenario_combo)
-        self.scenario_description = QLabel()
-        self.scenario_description.setWordWrap(True)
+        self.scenario_description = QLabel(wordWrap=True)
         control_layout.addWidget(self.scenario_description)
         control_layout.addWidget(QLabel("Guidance source"))
         self.navigation_mode_combo = QComboBox()
@@ -138,9 +142,8 @@ class SimulatorWindow(QMainWindow):
             ("Insertion", 10, 110, 35, "mm"),
         ]):
             label = QLabel(f"{name}: {value:.1f} {unit}")
-            slider = QSlider(Qt.Orientation.Horizontal)
-            slider.setRange(minimum * 10, maximum * 10)
-            slider.setValue(value * 10)
+            slider = QSlider(Qt.Orientation.Horizontal, minimum=minimum * 10,
+                             maximum=maximum * 10, value=value * 10)
             slider.setToolTip(f"Command {name.lower()}; actual position appears below.")
             slider.valueChanged.connect(lambda _, axis=index: self.set_command(axis))
             instrument_layout.addWidget(label)
@@ -156,19 +159,11 @@ class SimulatorWindow(QMainWindow):
         self.planning_mode_combo.addItem("Proximity-aware A*", "prox_aware")
         self.planning_mode_combo.addItem("Uncertainty-aware A*", "uncert_aware")
         self.planning_mode_combo.setToolTip("All methods enforce shaft clearance. Uncertainty mode adds a frozen tool-tracking margin. Changing method cancels the route.")
-        self.proximity_weight = QDoubleSpinBox()
-        self.proximity_weight.setRange(0.0, 10.0)
-        self.proximity_weight.setSingleStep(0.5)
-        self.proximity_weight.setDecimals(1)
-        self.proximity_weight.setValue(1.0)
-        self.proximity_weight.setEnabled(False)
+        self.proximity_weight = QDoubleSpinBox(minimum=0.0, maximum=10.0, singleStep=0.5,
+                                              decimals=1, value=1.0, enabled=False)
         self.proximity_weight.setToolTip("Zero uses travel cost only. Higher weights discourage close passes; the penalty decays over 5 mm above the base clearance.")
-        self.uncertainty_scale = QDoubleSpinBox()
-        self.uncertainty_scale.setRange(0.0, 5.0)
-        self.uncertainty_scale.setSingleStep(0.5)
-        self.uncertainty_scale.setDecimals(1)
-        self.uncertainty_scale.setValue(1.0)
-        self.uncertainty_scale.setEnabled(False)
+        self.uncertainty_scale = QDoubleSpinBox(minimum=0.0, maximum=5.0, singleStep=0.5,
+                                               decimals=1, value=1.0, enabled=False)
         self.uncertainty_scale.setToolTip("Adds filtered tool-tip disagreement + k times the largest-direction standard deviation. Zero k keeps the disagreement term. k is an experimental sensitivity, not a confidence percentage.")
         planning_settings = QFormLayout()
         planning_settings.setHorizontalSpacing(4)
@@ -176,46 +171,36 @@ class SimulatorWindow(QMainWindow):
         planning_settings.addRow("Proximity weight", self.proximity_weight)
         planning_settings.addRow("Uncertainty k", self.uncertainty_scale)
         planning_layout.addLayout(planning_settings)
-        self.plan_button = QPushButton("Plan route")
-        self.plan_button.setObjectName("primary")
+        self.plan_button = QPushButton("Plan route", objectName="primary")
         self.plan_button.clicked.connect(self.plan_path)
-        self.follow_button = QPushButton("Follow route")
+        self.follow_button = QPushButton("Follow route", enabled=False)
         self.follow_button.setToolTip("Automatically executes a freshly planned route for comparison. Manual controls keep the route as a reference.")
-        self.follow_button.setEnabled(False)
         self.follow_button.clicked.connect(self.follow_path)
-        self.cancel_button = QPushButton("Cancel route")
-        self.cancel_button.setEnabled(False)
+        self.cancel_button = QPushButton("Cancel route", enabled=False)
         self.cancel_button.clicked.connect(self.stop_path)
         route_buttons = QHBoxLayout()
         route_buttons.addWidget(self.plan_button)
         route_buttons.addWidget(self.follow_button)
         planning_layout.addLayout(route_buttons)
         planning_layout.addWidget(self.cancel_button)
-        self.plan_label = QLabel("Grid: 5° yaw / pitch + 5 mm insertion\nTarget tolerance: 2 mm")
-        self.plan_label.setWordWrap(True)
-        self.plan_label.setMinimumHeight(52)
+        self.plan_label = QLabel("Grid: 5° yaw / pitch + 5 mm insertion\nTarget tolerance: 2 mm",
+                                 wordWrap=True, minimumHeight=52)
         planning_layout.addWidget(self.plan_label)
-        self.margin_label = QLabel()
-        self.margin_label.setWordWrap(True)
-        self.margin_label.setVisible(False)
+        self.margin_label = QLabel(wordWrap=True, visible=False)
         self.margin_label.setToolTip("Uses filtered tool tracking independently of target guidance. The fixed-port model assumes the frozen endpoint-error bound applies throughout this route. Static known geometry and configuration remain the baseline; tracking changes do not update this margin automatically.")
         planning_layout.addWidget(self.margin_label)
-        self.route_result_label = QLabel()
-        self.route_result_label.setWordWrap(True)
-        self.route_result_label.setMinimumHeight(50)
-        self.route_result_label.setVisible(False)
+        self.route_result_label = QLabel(wordWrap=True, minimumHeight=50, visible=False)
         self.route_result_label.setToolTip("Tip-to-guide distance uses the selected tracking source + the displayed tip polyline. It does not check shaft clearance or prove that the instrument follows the planned configurations. Tracking changes must persist for 0.5 s before a replan warning stays visible.")
         planning_layout.addWidget(self.route_result_label)
         control_layout.addWidget(planning_group)
 
         keyboard_help = QLabel("W / S  Insert / retract\n"
                                "A / D  Yaw       Q / E  Pitch\n"
-                               "Hold a key to move. Manual control keeps the route as a guide.")
-        keyboard_help.setWordWrap(True)
+                               "Hold a key to move. Manual control keeps the route as a guide.",
+                               wordWrap=True)
         control_layout.addWidget(keyboard_help)
 
-        self.pause_button = QPushButton("Pause movement")
-        self.pause_button.setCheckable(True)
+        self.pause_button = QPushButton("Pause movement", checkable=True)
         self.pause_button.toggled.connect(self.set_paused)
         control_layout.addWidget(self.pause_button)
         self.reset_button = QPushButton("Reset instrument")
@@ -223,71 +208,66 @@ class SimulatorWindow(QMainWindow):
         self.reset_button.clicked.connect(self.reset_instrument)
         control_layout.addWidget(self.reset_button)
         control_layout.addStretch()
-        scene_note = QLabel("Tool radius: 1.5 mm\nRequired shaft clearance: 2.0 mm")
-        scene_note.setWordWrap(True)
+        scene_note = QLabel("Tool radius: 1.5 mm\nRequired shaft clearance: 2.0 mm", wordWrap=True)
         control_layout.addWidget(scene_note)
 
         sensor_layout = self.create_control_tab("Sensors")
 
         sensor_group = QGroupBox("Position measurements")
         sensor_settings = QFormLayout(sensor_group)
-        self.tool_noise = QDoubleSpinBox()
-        self.target_noise = QDoubleSpinBox()
+        self.tool_noise = QDoubleSpinBox(minimum=0.0, maximum=10.0, decimals=1,
+                                        singleStep=0.1, suffix=" mm", keyboardTracking=False)
+        self.target_noise = QDoubleSpinBox(minimum=0.0, maximum=10.0, decimals=1,
+                                          singleStep=0.1, suffix=" mm", keyboardTracking=False)
         for setting, value in [(self.tool_noise, 1.0), (self.target_noise, 2.0)]:
-            setting.setRange(0.0, 10.0)
-            setting.setDecimals(1)
-            setting.setSingleStep(0.1)
-            setting.setSuffix(" mm")
-            setting.setKeyboardTracking(False)
             setting.setValue(value)
             setting.setToolTip("Gaussian noise standard deviation for each coordinate.")
         sensor_settings.addRow("Tool noise σ", self.tool_noise)
         sensor_settings.addRow("Target noise σ", self.target_noise)
-        self.sensor_seed = QSpinBox()
-        self.sensor_seed.setRange(0, 999999)
-        self.sensor_seed.setValue(42)
-        self.sensor_seed.setKeyboardTracking(False)
-        self.sensor_seed.setToolTip("Repeats the same sequence of sensor noise.")
-        sensor_settings.addRow("Noise seed", self.sensor_seed)
+        self.tool_dropout = QDoubleSpinBox(minimum=0.0, maximum=100.0, decimals=0,
+                                          singleStep=5, suffix=" %", keyboardTracking=False)
+        self.target_dropout = QDoubleSpinBox(minimum=0.0, maximum=100.0, decimals=0,
+                                            singleStep=5, suffix=" %", keyboardTracking=False)
+        for name, setting in (("Tool dropout", self.tool_dropout),
+                              ("Target dropout", self.target_dropout)):
+            setting.setToolTip("Probability of discarding each reading. Changes preserve the filter.")
+            sensor_settings.addRow(name, setting)
+        self.sensor_seed = QSpinBox(minimum=0, maximum=999999, value=42, keyboardTracking=False)
+        self.sensor_seed.setToolTip("Repeats Gaussian noise + dropout sequences.")
+        sensor_settings.addRow("Sensor seed", self.sensor_seed)
         sensor_layout.addWidget(sensor_group)
-        self.restart_sensor_button = QPushButton("Restart noise sequence")
+        self.restart_sensor_button = QPushButton("Restart sensors")
         self.restart_sensor_button.clicked.connect(self.reset_measurements)
         sensor_layout.addWidget(self.restart_sensor_button)
-        self.measurements_checkbox = QCheckBox("Raw positions in scene")
-        self.measurements_checkbox.setChecked(False)
+        self.measurements_checkbox = QCheckBox("Raw positions in scene", checked=False)
         self.measurements_checkbox.setToolTip("Raw observations: blue tool + pink target. These markers are not physical objects.")
         self.measurements_checkbox.toggled.connect(self.toggle_measurements)
         sensor_layout.addWidget(self.measurements_checkbox)
-        self.estimates_checkbox = QCheckBox("Filtered positions in scene")
-        self.estimates_checkbox.setChecked(False)
+        self.estimates_checkbox = QCheckBox("Filtered positions in scene", checked=False)
         self.estimates_checkbox.setToolTip("Filtered crosses: navy tool + purple target. Their size does not represent uncertainty.")
         self.estimates_checkbox.toggled.connect(self.toggle_measurements)
         sensor_layout.addWidget(self.estimates_checkbox)
-        sensor_note = QLabel("Sensors: 10 Hz  ·  Readouts: 2 Hz")
-        sensor_note.setWordWrap(True)
+        sensor_note = QLabel("Sensors: 10 Hz  ·  Readouts: 2 Hz", wordWrap=True)
         sensor_layout.addWidget(sensor_note)
         measurements_group = QGroupBox("Raw position readings · mm")
         measurements_layout = QVBoxLayout(measurements_group)
-        self.tool_measurement_label = QLabel()
-        self.target_measurement_label = QLabel()
-        self.measurement_error_label = QLabel()
+        self.tool_measurement_label = QLabel(wordWrap=True)
+        self.target_measurement_label = QLabel(wordWrap=True)
+        self.measurement_error_label = QLabel(wordWrap=True)
         for label in (self.tool_measurement_label, self.target_measurement_label,
                       self.measurement_error_label):
-            label.setWordWrap(True)
             measurements_layout.addWidget(label)
         sensor_layout.addWidget(measurements_group)
 
         estimate_layout = self.create_control_tab("Feedback")
         feedback_group = QGroupBox("Target distance + arrival")
         feedback_layout = QVBoxLayout(feedback_group)
-        self.feedback_distance_label = QLabel()
-        self.feedback_status_label = QLabel()
-        self.feedback_status_label.setMinimumHeight(42)
-        self.relative_uncertainty_label = QLabel()
+        self.feedback_distance_label = QLabel(wordWrap=True)
+        self.feedback_status_label = QLabel(wordWrap=True, minimumHeight=42)
+        self.relative_uncertainty_label = QLabel(wordWrap=True)
         self.relative_uncertainty_label.setToolTip("RMS uncertainty in the relative tool-target position, assuming independent filter errors. It is not a 95% radius or an arrival probability.")
         for label in (self.feedback_distance_label, self.feedback_status_label,
                       self.relative_uncertainty_label):
-            label.setWordWrap(True)
             feedback_layout.addWidget(label)
         estimate_layout.addWidget(feedback_group)
 
@@ -307,50 +287,45 @@ class SimulatorWindow(QMainWindow):
         chart_key = QLabel('<span style="color:#667584">━</span> Actual &nbsp; '
                            '<span style="color:#94afc4">━</span> Raw &nbsp; '
                            '<span style="color:#286e9f">━</span> Filtered<br>'
-                           '<span style="color:#bc4046">┄</span> 2 mm arrival tolerance · Last 30 s')
+                           '<span style="color:#bc4046">┄</span> 2 mm arrival tolerance · Last 30 s',
+                           wordWrap=True)
         chart_key.setStyleSheet("font-size: 9pt;")
-        chart_key.setWordWrap(True)
         estimate_layout.addWidget(chart_key)
 
-        details_button = QPushButton("Position + filter details")
-        details_button.setCheckable(True)
+        details_button = QPushButton("Position + filter details", checkable=True)
         estimate_layout.addWidget(details_button)
-        filter_group = QGroupBox("Filtered position readings · mm")
+        filter_group = QGroupBox("Filtered position readings · mm", visible=False)
         filter_layout = QVBoxLayout(filter_group)
-        self.tool_estimate_label = QLabel()
-        self.target_estimate_label = QLabel()
-        self.estimate_error_label = QLabel()
-        self.uncertainty_label = QLabel()
-        self.rmse_label = QLabel()
+        self.tool_estimate_label = QLabel(wordWrap=True)
+        self.target_estimate_label = QLabel(wordWrap=True)
+        self.estimate_error_label = QLabel(wordWrap=True)
+        self.uncertainty_label = QLabel(wordWrap=True)
+        self.rmse_label = QLabel(wordWrap=True)
         self.uncertainty_label.setToolTip("Model RMS position uncertainty: square root of the three position variances added together.")
-        self.rmse_label.setToolTip("3D position errors over all samples since the last sensor restart, including the first reading.")
+        self.rmse_label.setToolTip("Raw RMSE uses received readings only. Filtered RMSE uses every initialized estimate, including predictions during dropout. These are different sample sets.")
         for label in (self.tool_estimate_label, self.target_estimate_label,
                       self.estimate_error_label, self.uncertainty_label, self.rmse_label):
-            label.setWordWrap(True)
             filter_layout.addWidget(label)
         estimate_layout.addWidget(filter_group)
-        filter_group.setVisible(False)
         details_button.toggled.connect(filter_group.setVisible)
         self.measurement_count_label = QLabel()
         sensor_layout.addWidget(self.measurement_count_label)
         sensor_layout.addStretch()
         estimate_layout.addStretch()
         marker_note = QLabel("Raw: blue tool / pink target\n"
-                             "Filtered: navy tool / purple target")
-        marker_note.setWordWrap(True)
+                             "Filtered: navy tool / purple target", wordWrap=True)
         sensor_layout.addWidget(marker_note)
         sensor_baseline = QLabel("Constant-velocity filtering.\n"
                                 "Motion σa: tool 20 / target 1 mm/s².\n"
                                 "Errors use true positions for evaluation.\n"
                                 "Motion uses known configuration + obstacle geometry.\n"
-                                "The selected tracking source supplies target + guide/arrival feedback.")
-        sensor_baseline.setWordWrap(True)
+                                "The selected tracking source supplies target + guide/arrival feedback.",
+                                wordWrap=True)
         estimate_layout.addWidget(sensor_baseline)
         for setting in (self.tool_noise, self.target_noise, self.sensor_seed):
             setting.valueChanged.connect(self.reset_measurements)
 
-        scene_frame = QFrame()
-        scene_frame.setObjectName("scene")
+        scene_frame = QFrame(objectName="scene")
         scene_layout = QVBoxLayout(scene_frame)
         scene_layout.setContentsMargins(1, 1, 1, 1)
         scene_layout.setSpacing(0)
@@ -360,8 +335,7 @@ class SimulatorWindow(QMainWindow):
         scene_title.setStyleSheet("font-size: 9pt; font-weight: 600; color: #62788c;")
         scene_toolbar.addWidget(scene_title)
         scene_toolbar.addStretch()
-        self.labels_checkbox = QCheckBox("Labels")
-        self.labels_checkbox.setChecked(False)
+        self.labels_checkbox = QCheckBox("Labels", checked=False)
         self.labels_checkbox.toggled.connect(self.toggle_labels)
         scene_toolbar.addWidget(self.labels_checkbox)
         self.view_combo = QComboBox()
@@ -381,22 +355,19 @@ class SimulatorWindow(QMainWindow):
         scene_key = QLabel('<span style="color:#d59420">●</span> Tool tip &nbsp; '
                            '<span style="color:#199a78">●</span> Target &nbsp; '
                            '<span style="color:#bc4046">●</span> Protected structure &nbsp; '
-                           '<span style="color:#7757b5">━</span> Route')
-        scene_key.setWordWrap(True)
+                           '<span style="color:#7757b5">━</span> Route', wordWrap=True)
         scene_key.setStyleSheet("background: white; padding: 8px 12px; font-size: 9pt;")
         scene_layout.addWidget(scene_key)
 
-        self.position_label = QLabel()
-        self.target_label = QLabel()
-        self.clearance_label = QLabel()
+        self.position_label = QLabel(wordWrap=True)
+        self.target_label = QLabel(wordWrap=True)
+        self.clearance_label = QLabel(wordWrap=True)
         readouts = QHBoxLayout()
         for label in (self.position_label, self.target_label, self.clearance_label):
-            label.setWordWrap(True)
             label.setStyleSheet("padding: 10px; background: white; border: 1px solid #d9e1e8;")
             readouts.addWidget(label, 1)
         layout.addLayout(readouts)
-        self.message_label = QLabel("Ready for manual movement.")
-        self.message_label.setWordWrap(True)
+        self.message_label = QLabel("Ready for manual movement.", wordWrap=True)
         layout.addWidget(self.message_label)
         self.sensor_timer = QTimer(self)
         self.sensor_timer.setTimerType(Qt.TimerType.PreciseTimer)
@@ -424,14 +395,11 @@ class SimulatorWindow(QMainWindow):
         self.timer.start(16)
 
     def create_control_tab(self, title):
-        panel = QFrame()
-        panel.setObjectName("controls")
+        panel = QFrame(objectName="controls")
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll = QScrollArea(widgetResizable=True, frameShape=QFrame.Shape.NoFrame)
         scroll.setWidget(panel)
         self.control_tabs.addTab(scroll, title)
         return layout
@@ -509,14 +477,10 @@ class SimulatorWindow(QMainWindow):
             np.array([[-3.5, 0, 0], [3.5, 0, 0], [0, -3.5, 0],
                       [0, 3.5, 0], [0, 0, -3.5], [0, 0, 3.5]], dtype=float),
             lines=np.array([2, 0, 1, 2, 2, 3, 2, 4, 5]))
-        self.tool_measurement_actor = self.viewport.add_mesh(
-            marker, color="#287dc0", line_width=2, render_lines_as_tubes=True)
-        self.target_measurement_actor = self.viewport.add_mesh(
-            marker, color="#b050a2", line_width=2, render_lines_as_tubes=True)
-        self.tool_estimate_actor = self.viewport.add_mesh(
-            marker, color="#12536e", line_width=3, render_lines_as_tubes=True)
-        self.target_estimate_actor = self.viewport.add_mesh(
-            marker, color="#723d76", line_width=3, render_lines_as_tubes=True)
+        (self.tool_measurement_actor, self.target_measurement_actor,
+         self.tool_estimate_actor, self.target_estimate_actor) = [
+            self.viewport.add_mesh(marker, color=color, line_width=width, render_lines_as_tubes=True)
+            for color, width in [("#287dc0", 2), ("#b050a2", 2), ("#12536e", 3), ("#723d76", 3)]]
         for actor in (self.tool_measurement_actor, self.target_measurement_actor):
             actor.SetVisibility(self.measurements_checkbox.isChecked())
         for actor in (self.tool_estimate_actor, self.target_estimate_actor):
@@ -551,21 +515,28 @@ class SimulatorWindow(QMainWindow):
         self.render_pending = False
 
     def plan_path(self):
+        source = self.navigation_mode_combo.currentIndex()
+        mode = self.planning_mode_combo.currentData()
+        if not self.TrackingAvailable(source, mode):
+            self.message_label.setText("Required tracking is unavailable. Wait for fresh readings before planning.")
+            return
         self.stop_path()
         self.pressed_keys.clear()
-        self.plan_source_index = self.navigation_mode_combo.currentIndex()
+        self.plan_source_index = source
         self.plan_source_name = self.navigation_mode_combo.currentText()
-        self.plan_mode = self.planning_mode_combo.currentData()
+        self.plan_mode = mode
         self.plan_mode_name = self.planning_mode_combo.currentText()
-        self.plan_weight = self.proximity_weight.value()
         self.plan_uncertainty_scale = self.uncertainty_scale.value()
-        # compares the tip with nominal geometry from the same sensor sample
-        self.plan_tool_offset = (self.tool_filter.state[:3].copy()
-                                 - tip_position(self.port, *self.sampled_configuration))
-        self.plan_tool_covariance = self.tool_filter.covariance[:3, :3].copy()
+        tool_offset = None
+        tool_covariance = None
+        if self.plan_mode == "uncert_aware":
+            # compares the tip with nominal geometry from the same sensor sample
+            tool_offset = (self.tool_estimate.copy()
+                           - tip_position(self.port, *self.sampled_configuration))
+            tool_covariance = self.tool_filter.covariance[:3, :3].copy()
         # freezes selected target estimate; new observations don't move this route
         self.planned_target = (self.target, self.target_measurement,
-                               self.target_filter.state[:3])[self.plan_source_index].copy()
+                               self.target_estimate)[self.plan_source_index].copy()
         self.planning_cancel = Event()
         # searches with copied scene values; only the UI thread updates widgets
         self.planning_future = self.executor.submit(
@@ -573,8 +544,8 @@ class SimulatorWindow(QMainWindow):
             self.tool_radius, self.structure_centre.copy(), self.structure_radius,
             self.lower_limits.copy(), self.upper_limits.copy(), self.required_clearance,
             self.target_tolerance, cancel_event=self.planning_cancel,
-            include_target=True, mode=self.plan_mode, proximity_weight=self.plan_weight,
-            tool_offset=self.plan_tool_offset, tool_covariance=self.plan_tool_covariance,
+            include_target=True, mode=self.plan_mode, proximity_weight=self.proximity_weight.value(),
+            tool_offset=tool_offset, tool_covariance=tool_covariance,
             uncertainty_scale=self.plan_uncertainty_scale)
         self.plan_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
@@ -656,6 +627,8 @@ class SimulatorWindow(QMainWindow):
 
     def follow_path(self):
         if self.path is None:
+            return
+        if not self.CheckRouteTracking():
             return
         if self.manual_guidance or self.guidance_warning is not None:
             self.message_label.setText("Plan a fresh route for automatic execution. The displayed route remains a reference.")
@@ -786,11 +759,21 @@ class SimulatorWindow(QMainWindow):
         if self.path is not None or self.planning_future is not None:
             self.stop_path()
             self.message_label.setText("Sensors restarted. Plan a new route with the new readings.")
-        # restarts sensor noise separately from random instrument positions
-        self.sensor_generator = np.random.default_rng(self.sensor_seed.value())
+        # keeps dropout draws separate from Gaussian noise + instrument resets
+        seed = self.sensor_seed.value()
+        self.sensor_generator = np.random.default_rng(seed)
+        self.dropout_generators = [np.random.default_rng([seed, index]) for index in (1, 2)]
         self.measurement_count = 0
         self.tool_filter = None
         self.target_filter = None
+        self.tool_measurement = None
+        self.target_measurement = None
+        self.tool_estimate = None
+        self.target_estimate = None
+        self.observations = [None, None]
+        self.observation_times = [None, None]
+        self.measurement_counts = np.zeros(2, dtype=int)
+        self.estimate_counts = np.zeros(2, dtype=int)
         self.measurement_squared_error = np.zeros(2)
         self.estimate_squared_error = np.zeros(2)
         self.last_measurement_time = None
@@ -806,68 +789,84 @@ class SimulatorWindow(QMainWindow):
 
     def update_measurements(self):
         sample_time = perf_counter()
+        if self.last_measurement_time is not None and sample_time - self.last_measurement_time > self.tracking_timeout:
+            self.CheckRouteTracking()
+            # restarts confirmation periods when observations are delayed
+            self.arrival_started = [None, None, None]
+            self.guidance_warning_pending = None
+            self.guidance_warning_started = None
         self.sampled_configuration = self.configuration.copy()
         tool_tip = tip_position(self.port, *self.sampled_configuration)
         self.sampled_clearance = shaft_clearance(
             self.port, tool_tip, self.tool_radius,
             self.structure_centre, self.structure_radius)
-        self.tool_measurement = measure_position(
-            tool_tip, self.tool_noise.value(), self.sensor_generator)
-        self.target_measurement = measure_position(
-            self.target, self.target_noise.value(), self.sensor_generator)
-        if self.tool_filter is None:
-            # initialises each estimate from its first sensor reading
-            self.tool_filter = KalmanFilter(self.tool_measurement, self.tool_noise.value(),
-                                            acceleration_std=20.0)
-            self.target_filter = KalmanFilter(self.target_measurement, self.target_noise.value(),
-                                              acceleration_std=1.0)
-        else:
-            # predicts over the elapsed time between observations
-            timestep = max(sample_time - self.last_measurement_time, 1e-6)
-            for estimator, measurement in ((self.tool_filter, self.tool_measurement),
-                                           (self.target_filter, self.target_measurement)):
+        timestep = (max(sample_time - self.last_measurement_time, 1e-6)
+                    if self.last_measurement_time is not None else None)
+        self.measurement_errors = np.full(2, np.nan)
+        self.estimate_errors = np.full(2, np.nan)
+        filters = [self.tool_filter, self.target_filter]
+        readings = [self.tool_measurement, self.target_measurement]
+        estimates = [None, None]
+        for index, (position, noise, dropout, acceleration) in enumerate((
+                (tool_tip, self.tool_noise.value(), self.tool_dropout.value(), 20.0),
+                (self.target, self.target_noise.value(), self.target_dropout.value(), 1.0))):
+            # draws noise every tick so dropout does not change the Gaussian sequence
+            observation = ApplyDropout(measure_position(position, noise, self.sensor_generator),
+                                       dropout / 100, self.dropout_generators[index])
+            self.observations[index] = observation
+            estimator = filters[index]
+            if estimator is not None:
                 estimator.predict(timestep)
-                estimator.update(measurement)
-        # restarts confirmation periods when observations are delayed
-        if self.last_measurement_time is not None and sample_time - self.last_measurement_time > 0.25:
-            self.arrival_started = [None, None, None]
-            self.guidance_warning_pending = None
-            self.guidance_warning_started = None
+            if observation is not None:
+                # initialises each filter once from its first received reading
+                if estimator is None:
+                    estimator = KalmanFilter(observation, noise, acceleration_std=acceleration)
+                else:
+                    estimator.update(observation)
+                readings[index] = observation
+                self.observation_times[index] = sample_time
+                self.measurement_errors[index] = np.linalg.norm(observation - position)
+                self.measurement_squared_error[index] += self.measurement_errors[index] ** 2
+                self.measurement_counts[index] += 1
+            filters[index] = estimator
+            if estimator is not None:
+                estimates[index] = estimator.state[:3].copy()
+                self.estimate_errors[index] = np.linalg.norm(estimates[index] - position)
+                self.estimate_squared_error[index] += self.estimate_errors[index] ** 2
+                self.estimate_counts[index] += 1
+        self.tool_filter, self.target_filter = filters
+        self.tool_measurement, self.target_measurement = readings
+        self.tool_estimate, self.target_estimate = estimates
         self.last_measurement_time = sample_time
         self.measurement_count += 1
-        self.tool_measurement_actor.SetPosition(*self.tool_measurement)
-        self.target_measurement_actor.SetPosition(*self.target_measurement)
-        self.tool_estimate_actor.SetPosition(*self.tool_filter.state[:3])
-        self.target_estimate_actor.SetPosition(*self.target_filter.state[:3])
-        # records errors at the same instant as each sensor sample
-        self.measurement_errors = np.array([
-            np.linalg.norm(self.tool_measurement - tool_tip),
-            np.linalg.norm(self.target_measurement - self.target)])
-        self.estimate_errors = np.array([
-            np.linalg.norm(self.tool_filter.state[:3] - tool_tip),
-            np.linalg.norm(self.target_filter.state[:3] - self.target)])
-        self.measurement_squared_error += self.measurement_errors ** 2
-        self.estimate_squared_error += self.estimate_errors ** 2
+        for actor, position in zip((self.tool_measurement_actor, self.target_measurement_actor,
+                                     self.tool_estimate_actor, self.target_estimate_actor),
+                                    (*self.observations, *estimates)):
+            if position is not None:
+                actor.SetPosition(*position)
+        self.toggle_measurements(None, render=False)
         # compares actual, raw + filtered views of the same task
-        self.target_feedbacks = [
-            get_target_feedback(tool_tip, self.target, self.target_tolerance),
-            get_target_feedback(self.tool_measurement, self.target_measurement, self.target_tolerance,
-                                self.tool_noise.value() ** 2 * np.eye(3),
-                                self.target_noise.value() ** 2 * np.eye(3)),
-            get_target_feedback(self.tool_filter.state[:3], self.target_filter.state[:3],
-                                self.target_tolerance, self.tool_filter.covariance[:3, :3],
-                                self.target_filter.covariance[:3, :3]),
-        ]
+        self.target_feedbacks = [get_target_feedback(tool_tip, self.target, self.target_tolerance)]
+        for positions, covariances in (
+                (self.observations, [self.tool_noise.value() ** 2 * np.eye(3),
+                                     self.target_noise.value() ** 2 * np.eye(3)]),
+                (estimates, [estimator.covariance[:3, :3] if estimator is not None else None
+                             for estimator in filters])):
+            self.target_feedbacks.append(
+                get_target_feedback(*positions, self.target_tolerance, *covariances)
+                if all(position is not None for position in positions)
+                else {"distance": np.nan, "arrived": False, "uncertainty": np.nan})
         self.distance_history.append((sample_time - self.distance_started_time,
                                       *(feedback["distance"] for feedback in self.target_feedbacks)))
         for index, feedback in enumerate(self.target_feedbacks):
-            if not feedback["arrived"]:
+            if not feedback["arrived"] or not self.TrackingAvailable(index):
                 self.arrival_started[index] = None
             elif self.arrival_started[index] is None:
                 self.arrival_started[index] = sample_time
             self.arrival_confirmed[index] = (self.arrival_started[index] is not None
                                              and sample_time - self.arrival_started[index] >= self.arrival_dwell - 1e-9)
 
+        self.CheckRouteTracking()
         if self.route_feedback_active:
             reported = self.arrival_confirmed[self.plan_source_index]
             expired = (self.route_finished_time is not None
@@ -900,11 +899,19 @@ class SimulatorWindow(QMainWindow):
 
     def update_sensor_readouts(self):
         # refreshes one snapshot while sampling + filtering continue at 10 Hz
+        self.toggle_measurements(None, render=False)
+        if self.measurements_checkbox.isChecked():
+            self.render_pending = True
         guide_distance = self.update_route_guidance()
-        rows = "".join(
-            f'<tr><td>{name}</td><td align="right">{feedback["distance"]:.2f}</td>'
-            f'<td align="right">{"Within" if feedback["arrived"] else "Outside"}</td></tr>'
-            for name, feedback in zip(("Actual", "Raw", "Filtered"), self.target_feedbacks))
+        rows = ""
+        for index, (name, feedback) in enumerate(zip(("Actual", "Raw", "Filtered"), self.target_feedbacks)):
+            available = self.TrackingAvailable(index)
+            state = ("Within" if feedback["arrived"] else "Outside") if available else "Unavailable"
+            if index == 2 and not available and np.isfinite(feedback["distance"]):
+                state = "Prediction"
+            value = feedback["distance"] if available or index == 2 else None
+            rows += (f'<tr><td>{name}</td><td align="right">{FormatReading(value)}</td>'
+                     f'<td align="right">{state}</td></tr>')
         self.feedback_distance_label.setText(
             '<table width="100%" cellspacing="4"><tr><td></td><td align="right">mm</td>'
             f'<td align="right">2 mm region</td></tr>{rows}</table>')
@@ -912,6 +919,8 @@ class SimulatorWindow(QMainWindow):
         selected = self.target_feedbacks[mode]
         if self.route_result is not None:
             self.feedback_status_label.setText(self.route_result_label.text())
+        elif not self.TrackingAvailable(mode):
+            self.feedback_status_label.setText("Tracking unavailable. Arrival confirmation requires fresh tool + target readings.")
         elif self.arrival_confirmed[mode]:
             self.feedback_status_label.setText("Arrival indication stable for 0.5 s.\nActual result is evaluated separately.")
         elif selected["arrived"]:
@@ -919,7 +928,7 @@ class SimulatorWindow(QMainWindow):
         else:
             self.feedback_status_label.setText("Selected guidance is outside the target tolerance.")
         self.relative_uncertainty_label.setText(
-            f"Relative-position uncertainty · RMS mm\nRaw {self.target_feedbacks[1]['uncertainty']:.2f}  ·  Filtered {self.target_feedbacks[2]['uncertainty']:.2f}")
+            f"Relative-position uncertainty · RMS mm\nRaw {FormatReading(self.target_feedbacks[1]['uncertainty'] if self.TrackingAvailable(1) else None)}  ·  Filtered {FormatReading(self.target_feedbacks[2]['uncertainty'])}")
         # plots every sampled distance - drawing stays at 2 Hz rate
         if self.distance_canvas.isVisible():
             history = np.array(self.distance_history)
@@ -927,62 +936,99 @@ class SimulatorWindow(QMainWindow):
                 line.set_data(history[:, 0], history[:, index + 1])
             latest_time = history[-1, 0]
             self.distance_axes.set_xlim(max(0.0, latest_time - 30.0), max(5.0, latest_time))
-            self.distance_plot_limit = max(self.distance_plot_limit, 1.15 * float(history[:, 1:].max()))
+            self.distance_plot_limit = max(self.distance_plot_limit, 1.15 * float(np.nanmax(history[:, 1:])))
             self.distance_axes.set_ylim(0, self.distance_plot_limit)
             self.distance_canvas.draw_idle()
         readings = [
-            (self.tool_measurement_label, "Tool tip", self.tool_measurement),
-            (self.target_measurement_label, "Target", self.target_measurement),
-            (self.tool_estimate_label, "Tool tip", self.tool_filter.state[:3]),
-            (self.target_estimate_label, "Target", self.target_filter.state[:3]),
+            (self.tool_measurement_label, "Tool tip", self.tool_measurement, 0, False),
+            (self.target_measurement_label, "Target", self.target_measurement, 1, False),
+            (self.tool_estimate_label, "Tool tip", self.tool_estimate, 0, True),
+            (self.target_estimate_label, "Target", self.target_estimate, 1, True),
         ]
         headings = "".join(f'<td width="33%" align="right">{axis}</td>' for axis in "XYZ")
-        for label, name, position in readings:
-            values = "".join(f'<td align="right">{value:.2f}</td>' for value in position)
-            label.setText(f'<b>{name}</b><table width="100%" cellspacing="4">'
+        now = perf_counter()
+        for label, name, position, index, filtered in readings:
+            received = self.observation_times[index]
+            fresh = (received is not None and self.observations[index] is not None
+                     and now - received <= self.tracking_timeout)
+            status = "Waiting for first reading" if received is None else (
+                f"Fresh · age {now - received:.1f} s" if fresh else
+                f"{'Prediction' if filtered else 'Last reading'} · age {now - received:.1f} s")
+            values = "".join(f'<td align="right">{FormatReading(value)}</td>'
+                             for value in (position if position is not None else (None,) * 3))
+            label.setText(f'<b>{name}</b><br>{status}<table width="100%" cellspacing="4">'
                           f'<tr style="color:#62788c">{headings}</tr>'
                           f'<tr style="font-family:Consolas">{values}</tr></table>')
         self.measurement_error_label.setText(
-            f"Raw error · mm\nTool {self.measurement_errors[0]:.2f}   Target {self.measurement_errors[1]:.2f}")
+            f"Raw error · mm\nTool {FormatReading(self.measurement_errors[0])}   Target {FormatReading(self.measurement_errors[1])}")
         self.estimate_error_label.setText(
-            f"Filtered error · mm\nTool {self.estimate_errors[0]:.2f}   Target {self.estimate_errors[1]:.2f}")
+            f"Filtered error · mm\nTool {FormatReading(self.estimate_errors[0])}   Target {FormatReading(self.estimate_errors[1])}")
         # calculates model RMS uncertainty from the three position variances
-        tool_uncertainty = np.sqrt(max(0.0, np.trace(self.tool_filter.covariance[:3, :3])))
-        target_uncertainty = np.sqrt(max(0.0, np.trace(self.target_filter.covariance[:3, :3])))
+        uncertainties = [np.sqrt(max(0.0, np.trace(estimator.covariance[:3, :3])))
+                         if estimator is not None else None
+                         for estimator in (self.tool_filter, self.target_filter)]
         self.uncertainty_label.setText(
-            f"Position uncertainty · mm\nTool {tool_uncertainty:.2f}   Target {target_uncertainty:.2f}")
-        measured_rmse = np.sqrt(self.measurement_squared_error / self.measurement_count)
-        filtered_rmse = np.sqrt(self.estimate_squared_error / self.measurement_count)
+            f"Position uncertainty · RMS mm\nTool {FormatReading(uncertainties[0])}   Target {FormatReading(uncertainties[1])}")
+        measured_rmse, filtered_rmse = [
+            np.sqrt(np.divide(errors, counts, out=np.full(2, np.nan), where=counts > 0))
+            for errors, counts in ((self.measurement_squared_error, self.measurement_counts),
+                                   (self.estimate_squared_error, self.estimate_counts))]
         self.rmse_label.setText(
             '<b>Running 3D RMSE · mm</b><table width="100%" cellspacing="4">'
             '<tr><td></td><td align="right">Raw</td><td align="right">Filtered</td></tr>'
-            f'<tr><td>Tool</td><td align="right">{measured_rmse[0]:.2f}</td>'
-            f'<td align="right">{filtered_rmse[0]:.2f}</td></tr>'
-            f'<tr><td>Target</td><td align="right">{measured_rmse[1]:.2f}</td>'
-            f'<td align="right">{filtered_rmse[1]:.2f}</td></tr></table>')
-        self.displayed_measurement_count = self.measurement_count
-        self.measurement_count_label.setText(f"Sample {self.displayed_measurement_count}  ·  Readouts 2 Hz")
+            f'<tr><td>Tool</td><td align="right">{FormatReading(measured_rmse[0])}</td>'
+            f'<td align="right">{FormatReading(filtered_rmse[0])}</td></tr>'
+            f'<tr><td>Target</td><td align="right">{FormatReading(measured_rmse[1])}</td>'
+            f'<td align="right">{FormatReading(filtered_rmse[1])}</td></tr></table>'
+            f'Raw samples {self.measurement_counts[0]} / {self.measurement_counts[1]}<br>'
+            f'Filtered samples {self.estimate_counts[0]} / {self.estimate_counts[1]}')
+        self.measurement_count_label.setText(f"Sample {self.measurement_count}\nReceived: tool {self.measurement_counts[0]} / target {self.measurement_counts[1]}")
         yaw, pitch = np.rad2deg(self.sampled_configuration[:2])
         self.position_label.setText(f"ACTUAL INSTRUMENT\nYaw {yaw:.1f}° · Pitch {pitch:.1f}° · Depth {self.sampled_configuration[2]:.1f} mm")
         guide_note = (f"\nTip-to-guide {guide_distance:.2f} mm"
                       + (" · Replan advised" if self.guidance_warning is not None else "")
                       if guide_distance is not None else "")
-        self.target_label.setText(f"{self.navigation_mode_combo.currentText().upper()} DISTANCE\n{selected['distance']:.2f} mm  ·  Actual {self.target_feedbacks[0]['distance']:.2f} mm{guide_note}")
+        distance = selected["distance"] if mode != 1 or self.TrackingAvailable(mode) else None
+        prediction_note = ""
+        if mode == 2 and not self.TrackingAvailable(mode):
+            prediction_note = " · Prediction" if np.isfinite(distance) else " · Unavailable"
+        self.target_label.setText(f"{self.navigation_mode_combo.currentText().upper()} DISTANCE\n{FormatReading(distance)} mm{prediction_note}  ·  Actual {self.target_feedbacks[0]['distance']:.2f} mm{guide_note}")
         minimum = self.route_clearance if self.following else self.required_clearance
         guide_margin = (f"\nGuide planned at {self.route_clearance:.2f} mm"
                         if self.path is not None and not self.following else "")
         self.clearance_label.setText(f"SHAFT CLEARANCE\n{self.sampled_clearance:.2f} mm  ·  Movement minimum {minimum:.2f} mm{guide_margin}")
 
+    def TrackingAvailable(self, source, mode="conventional"):
+        required = (0, 1) if source != 0 else (0,) if mode == "uncert_aware" else ()
+        now = perf_counter()
+        return all(self.observations[index] is not None
+                   and self.observation_times[index] is not None
+                   and now - self.observation_times[index] <= self.tracking_timeout for index in required)
+
+    def CheckRouteTracking(self):
+        if self.path is None or self.route_result is not None:
+            return True
+        if self.TrackingAvailable(self.plan_source_index, self.plan_mode):
+            return True
+        self.guidance_warning = "Required tracking is unavailable; a fresh plan is needed."
+        self.arrival_started = [None, None, None]
+        self.arrival_confirmed = [False, False, False]
+        if not self.manual_guidance:
+            self.stop_path(keep_route=True)
+            self.message_label.setText("Automatic execution unavailable: tracking lost. The guide stays visible; plan again after tracking returns.")
+        return False
+
     def update_route_guidance(self, refresh=True):
         if self.route_points is None:
             return
+        available = self.CheckRouteTracking()
         target = (self.target, self.target_measurement,
-                  self.target_filter.state[:3])[self.plan_source_index]
+                  self.target_estimate)[self.plan_source_index]
         reason = None
-        if np.linalg.norm(target - self.planned_target) > self.target_tolerance:
+        if available and np.linalg.norm(target - self.planned_target) > self.target_tolerance:
             reason = "Target tracking differs from the snapshot."
-        elif self.plan_mode == "uncert_aware":
-            offset = self.tool_filter.state[:3] - tip_position(self.port, *self.sampled_configuration)
+        elif available and self.plan_mode == "uncert_aware":
+            offset = self.tool_estimate - tip_position(self.port, *self.sampled_configuration)
             live_margin = get_uncertainty_margin(offset, self.tool_filter.covariance[:3, :3],
                                                  self.plan_uncertainty_scale)
             if round(live_margin, 2) > round(self.route_clearance - self.required_clearance, 2):
@@ -998,8 +1044,10 @@ class SimulatorWindow(QMainWindow):
         if not refresh or self.route_result is not None:
             return
         tool = (tip_position(self.port, *self.sampled_configuration),
-                self.tool_measurement, self.tool_filter.state[:3])[self.plan_source_index]
-        if len(self.route_points) == 1:
+                self.tool_measurement, self.tool_estimate)[self.plan_source_index]
+        if tool is None or (self.plan_source_index == 1 and not available):
+            distance = None
+        elif len(self.route_points) == 1:
             distance = np.linalg.norm(tool - self.route_points[0])
         else:
             # projects the selected tip estimate to each displayed line segment
@@ -1015,18 +1063,25 @@ class SimulatorWindow(QMainWindow):
                   else "Manual guide or automatic execution available.")
         if self.guidance_warning is not None:
             status = f"Replan advised: {self.guidance_warning}"
+        if self.plan_source_index == 2 and not available:
+            status += " Tip-to-guide uses prediction."
         if self.manual_guidance and self.sampled_clearance < self.route_clearance:
             status += " Below planned clearance; manual minimum still applies."
         self.route_result_label.setText(
-            f"{self.plan_source_name} · Tip-to-guide {distance:.2f} mm\n{status}")
-        return float(distance)
+            f"{self.plan_source_name} · Tip-to-guide {FormatReading(distance)} mm\n{status}")
+        return float(distance) if distance is not None else None
 
-    def toggle_measurements(self, _visible):
-        for actor in (self.tool_measurement_actor, self.target_measurement_actor):
-            actor.SetVisibility(self.measurements_checkbox.isChecked())
-        for actor in (self.tool_estimate_actor, self.target_estimate_actor):
-            actor.SetVisibility(self.estimates_checkbox.isChecked())
-        self.viewport.render()
+    def toggle_measurements(self, _visible, *, render=True):
+        now = perf_counter()
+        for index, actor in enumerate((self.tool_measurement_actor, self.target_measurement_actor)):
+            actor.SetVisibility(self.measurements_checkbox.isChecked()
+                                and self.observations[index] is not None
+                                and now - self.observation_times[index] <= self.tracking_timeout)
+        for actor, estimator in ((self.tool_estimate_actor, self.tool_filter),
+                                 (self.target_estimate_actor, self.target_filter)):
+            actor.SetVisibility(self.estimates_checkbox.isChecked() and estimator is not None)
+        if render:
+            self.viewport.render()
 
     def toggle_labels(self, visible):
         self.label_actor.SetVisibility(visible)
@@ -1039,6 +1094,8 @@ class SimulatorWindow(QMainWindow):
             timestep = min(now - self.last_tick, 0.05)
             self.last_tick = now
             self.poll_planning()
+            if self.route_feedback_active and not self.CheckRouteTracking():
+                return
             if self.pause_button.isChecked() or self.planning_future is not None:
                 return
 
