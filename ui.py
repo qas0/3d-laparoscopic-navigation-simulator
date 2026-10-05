@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 )
 from pyvistaqt import QtInteractor
 
-from astar import find_path
+from astar import find_path, get_uncertainty_margin
 from feedback import get_target_feedback
 from geometry import movement_is_clear, shaft_clearance, tip_position
 from kalman import KalmanFilter
@@ -35,6 +35,7 @@ class SimulatorWindow(QMainWindow):
         self.shaft_length = 135.0
         self.render_pending = False
         self.required_clearance = 2.0
+        self.route_clearance = self.required_clearance
         self.lower_limits = np.array([np.deg2rad(-45), np.deg2rad(-35), 10.0])
         self.upper_limits = np.array([np.deg2rad(45), np.deg2rad(35), 110.0])
         self.speed_limits = np.array([np.deg2rad(20), np.deg2rad(20), 15.0])
@@ -48,6 +49,12 @@ class SimulatorWindow(QMainWindow):
         self.random_generator = np.random.default_rng()
         self.path = None
         self.path_actor = None
+        self.route_points = None
+        self.manual_guidance = False
+        self.guidance_warning = None
+        self.guidance_warning_pending = None
+        self.guidance_warning_started = None
+        self.margin_actor = None
         self.path_index = 0
         self.following = False
         self.planning_future = None
@@ -96,7 +103,6 @@ class SimulatorWindow(QMainWindow):
         title = QLabel("Laparoscopic navigation")
         title.setStyleSheet("font-size: 18pt; font-weight: 600;")
         layout.addWidget(title)
-        layout.addWidget(QLabel("Fixed-port 3D simulator  ·  Manual control + A* planning  ·  Millimetres"))
         body = QHBoxLayout()
         layout.addLayout(body, 1)
 
@@ -148,22 +154,33 @@ class SimulatorWindow(QMainWindow):
         self.planning_mode_combo = QComboBox()
         self.planning_mode_combo.addItem("Conventional A*", "conventional")
         self.planning_mode_combo.addItem("Proximity-aware A*", "prox_aware")
-        self.planning_mode_combo.setToolTip("Both methods enforce the required shaft clearance. Changing method cancels the route.")
+        self.planning_mode_combo.addItem("Uncertainty-aware A*", "uncert_aware")
+        self.planning_mode_combo.setToolTip("All methods enforce shaft clearance. Uncertainty mode adds a frozen tool-tracking margin. Changing method cancels the route.")
         self.proximity_weight = QDoubleSpinBox()
         self.proximity_weight.setRange(0.0, 10.0)
         self.proximity_weight.setSingleStep(0.5)
         self.proximity_weight.setDecimals(1)
         self.proximity_weight.setValue(1.0)
         self.proximity_weight.setEnabled(False)
-        self.proximity_weight.setToolTip("Zero uses travel cost only. Higher weights discourage close passes; the penalty decays over 5 mm above the required clearance.")
+        self.proximity_weight.setToolTip("Zero uses travel cost only. Higher weights discourage close passes; the penalty decays over 5 mm above the base clearance.")
+        self.uncertainty_scale = QDoubleSpinBox()
+        self.uncertainty_scale.setRange(0.0, 5.0)
+        self.uncertainty_scale.setSingleStep(0.5)
+        self.uncertainty_scale.setDecimals(1)
+        self.uncertainty_scale.setValue(1.0)
+        self.uncertainty_scale.setEnabled(False)
+        self.uncertainty_scale.setToolTip("Adds filtered tool-tip disagreement + k times the largest-direction standard deviation. Zero k keeps the disagreement term. k is an experimental sensitivity, not a confidence percentage.")
         planning_settings = QFormLayout()
+        planning_settings.setHorizontalSpacing(4)
         planning_settings.addRow("Planning method", self.planning_mode_combo)
         planning_settings.addRow("Proximity weight", self.proximity_weight)
+        planning_settings.addRow("Uncertainty k", self.uncertainty_scale)
         planning_layout.addLayout(planning_settings)
         self.plan_button = QPushButton("Plan route")
         self.plan_button.setObjectName("primary")
         self.plan_button.clicked.connect(self.plan_path)
         self.follow_button = QPushButton("Follow route")
+        self.follow_button.setToolTip("Automatically executes a freshly planned route for comparison. Manual controls keep the route as a reference.")
         self.follow_button.setEnabled(False)
         self.follow_button.clicked.connect(self.follow_path)
         self.cancel_button = QPushButton("Cancel route")
@@ -178,15 +195,22 @@ class SimulatorWindow(QMainWindow):
         self.plan_label.setWordWrap(True)
         self.plan_label.setMinimumHeight(52)
         planning_layout.addWidget(self.plan_label)
-        self.route_result_label = QLabel("Arrival requires 0.5 s within the 2 mm tolerance.")
+        self.margin_label = QLabel()
+        self.margin_label.setWordWrap(True)
+        self.margin_label.setVisible(False)
+        self.margin_label.setToolTip("Uses filtered tool tracking independently of target guidance. The fixed-port model assumes the frozen endpoint-error bound applies throughout this route. Static known geometry and configuration remain the baseline; tracking changes do not update this margin automatically.")
+        planning_layout.addWidget(self.margin_label)
+        self.route_result_label = QLabel()
         self.route_result_label.setWordWrap(True)
         self.route_result_label.setMinimumHeight(50)
+        self.route_result_label.setVisible(False)
+        self.route_result_label.setToolTip("Tip-to-guide distance uses the selected tracking source + the displayed tip polyline. It does not check shaft clearance or prove that the instrument follows the planned configurations. Tracking changes must persist for 0.5 s before a replan warning stays visible.")
         planning_layout.addWidget(self.route_result_label)
         control_layout.addWidget(planning_group)
 
         keyboard_help = QLabel("W / S  Insert / retract\n"
                                "A / D  Yaw       Q / E  Pitch\n"
-                               "Hold a key to move. Manual control cancels a route.")
+                               "Hold a key to move. Manual control keeps the route as a guide.")
         keyboard_help.setWordWrap(True)
         control_layout.addWidget(keyboard_help)
 
@@ -199,9 +223,7 @@ class SimulatorWindow(QMainWindow):
         self.reset_button.clicked.connect(self.reset_instrument)
         control_layout.addWidget(self.reset_button)
         control_layout.addStretch()
-        scene_note = QLabel("Tool radius: 1.5 mm\nRequired shaft clearance: 2.0 mm\n"
-                            "Protected structure: red sphere\n\n"
-                            "The organ surface is a visual reference.")
+        scene_note = QLabel("Tool radius: 1.5 mm\nRequired shaft clearance: 2.0 mm")
         scene_note.setWordWrap(True)
         control_layout.addWidget(scene_note)
 
@@ -241,8 +263,7 @@ class SimulatorWindow(QMainWindow):
         self.estimates_checkbox.setToolTip("Filtered crosses: navy tool + purple target. Their size does not represent uncertainty.")
         self.estimates_checkbox.toggled.connect(self.toggle_measurements)
         sensor_layout.addWidget(self.estimates_checkbox)
-        sensor_note = QLabel("Sensors: 10 Hz  ·  Readouts: 2 Hz\n"
-                            "σ applies to each coordinate. The seed repeats noise; instrument resets stay random.")
+        sensor_note = QLabel("Sensors: 10 Hz  ·  Readouts: 2 Hz")
         sensor_note.setWordWrap(True)
         sensor_layout.addWidget(sensor_note)
         measurements_group = QGroupBox("Raw position readings · mm")
@@ -257,10 +278,6 @@ class SimulatorWindow(QMainWindow):
         sensor_layout.addWidget(measurements_group)
 
         estimate_layout = self.create_control_tab("Feedback")
-        estimate_note = QLabel("Compare what tracking reports with the actual result.\n"
-                              "Readouts refresh together twice per second.")
-        estimate_note.setWordWrap(True)
-        estimate_layout.addWidget(estimate_note)
         feedback_group = QGroupBox("Target distance + arrival")
         feedback_layout = QVBoxLayout(feedback_group)
         self.feedback_distance_label = QLabel()
@@ -318,8 +335,7 @@ class SimulatorWindow(QMainWindow):
         sensor_layout.addWidget(self.measurement_count_label)
         sensor_layout.addStretch()
         estimate_layout.addStretch()
-        marker_note = QLabel("Readings stay in the side panel by default.\n"
-                             "Raw: blue tool / pink target\n"
+        marker_note = QLabel("Raw: blue tool / pink target\n"
                              "Filtered: navy tool / purple target")
         marker_note.setWordWrap(True)
         sensor_layout.addWidget(marker_note)
@@ -327,7 +343,7 @@ class SimulatorWindow(QMainWindow):
                                 "Motion σa: tool 20 / target 1 mm/s².\n"
                                 "Errors use true positions for evaluation.\n"
                                 "Motion uses known configuration + obstacle geometry.\n"
-                                "The selected tracking source supplies target + arrival feedback.")
+                                "The selected tracking source supplies target + guide/arrival feedback.")
         sensor_baseline.setWordWrap(True)
         estimate_layout.addWidget(sensor_baseline)
         for setting in (self.tool_noise, self.target_noise, self.sensor_seed):
@@ -393,8 +409,11 @@ class SimulatorWindow(QMainWindow):
         self.navigation_mode_combo.currentIndexChanged.connect(self.update_sensor_readouts)
         self.planning_mode_combo.currentIndexChanged.connect(self.stop_path)
         self.planning_mode_combo.currentIndexChanged.connect(
-            lambda index: self.proximity_weight.setEnabled(index == 1))
+            lambda index: self.proximity_weight.setEnabled(index in (1, 2)))
+        self.planning_mode_combo.currentIndexChanged.connect(
+            lambda index: self.uncertainty_scale.setEnabled(index == 2))
         self.proximity_weight.valueChanged.connect(self.stop_path)
+        self.uncertainty_scale.valueChanged.connect(self.stop_path)
         self.control_tabs.currentChanged.connect(self.update_sensor_readouts)
 
         QApplication.instance().installEventFilter(self)
@@ -457,7 +476,9 @@ class SimulatorWindow(QMainWindow):
                                color="#bc4046", smooth_shading=True, specular=0.3)
         margin = pv.Sphere(radius=self.structure_radius + self.required_clearance,
                            center=self.structure_centre, theta_resolution=48, phi_resolution=32)
-        self.viewport.add_mesh(margin, color="#ce7a7e", opacity=0.12, smooth_shading=True)
+        self.margin_actor = self.viewport.add_mesh(
+            margin, color="#ce7a7e", opacity=0.12, smooth_shading=True)
+        self.margin_actor.SetOrigin(*self.structure_centre)
         self.viewport.add_mesh(pv.Sphere(radius=2.2, center=self.target),
                                color="#199a78", smooth_shading=True, ambient=0.25)
         self.viewport.add_mesh(pv.Disc(center=self.port, normal=(1, 0, 0),
@@ -537,6 +558,11 @@ class SimulatorWindow(QMainWindow):
         self.plan_mode = self.planning_mode_combo.currentData()
         self.plan_mode_name = self.planning_mode_combo.currentText()
         self.plan_weight = self.proximity_weight.value()
+        self.plan_uncertainty_scale = self.uncertainty_scale.value()
+        # compares the tip with nominal geometry from the same sensor sample
+        self.plan_tool_offset = (self.tool_filter.state[:3].copy()
+                                 - tip_position(self.port, *self.sampled_configuration))
+        self.plan_tool_covariance = self.tool_filter.covariance[:3, :3].copy()
         # freezes selected target estimate; new observations don't move this route
         self.planned_target = (self.target, self.target_measurement,
                                self.target_filter.state[:3])[self.plan_source_index].copy()
@@ -547,11 +573,16 @@ class SimulatorWindow(QMainWindow):
             self.tool_radius, self.structure_centre.copy(), self.structure_radius,
             self.lower_limits.copy(), self.upper_limits.copy(), self.required_clearance,
             self.target_tolerance, cancel_event=self.planning_cancel,
-            include_target=True, mode=self.plan_mode, proximity_weight=self.plan_weight)
+            include_target=True, mode=self.plan_mode, proximity_weight=self.plan_weight,
+            tool_offset=self.plan_tool_offset, tool_covariance=self.plan_tool_covariance,
+            uncertainty_scale=self.plan_uncertainty_scale)
         self.plan_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.plan_label.setText("Searching the configuration grid…")
+        self.margin_label.setText("Calculating the frozen tool-tracking margin…")
+        self.margin_label.setVisible(self.plan_mode == "uncert_aware")
         self.route_result_label.setText(f"Target snapshot: {self.plan_source_name}.\nNew readings do not move the planned route.")
+        self.route_result_label.setVisible(True)
         self.message_label.setText(f"{self.plan_mode_name} with {self.plan_source_name.lower()}. Cancel or use manual controls to interrupt.")
 
     def poll_planning(self):
@@ -565,14 +596,19 @@ class SimulatorWindow(QMainWindow):
             result = future.result()
         except Exception as error:
             self.cancel_button.setEnabled(False)
+            self.margin_label.hide()
+            self.route_result_label.hide()
             self.plan_label.setText("Planning failed.")
             self.message_label.setText(f"Planning failed: {error}")
             return
         self.plan_label.setText(f"Search: {result['time']:.3f} s\n"
                                f"Expanded configurations: {result['expanded']}")
+        self.margin_label.setText(f"Frozen margin · Base {result['base_clearance']:.2f} mm\n"
+                                  f"Extra {result['extra_clearance']:.2f} mm · Total {result['required_clearance']:.2f} mm")
         if result["status"] != "found":
             messages = {
                 "invalid_start": "The starting configuration violates limits or required clearance.",
+                "insufficient_clearance": f"The start lacks the selected {result['required_clearance']:.2f} mm clearance. Reduce the uncertainty factor, improve tracking, or choose a different start.",
                 "invalid_target": "The target region is inaccessible within the limits or required clearance.",
                 "no_grid_goal": "No configuration on this grid meets the target tolerance and clearance.",
                 "no_path": "No route connects the start to a valid goal on this grid.",
@@ -580,20 +616,21 @@ class SimulatorWindow(QMainWindow):
                 "cancelled": "Planning cancelled.",
             }
             self.cancel_button.setEnabled(False)
+            self.route_result_label.hide()
             self.message_label.setText(messages[result["status"]])
             return
         self.path = result["path"]
+        self.route_clearance = result["required_clearance"]
+        radius_scale = ((self.structure_radius + self.route_clearance)
+                        / (self.structure_radius + self.required_clearance))
+        self.margin_actor.SetScale(radius_scale)
+        self.render_pending = True
         score = (f"Weighted score: {result['cost']:.2f}\n"
-                 if self.plan_mode == "prox_aware" else "")
+                 if self.plan_mode != "conventional" else "")
         self.plan_label.setText(f"Planned tip travel: {result['length']:.2f} mm\n"
                                f"Clearance bound: ≥ {result['minimum_clearance']:.2f} mm\n"
                                f"{score}Search: {result['time']:.3f} s · Expanded: {result['expanded']}")
         self.plan_label.setToolTip("Travel is the planned tip path length. Clearance is a conservative lower bound across the whole shaft + every movement. The weighted score adds proximity weight × clearance penalty to travel.")
-        if len(self.path) == 1:
-            self.follow_button.setText("Check arrival")
-            self.follow_button.setEnabled(True)
-            self.message_label.setText("No movement needed for this target snapshot. Press Check arrival to verify tracking feedback.")
-            return
         points = [tip_position(self.port, *self.path[0])]
         for start, end in zip(self.path, self.path[1:]):
             change = end - start
@@ -602,17 +639,29 @@ class SimulatorWindow(QMainWindow):
             for fraction in np.linspace(0, 1, intervals + 1)[1:]:
                 points.append(tip_position(self.port, *(start + fraction * change)))
         # samples rotational arcs so the display follows the planned tip movement
+        self.route_points = np.array(points)
+        mesh = (pv.lines_from_points(self.route_points) if len(points) > 1
+                else pv.PolyData(self.route_points))
         self.path_actor = self.viewport.add_mesh(
-            pv.lines_from_points(np.array(points)), color="#7757b5", line_width=3, render_lines_as_tubes=True)
+            mesh, color="#7757b5", line_width=3, render_lines_as_tubes=True,
+            point_size=9, render_points_as_spheres=True)
         self.viewport.render()
         self.follow_button.setEnabled(True)
-        self.message_label.setText("Route ready. Press Follow route to begin autonomous movement.")
+        self.update_route_guidance()
+        if len(self.path) == 1:
+            self.follow_button.setText("Check arrival")
+            self.message_label.setText("No movement needed for this target snapshot. Press Check arrival to verify tracking feedback.")
+        else:
+            self.message_label.setText("Route ready. Use manual controls with the guide, or Follow route for automatic execution.")
 
     def follow_path(self):
         if self.path is None:
             return
+        if self.manual_guidance or self.guidance_warning is not None:
+            self.message_label.setText("Plan a fresh route for automatic execution. The displayed route remains a reference.")
+            return
         if not np.allclose(self.configuration, self.path[0], atol=1e-9, rtol=0):
-            self.stop_path()
+            self.start_manual_control()
             self.message_label.setText("The instrument moved. Plan a new route from its current position.")
             return
         self.pressed_keys.clear()
@@ -629,7 +678,7 @@ class SimulatorWindow(QMainWindow):
         self.follow_button.setEnabled(False)
         self.message_label.setText("Following the planned route." if self.following else "Checking arrival feedback for 0.5 s.")
 
-    def stop_path(self):
+    def stop_path(self, _signal=None, *, keep_route=False):
         if self.planning_cancel is not None:
             self.planning_cancel.set()
         if self.planning_future is not None:
@@ -640,27 +689,50 @@ class SimulatorWindow(QMainWindow):
         self.route_feedback_active = False
         self.route_finished_time = None
         self.route_result = None
+        self.command = self.configuration.copy()
+        self.plan_button.setEnabled(True)
+        self.follow_button.setEnabled(False)
+        self.sync_controls()
+        if keep_route and self.path is not None:
+            self.manual_guidance = True
+            self.update_route_guidance()
+            self.message_label.setText("Manual control. The route stays visible as a reference; replan for automatic execution.")
+            return
+        self.route_clearance = self.required_clearance
+        if self.margin_actor is not None:
+            self.margin_actor.SetScale(1.0)
+            self.render_pending = True
         self.planned_target = None
         self.path = None
+        self.route_points = None
+        self.manual_guidance = False
+        self.guidance_warning = None
+        self.guidance_warning_pending = None
+        self.guidance_warning_started = None
         self.path_index = 0
-        self.command = self.configuration.copy()
         if self.path_actor is not None:
             self.viewport.remove_actor(self.path_actor)
             self.path_actor = None
-        self.plan_button.setEnabled(True)
-        self.follow_button.setEnabled(False)
         self.follow_button.setText("Follow route")
         self.cancel_button.setEnabled(False)
         self.plan_label.setText("Grid: 5° yaw / pitch + 5 mm insertion\nTarget tolerance: 2 mm")
         self.plan_label.setToolTip("")
-        self.route_result_label.setText("Arrival requires 0.5 s within the 2 mm tolerance.")
-        self.sync_controls()
+        self.margin_label.clear()
+        self.margin_label.hide()
+        self.route_result_label.clear()
+        self.route_result_label.hide()
         self.message_label.setText("Route cancelled. Ready for manual movement.")
+
+    def start_manual_control(self):
+        # stops execution once; later commands keep the other manual axes
+        if self.planning_future is not None:
+            self.stop_path()
+        elif self.path is not None and not self.manual_guidance:
+            self.stop_path(keep_route=True)
 
     def set_command(self, axis):
         value = self.sliders[axis].value() / 10
-        if self.path is not None or self.planning_future is not None:
-            self.stop_path()
+        self.start_manual_control()
         self.command[axis] = np.deg2rad(value) if axis < 2 else value
         self.sync_controls()
 
@@ -756,9 +828,11 @@ class SimulatorWindow(QMainWindow):
                                            (self.target_filter, self.target_measurement)):
                 estimator.predict(timestep)
                 estimator.update(measurement)
-        # restarts arrival confirmation if observations were delayed
+        # restarts confirmation periods when observations are delayed
         if self.last_measurement_time is not None and sample_time - self.last_measurement_time > 0.25:
             self.arrival_started = [None, None, None]
+            self.guidance_warning_pending = None
+            self.guidance_warning_started = None
         self.last_measurement_time = sample_time
         self.measurement_count += 1
         self.tool_measurement_actor.SetPosition(*self.tool_measurement)
@@ -803,6 +877,7 @@ class SimulatorWindow(QMainWindow):
                 actual = self.target_feedbacks[0]
                 selected = self.target_feedbacks[self.plan_source_index]
                 self.route_result = {"source": self.plan_source_name, "reported": reported,
+                                     "method": self.plan_mode_name, "required_clearance": self.route_clearance,
                                      "actual_arrived": actual["arrived"],
                                      "actual_distance": actual["distance"],
                                      "reported_distance": selected["distance"],
@@ -819,11 +894,13 @@ class SimulatorWindow(QMainWindow):
                 self.route_result_label.setText(
                     f"{outcome} · {self.plan_source_name}\nActual distance {actual['distance']:.2f} mm")
                 self.message_label.setText(f"{outcome} · actual tip–target distance {actual['distance']:.2f} mm. Plan again to use the latest target estimate.")
+        self.update_route_guidance(refresh=False)
         if self.measurements_checkbox.isChecked() or self.estimates_checkbox.isChecked():
             self.render_pending = True
 
     def update_sensor_readouts(self):
         # refreshes one snapshot while sampling + filtering continue at 10 Hz
+        guide_distance = self.update_route_guidance()
         rows = "".join(
             f'<tr><td>{name}</td><td align="right">{feedback["distance"]:.2f}</td>'
             f'<td align="right">{"Within" if feedback["arrived"] else "Outside"}</td></tr>'
@@ -887,8 +964,62 @@ class SimulatorWindow(QMainWindow):
         self.measurement_count_label.setText(f"Sample {self.displayed_measurement_count}  ·  Readouts 2 Hz")
         yaw, pitch = np.rad2deg(self.sampled_configuration[:2])
         self.position_label.setText(f"ACTUAL INSTRUMENT\nYaw {yaw:.1f}° · Pitch {pitch:.1f}° · Depth {self.sampled_configuration[2]:.1f} mm")
-        self.target_label.setText(f"{self.navigation_mode_combo.currentText().upper()} DISTANCE\n{selected['distance']:.2f} mm  ·  Actual {self.target_feedbacks[0]['distance']:.2f} mm")
-        self.clearance_label.setText(f"SHAFT CLEARANCE\n{self.sampled_clearance:.2f} mm  ·  Required {self.required_clearance:.1f} mm")
+        guide_note = (f"\nTip-to-guide {guide_distance:.2f} mm"
+                      + (" · Replan advised" if self.guidance_warning is not None else "")
+                      if guide_distance is not None else "")
+        self.target_label.setText(f"{self.navigation_mode_combo.currentText().upper()} DISTANCE\n{selected['distance']:.2f} mm  ·  Actual {self.target_feedbacks[0]['distance']:.2f} mm{guide_note}")
+        minimum = self.route_clearance if self.following else self.required_clearance
+        guide_margin = (f"\nGuide planned at {self.route_clearance:.2f} mm"
+                        if self.path is not None and not self.following else "")
+        self.clearance_label.setText(f"SHAFT CLEARANCE\n{self.sampled_clearance:.2f} mm  ·  Movement minimum {minimum:.2f} mm{guide_margin}")
+
+    def update_route_guidance(self, refresh=True):
+        if self.route_points is None:
+            return
+        target = (self.target, self.target_measurement,
+                  self.target_filter.state[:3])[self.plan_source_index]
+        reason = None
+        if np.linalg.norm(target - self.planned_target) > self.target_tolerance:
+            reason = "Target tracking differs from the snapshot."
+        elif self.plan_mode == "uncert_aware":
+            offset = self.tool_filter.state[:3] - tip_position(self.port, *self.sampled_configuration)
+            live_margin = get_uncertainty_margin(offset, self.tool_filter.covariance[:3, :3],
+                                                 self.plan_uncertainty_scale)
+            if round(live_margin, 2) > round(self.route_clearance - self.required_clearance, 2):
+                reason = "Tool tracking exceeds the planned margin."
+        # keeps brief noise changes from flickering the warning
+        if reason != self.guidance_warning_pending:
+            self.guidance_warning_pending = reason
+            self.guidance_warning_started = self.last_measurement_time if reason is not None else None
+        elif (reason is not None and self.guidance_warning is None
+              and self.last_measurement_time - self.guidance_warning_started >= 0.5 - 1e-9):
+            self.guidance_warning = reason
+            self.follow_button.setEnabled(False)
+        if not refresh or self.route_result is not None:
+            return
+        tool = (tip_position(self.port, *self.sampled_configuration),
+                self.tool_measurement, self.tool_filter.state[:3])[self.plan_source_index]
+        if len(self.route_points) == 1:
+            distance = np.linalg.norm(tool - self.route_points[0])
+        else:
+            # projects the selected tip estimate to each displayed line segment
+            segments = np.diff(self.route_points, axis=0)
+            squared_lengths = np.sum(segments ** 2, axis=1)
+            fractions = np.zeros(len(segments))
+            np.divide(np.sum((tool - self.route_points[:-1]) * segments, axis=1),
+                      squared_lengths, out=fractions, where=squared_lengths > 0)
+            closest = self.route_points[:-1] + np.clip(fractions, 0, 1)[:, None] * segments
+            distance = np.linalg.norm(tool - closest, axis=1).min()
+        status = ("Manual reference; replan for automatic execution." if self.manual_guidance
+                  else "Automatic execution uses the frozen route." if self.route_feedback_active
+                  else "Manual guide or automatic execution available.")
+        if self.guidance_warning is not None:
+            status = f"Replan advised: {self.guidance_warning}"
+        if self.manual_guidance and self.sampled_clearance < self.route_clearance:
+            status += " Below planned clearance; manual minimum still applies."
+        self.route_result_label.setText(
+            f"{self.plan_source_name} · Tip-to-guide {distance:.2f} mm\n{status}")
+        return float(distance)
 
     def toggle_measurements(self, _visible):
         for actor in (self.tool_measurement_actor, self.target_measurement_actor):
@@ -933,9 +1064,10 @@ class SimulatorWindow(QMainWindow):
             if not np.any(change) and not self.following:
                 return
             proposed = self.configuration + change
+            clearance = self.route_clearance if self.following else self.required_clearance
             if movement_is_clear(self.port, self.configuration, proposed, self.tool_radius,
                                  self.structure_centre, self.structure_radius,
-                                 self.required_clearance):
+                                 clearance):
                 self.configuration = proposed
                 self.update_instrument()
                 if self.following:
@@ -996,13 +1128,14 @@ class SimulatorWindow(QMainWindow):
             if event.type() in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress,
                                 QEvent.Type.KeyRelease) and event.key() in self.key_directions:
                 if event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier):
+                    if event.type() == QEvent.Type.KeyRelease and not event.isAutoRepeat():
+                        self.pressed_keys.discard(event.key())
                     return super().eventFilter(watched, event)
                 if event.type() == QEvent.Type.ShortcutOverride:
                     event.accept()
                 elif not event.isAutoRepeat():
                     if event.type() == QEvent.Type.KeyPress and not self.pause_button.isChecked():
-                        if self.path is not None or self.planning_future is not None:
-                            self.stop_path()
+                        self.start_manual_control()
                         self.pressed_keys.add(event.key())
                     else:
                         self.pressed_keys.discard(event.key())

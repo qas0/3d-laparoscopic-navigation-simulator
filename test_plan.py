@@ -3,7 +3,7 @@ from threading import Event
 
 import numpy as np
 
-from astar import find_path, get_clearance_penalty
+from astar import find_path, get_clearance_penalty, get_uncertainty_margin
 from geometry import movement_is_clear, shaft_clearance, tip_position
 from scenarios import SCENARIOS
 
@@ -28,22 +28,21 @@ class PlanningTests(unittest.TestCase):
         sampled_clearance = shaft_clearance(
             settings["port"], tip_position(settings["port"], *path[0]),
             settings["tool_radius"], settings["structure_centre"], settings["structure_radius"])
+        required_clearance = result["required_clearance"]
         for first, second in zip(path, path[1:]):
             self.assertEqual(np.count_nonzero(abs(second - first) > 1e-12), 1)
             self.assertTrue(movement_is_clear(
                 settings["port"], first, second, settings["tool_radius"],
                 settings["structure_centre"], settings["structure_radius"],
-                settings.get("required_clearance", 2.0)))
+                required_clearance))
             for fraction in np.linspace(0, 1, 41):
                 tip = tip_position(settings["port"], *(first + fraction * (second - first)))
                 clearance = shaft_clearance(
                     settings["port"], tip, settings["tool_radius"],
                     settings["structure_centre"], settings["structure_radius"])
                 sampled_clearance = min(sampled_clearance, clearance)
-                self.assertGreaterEqual(clearance,
-                    settings.get("required_clearance", 2.0) - 1e-9)
-        self.assertGreaterEqual(result["minimum_clearance"],
-                                settings.get("required_clearance", 2.0) - 1e-9)
+                self.assertGreaterEqual(clearance, required_clearance - 1e-9)
+        self.assertGreaterEqual(result["minimum_clearance"], required_clearance - 1e-9)
         self.assertLessEqual(result["minimum_clearance"], sampled_clearance + 1e-9)
         self.assertGreaterEqual(result["cost"], result["length"] - 1e-9)
 
@@ -176,6 +175,88 @@ class PlanningTests(unittest.TestCase):
                         {"clearance_scale": np.nan}, {"mode": "unsupported"}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 find_path(start=[0, 0, 35], **dict(self.settings, **options))
+
+    def test_uncertainty_margin_combines_offset_and_largest_position_variance(self):
+        offset = np.array([3.0, 4.0, 0.0])
+        covariance = np.diag([1.0, 4.0, 9.0])
+        self.assertAlmostEqual(get_uncertainty_margin(offset, covariance, 2.0), 11.0)
+
+        self.assertAlmostEqual(get_uncertainty_margin(offset, covariance, 0.0), 5.0)
+        self.assertEqual(get_uncertainty_margin(np.zeros(3), np.zeros((3, 3))), 0.0)
+
+    def test_uncertainty_margin_is_unchanged_by_rotation_of_the_world_axes(self):
+        angle = np.deg2rad(37.0)
+        rotation = np.array([[np.cos(angle), 0.0, np.sin(angle)], [0.0, 1.0, 0.0],
+                             [-np.sin(angle), 0.0, np.cos(angle)]])
+        offset, covariance = np.array([3.0, 4.0, 0.0]), np.diag([1.0, 4.0, 9.0])
+        self.assertAlmostEqual(get_uncertainty_margin(rotation @ offset,
+                                                     rotation @ covariance @ rotation.T, 2.0),
+                               get_uncertainty_margin(offset, covariance, 2.0))
+
+    def test_zero_uncertainty_snapshot_matches_proximity_search(self):
+        start, settings = self.scenario_settings("3D detour")
+        proximity = find_path(start=start, mode="prox_aware", **settings)
+        uncertainty = find_path(start=start, mode="uncert_aware", tool_offset=np.zeros(3),
+                                tool_covariance=np.zeros((3, 3)), **settings)
+        np.testing.assert_array_equal(uncertainty["path"], proximity["path"])
+        for key in ("status", "cost", "length", "expanded", "clearance_penalty",
+                    "minimum_clearance", "base_clearance", "extra_clearance", "required_clearance"):
+            self.assertEqual(uncertainty[key], proximity[key])
+
+    def test_uncertainty_margin_is_enforced_throughout_the_shaft_sweep(self):
+        settings = dict(self.settings, tool_radius=1.0, structure_radius=3.0,
+                        structure_centre=np.array([30.0, 0.0, 0.0]),
+                        lower_limits=np.array([np.deg2rad(-20), 0, 10.0]),
+                        upper_limits=np.array([np.deg2rad(20), 0, 40.0]),
+                        grid_step=np.array([np.deg2rad(10), np.deg2rad(5), 10.0]),
+                        target_tolerance=0.01, proximity_weight=0.0)
+        start = np.array([np.deg2rad(-20), 0, 40.0])
+        settings["target"] = tip_position(settings["port"], np.deg2rad(20), 0, 40.0)
+        proximity = find_path(start=start, mode="prox_aware", **settings)
+        uncertainty = find_path(start=start, mode="uncert_aware", tool_offset=[1.0, 0, 0],
+                                tool_covariance=np.diag([9.0, 0, 0]), **settings)
+        self.assertEqual(uncertainty["base_clearance"], 2.0)
+        self.assertEqual(uncertainty["extra_clearance"], 4.0)
+        self.assertEqual(uncertainty["required_clearance"], 6.0)
+        self.check_route(uncertainty, start, settings)
+        self.assertGreater(uncertainty["length"], proximity["length"])
+        self.assertLess(proximity["minimum_clearance"], uncertainty["required_clearance"])
+        # keeps exposure referenced to the base margin for a fair cost comparison
+        reference = find_path(start=start, mode="prox_aware", required_clearance=6.0,
+                              **dict(settings, proximity_weight=0.0))
+        np.testing.assert_array_equal(uncertainty["path"], reference["path"])
+        self.assertAlmostEqual(uncertainty["clearance_penalty"],
+                               reference["clearance_penalty"] * np.exp(-4.0 / 5.0))
+
+    def test_uncertainty_failures_report_the_frozen_clearance_without_claiming_collision(self):
+        event = Event()
+        event.set()
+        cases = [(SCENARIOS["3D detour"]["start"], {}, "insufficient_clearance"),
+                 ([np.deg2rad(50), 0, 90], {}, "invalid_start"),
+                 ([0, 0, 35], {"target": np.array([200.0, 0, 0])}, "invalid_target"),
+                 ([0, 0, 35], {"cancel_event": event}, "cancelled")]
+        for start, options, status in cases:
+            with self.subTest(status=status):
+                result = find_path(start=start, mode="uncert_aware", tool_offset=[3.0, 0, 0],
+                                   tool_covariance=np.zeros((3, 3)), **dict(self.settings, **options))
+                self.assertEqual(result["status"], status)
+                self.assertIsNone(result["path"])
+                self.assertEqual(result["base_clearance"], 2.0)
+                self.assertEqual(result["extra_clearance"], 3.0)
+                self.assertEqual(result["required_clearance"], 5.0)
+
+    def test_uncertainty_inputs_reject_invalid_covariance_offset_or_sensitivity(self):
+        for offset, covariance, sensitivity in [
+                ([0, 0], np.eye(3), 1.0), ([np.nan, 0, 0], np.eye(3), 1.0),
+                (np.zeros(3), np.eye(2), 1.0), (np.zeros(3), np.diag([np.inf, 1, 1]), 1.0),
+                (np.zeros(3), np.array([[1, 1, 0], [0, 1, 0], [0, 0, 1]]), 1.0),
+                (np.zeros(3), np.array([[1, 2, 0], [2, 1, 0], [0, 0, 1]]), 1.0),
+                (np.zeros(3), np.eye(3), -1.0), (np.zeros(3), np.eye(3), np.nan)]:
+            with self.subTest(offset=offset, covariance=covariance, sensitivity=sensitivity):
+                with self.assertRaises(ValueError):
+                    get_uncertainty_margin(offset, covariance, sensitivity)
+        with self.assertRaises(ValueError):
+            find_path(start=[0, 0, 35], mode="uncert_aware", **self.settings)
 
     def test_fixed_scenarios_have_valid_starting_configurations(self):
         for name in SCENARIOS:

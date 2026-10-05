@@ -6,6 +6,23 @@ import numpy as np
 from geometry import instrument_direction, movement_is_clear, shaft_clearance, tip_position
 
 
+def get_uncertainty_margin(tool_offset, tool_covariance, uncertainty_scale=1.0):
+    # expands a frozen tip-error envelope
+    tool_offset = np.asarray(tool_offset, dtype=float)
+    tool_covariance = np.asarray(tool_covariance, dtype=float)
+    if (tool_offset.shape != (3,) or tool_covariance.shape != (3, 3)
+            or not np.all(np.isfinite(tool_offset)) or not np.all(np.isfinite(tool_covariance))
+            or not np.isfinite(uncertainty_scale) or uncertainty_scale < 0):
+        raise ValueError("Invalid uncertainty settings.")
+    if not np.allclose(tool_covariance, tool_covariance.T, atol=1e-10, rtol=0):
+        raise ValueError("Covariance must be symmetric.")
+    eigenvalues = np.linalg.eigvalsh((tool_covariance + tool_covariance.T) / 2)
+    if eigenvalues[0] < -1e-10:
+        raise ValueError("Covariance must be nonnegative.")
+    return float(np.linalg.norm(tool_offset)
+                 + uncertainty_scale * np.sqrt(max(0.0, eigenvalues[-1])))
+
+
 def get_clearance_penalty(clearances, travel, required_clearance=2.0, clearance_scale=5.0):
     # weights tip travel by proximity to the required shaft clearance
     clearances = np.asarray(clearances, dtype=float)
@@ -26,7 +43,7 @@ def get_neighbours(node, shape):
                 yield tuple(neighbour)
 
 
-def reconstruct_path(parents, node):
+def reconstruct(parents, node):
     path = [node]
     while node in parents:
         node = parents[node]
@@ -38,7 +55,8 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
               lower_limits, upper_limits, required_clearance=2.0, target_tolerance=2.0,
               grid_step=None, max_expansions=10000, time_limit=5.0, cancel_event=None,
               include_target=False, mode="conventional", proximity_weight=1.0,
-              clearance_scale=5.0):
+              clearance_scale=5.0, tool_offset=None, tool_covariance=None,
+              uncertainty_scale=1.0):
     # searches yaw, pitch + insertion; angles use radians, distances use mm
     started = perf_counter()
     expanded = 0
@@ -52,11 +70,11 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
     if any(value.shape != (3,) or not np.all(np.isfinite(value)) for value in vectors):
         raise ValueError("Expected three finite values.")
     scalars = [tool_radius, structure_radius, required_clearance, target_tolerance, time_limit,
-               proximity_weight, clearance_scale]
+               proximity_weight, clearance_scale, uncertainty_scale]
     if (not np.all(np.isfinite(scalars)) or min(scalars) < 0
             or time_limit == 0 or clearance_scale == 0):
         raise ValueError("Invalid planning settings.")
-    if mode not in ("conventional", "prox_aware"):
+    if mode not in ("conventional", "prox_aware", "uncert_aware"):
         raise ValueError("Unknown planning mode.")
     if (np.any(grid_step <= 0) or np.any(lower_limits > upper_limits)
             or lower_limits[2] < 0 or max_expansions < 1):
@@ -64,6 +82,12 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
     if (lower_limits[0] < -np.pi or upper_limits[0] > np.pi
             or lower_limits[1] < -np.pi / 2 or upper_limits[1] > np.pi / 2):
         raise ValueError("Yaw or pitch limits out of range.")
+
+    base_clearance = float(required_clearance)
+    extra_clearance = (get_uncertainty_margin(tool_offset, tool_covariance, uncertainty_scale)
+                       if mode == "uncert_aware" else 0.0)
+    # holds the same endpoint envelope along every fixed-port straight-shaft movement
+    required_clearance = base_clearance + extra_clearance
 
     def finish(status, path=None, cost=None):
         length, penalty, minimum_clearance = None, None, None
@@ -78,7 +102,7 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
                 movement_is_clear(port, first, second, tool_radius, structure_centre,
                                   structure_radius, required_clearance,
                                   clearance_samples=clearances)
-                penalty += get_clearance_penalty(clearances, travel, required_clearance,
+                penalty += get_clearance_penalty(clearances, travel, base_clearance,
                                                   clearance_scale)
                 if np.any(first[:2] != second[:2]):
                     # subtracts the same displacement guard used for swept clearance
@@ -96,7 +120,9 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
         return {"status": status, "path": path, "cost": cost,
                 "expanded": expanded, "time": perf_counter() - started,
                 "length": length, "clearance_penalty": penalty,
-                "minimum_clearance": minimum_clearance}
+                "minimum_clearance": minimum_clearance,
+                "base_clearance": base_clearance, "extra_clearance": extra_clearance,
+                "required_clearance": required_clearance}
 
     if cancel_event is not None and cancel_event.is_set():
         return finish("cancelled")
@@ -105,8 +131,10 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
     start_tip = tip_position(port, *start)
     start_clearance = shaft_clearance(port, start_tip, tool_radius, structure_centre,
                                       structure_radius)
-    if start_clearance < required_clearance:
+    if start_clearance < base_clearance:
         return finish("invalid_start")
+    if start_clearance < required_clearance:
+        return finish("insufficient_clearance")
     if np.linalg.norm(start_tip - target) <= target_tolerance + 1e-9:
         return finish("found", np.array([start]), 0.0)
 
@@ -187,7 +215,7 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
         if node in visited or cost > costs[node]:
             continue
         if node in goals:
-            nodes = reconstruct_path(parents, node)
+            nodes = reconstruct(parents, node)
             return finish("found", np.array([configurations[index] for index in nodes]), cost)
         if expanded >= max_expansions:
             return finish("budget_exceeded")
@@ -213,7 +241,7 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
                     travel *= np.cos(configuration[1])
             if cost + travel >= costs.get(neighbour, np.inf):
                 continue
-            clearances = [] if mode == "prox_aware" and proximity_weight > 0 else None
+            clearances = [] if mode != "conventional" and proximity_weight > 0 else None
             if not movement_is_clear(port, configuration, proposed, tool_radius,
                                      structure_centre, structure_radius, required_clearance,
                                      clearance_samples=clearances):
@@ -221,7 +249,7 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
             candidate_cost = cost + travel
             if clearances is not None:
                 candidate_cost += proximity_weight * get_clearance_penalty(
-                    clearances, travel, required_clearance, clearance_scale)
+                    clearances, travel, base_clearance, clearance_scale)
             if candidate_cost >= costs.get(neighbour, np.inf):
                 continue
             costs[neighbour] = candidate_cost
