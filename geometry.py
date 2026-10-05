@@ -32,7 +32,8 @@ def shaft_clearance(port, tip, tool_radius, structure_centre, structure_radius):
 
 
 def movement_is_clear(port, start, end, tool_radius, structure_centre,
-                      structure_radius, required_clearance=0.0, max_step=0.5):
+                      structure_radius, required_clearance=0.0, max_step=0.5,
+                      clearance_samples=None):
     # checks linear movement between (yaw, pitch, depth) configurations
     # uses radians + mm; max_step bounds shaft displacement per interval
     port, start, end, structure_centre = (
@@ -48,18 +49,23 @@ def movement_is_clear(port, start, end, tool_radius, structure_centre,
         raise ValueError("Invalid depth, clearance or step.")
 
     change = end - start
-    if not np.any(change[:2]):
+    rotating = np.any(change[:2])
+    if not rotating:
         # checks the longest shaft because fixed-direction retraction stays inside it
         tip = tip_position(port, start[0], start[1], max(start[2], end[2]))
-        return shaft_clearance(port, tip, tool_radius, structure_centre,
-                               structure_radius) >= required_clearance
+        clearance = shaft_clearance(port, tip, tool_radius,
+                                    structure_centre, structure_radius)
+        if not clearance >= required_clearance:
+            return False
+        if clearance_samples is None:
+            return True
 
     # bounds the displacement of every shaft point during the movement
     movement_bound = abs(change[2]) + max(start[2], end[2]) * (
         abs(change[0]) + abs(change[1]))
     intervals = max(1, int(np.ceil(movement_bound / max_step)))
     # covers unsampled motion because clearance loss is bounded by shaft displacement
-    guard = movement_bound / (2 * intervals)
+    guard = movement_bound / (2 * intervals) if rotating else 0.0
 
     for index in range(intervals):
         fraction = (index + 0.5) / intervals
@@ -69,4 +75,6 @@ def movement_is_clear(port, start, end, tool_radius, structure_centre,
                                     structure_centre, structure_radius)
         if clearance < required_clearance + guard:
             return False
+        if clearance_samples is not None:
+            clearance_samples.append(clearance)
     return True

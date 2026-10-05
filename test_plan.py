@@ -3,7 +3,7 @@ from threading import Event
 
 import numpy as np
 
-from astar import find_path
+from astar import find_path, get_clearance_penalty
 from geometry import movement_is_clear, shaft_clearance, tip_position
 from scenarios import SCENARIOS
 
@@ -24,7 +24,10 @@ class PlanningTests(unittest.TestCase):
         np.testing.assert_array_equal(path[0], start)
         self.assertLessEqual(np.linalg.norm(tip_position(settings["port"], *path[-1])
                                            - settings["target"]),
-                             settings.get("target_tolerance", 2.0) + 1e-9)
+                              settings.get("target_tolerance", 2.0) + 1e-9)
+        sampled_clearance = shaft_clearance(
+            settings["port"], tip_position(settings["port"], *path[0]),
+            settings["tool_radius"], settings["structure_centre"], settings["structure_radius"])
         for first, second in zip(path, path[1:]):
             self.assertEqual(np.count_nonzero(abs(second - first) > 1e-12), 1)
             self.assertTrue(movement_is_clear(
@@ -33,10 +36,16 @@ class PlanningTests(unittest.TestCase):
                 settings.get("required_clearance", 2.0)))
             for fraction in np.linspace(0, 1, 41):
                 tip = tip_position(settings["port"], *(first + fraction * (second - first)))
-                self.assertGreaterEqual(shaft_clearance(
+                clearance = shaft_clearance(
                     settings["port"], tip, settings["tool_radius"],
-                    settings["structure_centre"], settings["structure_radius"]),
+                    settings["structure_centre"], settings["structure_radius"])
+                sampled_clearance = min(sampled_clearance, clearance)
+                self.assertGreaterEqual(clearance,
                     settings.get("required_clearance", 2.0) - 1e-9)
+        self.assertGreaterEqual(result["minimum_clearance"],
+                                settings.get("required_clearance", 2.0) - 1e-9)
+        self.assertLessEqual(result["minimum_clearance"], sampled_clearance + 1e-9)
+        self.assertGreaterEqual(result["cost"], result["length"] - 1e-9)
 
     def scenario_settings(self, name):
         scenario = SCENARIOS[name]
@@ -51,6 +60,7 @@ class PlanningTests(unittest.TestCase):
         result = find_path(start=start, **settings)
         self.check_route(result, start, settings)
         self.assertAlmostEqual(result["cost"], 55.0)
+        self.assertAlmostEqual(result["length"], 55.0)
         np.testing.assert_array_equal(result["path"][:, :2], np.zeros((len(result["path"]), 2)))
 
     def test_off_grid_start_is_preserved_without_diagonal_movement(self):
@@ -94,6 +104,78 @@ class PlanningTests(unittest.TestCase):
         result = find_path(start=start, **settings)
         self.check_route(result, start, settings)
         self.assertTrue(np.any(abs(result["path"][:, 1]) > 1e-9))
+
+    def test_clearance_penalty_weights_distance_and_decreases_with_clearance(self):
+        at_margin = get_clearance_penalty([2.0], 10.0)
+        farther = get_clearance_penalty([7.0], 10.0)
+        self.assertAlmostEqual(at_margin, 10.0)
+        self.assertAlmostEqual(farther, 10.0 / np.e)
+        self.assertLess(farther, at_margin)
+        # checks equal exposure when the same movement is split into shorter edges
+        self.assertAlmostEqual(get_clearance_penalty([7.0], 20.0), 2 * farther)
+        self.assertAlmostEqual(get_clearance_penalty([0.0], 10.0), at_margin)
+
+    def test_clearance_penalty_detects_a_close_shaft_pass_between_clear_endpoints(self):
+        port = np.zeros(3)
+        start, end = np.array([-0.3, 0.0, 100.0]), np.array([0.3, 0.0, 100.0])
+        centre = np.array([50.0, 0.0, 12.0])
+        samples = []
+        self.assertTrue(movement_is_clear(port, start, end, 1.0, centre, 3.0, 2.0,
+                                          clearance_samples=samples))
+        endpoints = [shaft_clearance(port, tip_position(port, *configuration), 1.0,
+                                     centre, 3.0) for configuration in (start, end)]
+        self.assertLess(min(samples), min(endpoints))
+        self.assertGreater(get_clearance_penalty(samples, 60.0),
+                           1.5 * get_clearance_penalty(endpoints, 60.0))
+        tip_clearances = [np.linalg.norm(tip_position(port, *configuration) - centre) - 4.0
+                          for configuration in (start, np.array([0.0, 0.0, 100.0]), end)]
+        self.assertGreater(get_clearance_penalty(samples, 60.0),
+                           get_clearance_penalty(tip_clearances, 60.0))
+
+    def test_zero_proximity_weight_matches_conventional_search(self):
+        start, settings = self.scenario_settings("3D detour")
+        conventional = find_path(start=start, **settings)
+        proximity = find_path(start=start, mode="prox_aware", proximity_weight=0.0, **settings)
+        np.testing.assert_array_equal(proximity["path"], conventional["path"])
+        for key in ("status", "cost", "length", "expanded", "clearance_penalty", "minimum_clearance"):
+            self.assertEqual(proximity[key], conventional[key])
+
+    def test_proximity_route_trades_distance_for_reduced_close_clearance_exposure(self):
+        start, settings = self.scenario_settings("Retraction required")
+        conventional = find_path(start=start, **settings)
+        proximity = find_path(start=start, mode="prox_aware", proximity_weight=1.0, **settings)
+        self.check_route(conventional, start, settings)
+        self.check_route(proximity, start, settings)
+        self.assertGreater(proximity["length"], conventional["length"])
+        self.assertLess(proximity["clearance_penalty"], conventional["clearance_penalty"])
+        self.assertGreater(proximity["minimum_clearance"], conventional["minimum_clearance"])
+        self.assertAlmostEqual(proximity["cost"],
+                               proximity["length"] + proximity["clearance_penalty"])
+        # compares both routes under the same proximity objective
+        self.assertLess(proximity["cost"],
+                        conventional["length"] + conventional["clearance_penalty"])
+
+    def test_proximity_cost_never_allows_a_blocked_shaft_sweep(self):
+        settings = dict(self.settings, tool_radius=1.0, structure_radius=3.0,
+                        structure_centre=np.array([50.0, 0.0, 0.0]),
+                        lower_limits=np.array([-0.3, 0, 100.0]),
+                        upper_limits=np.array([0.3, 0, 100.0]),
+                        grid_step=np.array([0.6, 0.1, 5.0]))
+        start = np.array([-0.3, 0, 100.0])
+        settings["target"] = tip_position(settings["port"], 0.3, 0, 100.0)
+        result = find_path(start=start, mode="prox_aware", proximity_weight=10.0, **settings)
+        self.assertEqual(result["status"], "no_path")
+        self.assertIsNone(result["path"])
+        for key in ("length", "clearance_penalty", "minimum_clearance"):
+            self.assertIsNone(result[key])
+
+    def test_proximity_settings_reject_negative_or_nonfinite_values(self):
+        for options in ({"proximity_weight": -1.0}, {"proximity_weight": np.inf},
+                        {"proximity_weight": np.nan}, {"clearance_scale": 0.0},
+                        {"clearance_scale": -1.0}, {"clearance_scale": np.inf},
+                        {"clearance_scale": np.nan}, {"mode": "unsupported"}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                find_path(start=[0, 0, 35], **dict(self.settings, **options))
 
     def test_fixed_scenarios_have_valid_starting_configurations(self):
         for name in SCENARIOS:
@@ -228,6 +310,8 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(result["status"], "found")
         self.assertEqual(len(result["path"]), 1)
         self.assertEqual(result["cost"], 0.0)
+        self.assertEqual(result["length"], 0.0)
+        self.assertEqual(result["clearance_penalty"], 0.0)
 
 
 if __name__ == "__main__":

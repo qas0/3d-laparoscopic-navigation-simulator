@@ -145,6 +145,21 @@ class SimulatorWindow(QMainWindow):
 
         planning_group = QGroupBox("A* navigation")
         planning_layout = QVBoxLayout(planning_group)
+        self.planning_mode_combo = QComboBox()
+        self.planning_mode_combo.addItem("Conventional A*", "conventional")
+        self.planning_mode_combo.addItem("Proximity-aware A*", "prox_aware")
+        self.planning_mode_combo.setToolTip("Both methods enforce the required shaft clearance. Changing method cancels the route.")
+        self.proximity_weight = QDoubleSpinBox()
+        self.proximity_weight.setRange(0.0, 10.0)
+        self.proximity_weight.setSingleStep(0.5)
+        self.proximity_weight.setDecimals(1)
+        self.proximity_weight.setValue(1.0)
+        self.proximity_weight.setEnabled(False)
+        self.proximity_weight.setToolTip("Zero uses travel cost only. Higher weights discourage close passes; the penalty decays over 5 mm above the required clearance.")
+        planning_settings = QFormLayout()
+        planning_settings.addRow("Planning method", self.planning_mode_combo)
+        planning_settings.addRow("Proximity weight", self.proximity_weight)
+        planning_layout.addLayout(planning_settings)
         self.plan_button = QPushButton("Plan route")
         self.plan_button.setObjectName("primary")
         self.plan_button.clicked.connect(self.plan_path)
@@ -376,6 +391,10 @@ class SimulatorWindow(QMainWindow):
         self.scenario_combo.currentIndexChanged.connect(self.load_scenario)
         self.navigation_mode_combo.currentIndexChanged.connect(self.stop_path)
         self.navigation_mode_combo.currentIndexChanged.connect(self.update_sensor_readouts)
+        self.planning_mode_combo.currentIndexChanged.connect(self.stop_path)
+        self.planning_mode_combo.currentIndexChanged.connect(
+            lambda index: self.proximity_weight.setEnabled(index == 1))
+        self.proximity_weight.valueChanged.connect(self.stop_path)
         self.control_tabs.currentChanged.connect(self.update_sensor_readouts)
 
         QApplication.instance().installEventFilter(self)
@@ -515,6 +534,9 @@ class SimulatorWindow(QMainWindow):
         self.pressed_keys.clear()
         self.plan_source_index = self.navigation_mode_combo.currentIndex()
         self.plan_source_name = self.navigation_mode_combo.currentText()
+        self.plan_mode = self.planning_mode_combo.currentData()
+        self.plan_mode_name = self.planning_mode_combo.currentText()
+        self.plan_weight = self.proximity_weight.value()
         # freezes selected target estimate; new observations don't move this route
         self.planned_target = (self.target, self.target_measurement,
                                self.target_filter.state[:3])[self.plan_source_index].copy()
@@ -525,12 +547,12 @@ class SimulatorWindow(QMainWindow):
             self.tool_radius, self.structure_centre.copy(), self.structure_radius,
             self.lower_limits.copy(), self.upper_limits.copy(), self.required_clearance,
             self.target_tolerance, cancel_event=self.planning_cancel,
-            include_target=True)
+            include_target=True, mode=self.plan_mode, proximity_weight=self.plan_weight)
         self.plan_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.plan_label.setText("Searching the configuration grid…")
         self.route_result_label.setText(f"Target snapshot: {self.plan_source_name}.\nNew readings do not move the planned route.")
-        self.message_label.setText(f"Planning with {self.plan_source_name.lower()}. Cancel or use manual controls to interrupt.")
+        self.message_label.setText(f"{self.plan_mode_name} with {self.plan_source_name.lower()}. Cancel or use manual controls to interrupt.")
 
     def poll_planning(self):
         if self.planning_future is None or not self.planning_future.done():
@@ -561,8 +583,12 @@ class SimulatorWindow(QMainWindow):
             self.message_label.setText(messages[result["status"]])
             return
         self.path = result["path"]
-        self.plan_label.setText(f"Planned tip travel: {result['cost']:.2f} mm\n"
-                               f"Search: {result['time']:.3f} s · Expanded: {result['expanded']}")
+        score = (f"Weighted score: {result['cost']:.2f}\n"
+                 if self.plan_mode == "prox_aware" else "")
+        self.plan_label.setText(f"Planned tip travel: {result['length']:.2f} mm\n"
+                               f"Clearance bound: ≥ {result['minimum_clearance']:.2f} mm\n"
+                               f"{score}Search: {result['time']:.3f} s · Expanded: {result['expanded']}")
+        self.plan_label.setToolTip("Travel is the planned tip path length. Clearance is a conservative lower bound across the whole shaft + every movement. The weighted score adds proximity weight × clearance penalty to travel.")
         if len(self.path) == 1:
             self.follow_button.setText("Check arrival")
             self.follow_button.setEnabled(True)
@@ -626,6 +652,7 @@ class SimulatorWindow(QMainWindow):
         self.follow_button.setText("Follow route")
         self.cancel_button.setEnabled(False)
         self.plan_label.setText("Grid: 5° yaw / pitch + 5 mm insertion\nTarget tolerance: 2 mm")
+        self.plan_label.setToolTip("")
         self.route_result_label.setText("Arrival requires 0.5 s within the 2 mm tolerance.")
         self.sync_controls()
         self.message_label.setText("Route cancelled. Ready for manual movement.")
