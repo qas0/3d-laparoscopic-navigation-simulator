@@ -20,7 +20,7 @@ from feedback import get_target_feedback
 from geometry import movement_is_clear, shaft_clearance, tip_position
 from kalman import KalmanFilter
 from scenarios import SCENARIOS
-from sensors import ApplyDropout, measure_position
+from sensors import ApplyBias, ApplyDropout, measure_position
 
 
 def FormatReading(value):
@@ -236,6 +236,25 @@ class SimulatorWindow(QMainWindow):
         self.sensor_seed.setToolTip("Repeats Gaussian noise + dropout sequences.")
         sensor_settings.addRow("Sensor seed", self.sensor_seed)
         sensor_layout.addWidget(sensor_group)
+        bias_group = QGroupBox("Sensor bias + drift")
+        bias_settings = QFormLayout(bias_group)
+        self.sensor_axis = QComboBox()
+        self.sensor_axis.addItems(["X", "Y", "Z"])
+        self.sensor_axis.setToolTip("World axis for fixed bias + subsequent drift increments.")
+        bias_settings.addRow("Direction", self.sensor_axis)
+        self.tool_bias = QDoubleSpinBox(minimum=-20.0, maximum=20.0, decimals=1,
+                                       singleStep=0.5, suffix=" mm", keyboardTracking=False)
+        self.target_bias = QDoubleSpinBox(minimum=-20.0, maximum=20.0, decimals=1,
+                                         singleStep=0.5, suffix=" mm", keyboardTracking=False)
+        self.tool_drift = QDoubleSpinBox(minimum=-1.0, maximum=1.0, decimals=2,
+                                        singleStep=0.05, suffix=" mm/s", keyboardTracking=False)
+        self.target_drift = QDoubleSpinBox(minimum=-1.0, maximum=1.0, decimals=2,
+                                          singleStep=0.05, suffix=" mm/s", keyboardTracking=False)
+        for name, setting in (("Tool bias", self.tool_bias), ("Target bias", self.target_bias),
+                              ("Tool drift", self.tool_drift), ("Target drift", self.target_drift)):
+            bias_settings.addRow(name, setting)
+        bias_group.setToolTip("Changes preserve the filters. Drift accumulates until Restart sensors clears it; zero rate stops further drift.")
+        sensor_layout.addWidget(bias_group)
         self.restart_sensor_button = QPushButton("Restart sensors")
         self.restart_sensor_button.clicked.connect(self.reset_measurements)
         sensor_layout.addWidget(self.restart_sensor_button)
@@ -301,7 +320,7 @@ class SimulatorWindow(QMainWindow):
         self.estimate_error_label = QLabel(wordWrap=True)
         self.uncertainty_label = QLabel(wordWrap=True)
         self.rmse_label = QLabel(wordWrap=True)
-        self.uncertainty_label.setToolTip("Model RMS position uncertainty: square root of the three position variances added together.")
+        self.uncertainty_label.setToolTip("Model RMS position uncertainty: square root of the three position variances added together. Unknown bias + drift are not included.")
         self.rmse_label.setToolTip("Raw RMSE uses received readings only. Filtered RMSE uses every initialized estimate, including predictions during dropout. These are different sample sets.")
         for label in (self.tool_estimate_label, self.target_estimate_label,
                       self.estimate_error_label, self.uncertainty_label, self.rmse_label):
@@ -763,6 +782,7 @@ class SimulatorWindow(QMainWindow):
         seed = self.sensor_seed.value()
         self.sensor_generator = np.random.default_rng(seed)
         self.dropout_generators = [np.random.default_rng([seed, index]) for index in (1, 2)]
+        self.sensor_drift = np.zeros((2, 3))
         self.measurement_count = 0
         self.tool_filter = None
         self.target_filter = None
@@ -807,11 +827,19 @@ class SimulatorWindow(QMainWindow):
         filters = [self.tool_filter, self.target_filter]
         readings = [self.tool_measurement, self.target_measurement]
         estimates = [None, None]
-        for index, (position, noise, dropout, acceleration) in enumerate((
-                (tool_tip, self.tool_noise.value(), self.tool_dropout.value(), 20.0),
-                (self.target, self.target_noise.value(), self.target_dropout.value(), 1.0))):
+        direction = np.eye(3)[self.sensor_axis.currentIndex()]
+        for index, (position, noise, dropout, bias, drift, acceleration) in enumerate((
+                (tool_tip, self.tool_noise.value(), self.tool_dropout.value(),
+                 self.tool_bias.value(), self.tool_drift.value(), 20.0),
+                (self.target, self.target_noise.value(), self.target_dropout.value(),
+                 self.target_bias.value(), self.target_drift.value(), 1.0))):
+            # accumulates drift while preserving previous offsets when its rate changes
+            drift_rate = direction * drift
+            biased_position = ApplyBias(position, direction * bias + self.sensor_drift[index],
+                                        drift_rate, timestep or 0.0)
+            self.sensor_drift[index] += drift_rate * (timestep or 0.0)
             # draws noise every tick so dropout does not change the Gaussian sequence
-            observation = ApplyDropout(measure_position(position, noise, self.sensor_generator),
+            observation = ApplyDropout(measure_position(biased_position, noise, self.sensor_generator),
                                        dropout / 100, self.dropout_generators[index])
             self.observations[index] = observation
             estimator = filters[index]

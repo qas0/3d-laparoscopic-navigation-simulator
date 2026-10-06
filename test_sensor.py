@@ -2,7 +2,9 @@ import unittest
 
 import numpy as np
 
-from sensors import ApplyDropout, measure_position
+from feedback import get_target_feedback
+from kalman import KalmanFilter
+from sensors import ApplyBias, ApplyDropout, measure_position
 
 
 class SensorTests(unittest.TestCase):
@@ -108,6 +110,95 @@ class SensorTests(unittest.TestCase):
         for position in [None, [], [1, 2], [[1, 2, 3]], [np.nan, 0, 0], [np.inf, 0, 0]]:
             with self.subTest(position=position), self.assertRaises(ValueError):
                 ApplyDropout(position, 1.0, np.random.default_rng(1))
+
+    def test_BiasDisabledPreservesInputsWithoutSharingMemory(self):
+        position = np.array([90.0, -4.0, 3.0])
+        bias = np.zeros(3)
+        drift_rate = np.zeros(3)
+        measured = ApplyBias(position, bias, drift_rate, 20.0)
+        np.testing.assert_array_equal(measured, position)
+        for value in (position, bias, drift_rate):
+            self.assertFalse(np.shares_memory(measured, value))
+        measured[0] = -100.0
+        np.testing.assert_array_equal(position, [90.0, -4.0, 3.0])
+        np.testing.assert_array_equal(bias, np.zeros(3))
+        np.testing.assert_array_equal(drift_rate, np.zeros(3))
+
+    def test_BiasAndDriftUseSignedOffsetsAndElapsedSeconds(self):
+        position = np.array([90.0, -4.0, 3.0])
+        bias = np.array([-3.0, 2.0, 0.5])
+        drift_rate = np.array([0.2, -0.4, 0.0])
+        np.testing.assert_array_equal(ApplyBias(position, bias, drift_rate, 0.0),
+                                      [87.0, -2.0, 3.5])
+        final_reading = ApplyBias(position, bias, drift_rate, 2.5)
+        np.testing.assert_array_equal(final_reading, [87.5, -3.0, 3.5])
+
+        # keeps the same final drift when sample intervals change
+        elapsed_time = 0.0
+        for interval in (0.5, 0.25, 0.75, 1.0):
+            elapsed_time += interval
+            measured = ApplyBias(position, bias, drift_rate, elapsed_time)
+        np.testing.assert_array_equal(measured, final_reading)
+        np.testing.assert_array_equal(position, [90.0, -4.0, 3.0])
+        np.testing.assert_array_equal(bias, [-3.0, 2.0, 0.5])
+        np.testing.assert_array_equal(drift_rate, [0.2, -0.4, 0.0])
+
+    def test_BiasPreservesSeededNoiseAndDropoutSequences(self):
+        position = np.array([90.0, -4.0, 3.0])
+        noise_generator = np.random.default_rng(65)
+        repeated_noise = np.random.default_rng(65)
+        dropout_generator = np.random.default_rng(66)
+        repeated_dropout = np.random.default_rng(66)
+        for sample in range(30):
+            elapsed_time = sample * 0.1
+            biased = ApplyBias(position, [3.0, -2.0, 1.0], [0.2, 0.0, -0.1], elapsed_time)
+            measured = measure_position(biased, 2.0, noise_generator)
+            repeated = measure_position(position, 2.0, repeated_noise)
+            received = ApplyDropout(measured, 0.4, dropout_generator)
+            original = ApplyDropout(repeated, 0.4, repeated_dropout)
+            self.assertEqual(received is None, original is None)
+            if received is not None:
+                np.testing.assert_allclose(received - original,
+                                           [3.0 + 0.2 * elapsed_time, -2.0,
+                                            1.0 - 0.1 * elapsed_time], atol=1e-12)
+        self.assertEqual(noise_generator.random(), repeated_noise.random())
+        self.assertEqual(dropout_generator.random(), repeated_dropout.random())
+
+    def test_BiasRejectsInvalidVectorsTimesAndOverflow(self):
+        for index in range(3):
+            for value in (None, [], [1, 2], [[1, 2, 3]], [np.nan, 0, 0],
+                          [np.inf, 0, 0], "invalid"):
+                inputs = [[1, 2, 3], [0, 0, 0], [0, 0, 0]]
+                inputs[index] = value
+                with self.subTest(index=index, value=value), self.assertRaises(ValueError):
+                    ApplyBias(*inputs, 1.0)
+        for elapsed_time in (-1.0, np.nan, np.inf, -np.inf, [1.0], [[1.0]], "invalid"):
+            with self.subTest(elapsed_time=elapsed_time), self.assertRaises(ValueError):
+                ApplyBias([1, 2, 3], [0, 0, 0], [0, 0, 0], elapsed_time)
+        with self.assertRaises(ValueError):
+            ApplyBias([0, 0, 0], [0, 0, 0], [1e308, 0, 0], 2.0)
+
+    def test_BiasCanCauseFalseArrivalDespiteSmallFilterCovariance(self):
+        tool = np.array([0.0, 0.0, 0.0])
+        target = np.array([5.0, 0.0, 0.0])
+        tool_reading = ApplyBias(tool, [0, 0, 0], [0, 0, 0], 0.0)
+        target_reading = ApplyBias(target, [-5, 0, 0], [0, 0, 0], 0.0)
+        filters = [KalmanFilter(reading, 0.1, acceleration_std=0.0, velocity_std=0.0)
+                   for reading in (tool_reading, target_reading)]
+        for _ in range(30):
+            for filter_, reading in zip(filters, (tool_reading, target_reading)):
+                filter_.predict(0.1)
+                filter_.update(reading)
+
+        tool_filter, target_filter = filters
+        feedback = get_target_feedback(tool_filter.state[:3], target_filter.state[:3],
+                                       tool_covariance=tool_filter.covariance[:3, :3],
+                                       target_covariance=target_filter.covariance[:3, :3])
+        # checks that repeated biased readings reduce covariance without removing their error
+        self.assertTrue(feedback["arrived"])
+        self.assertLess(feedback["uncertainty"], 0.1)
+        self.assertAlmostEqual(np.linalg.norm(target_filter.state[:3] - target), 5.0)
+        self.assertFalse(get_target_feedback(tool, target)["arrived"])
 
 
 if __name__ == "__main__":
