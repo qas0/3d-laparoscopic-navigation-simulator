@@ -19,6 +19,7 @@ from astar import find_path, get_uncertainty_margin
 from feedback import get_target_feedback
 from geometry import movement_is_clear, shaft_clearance, tip_position
 from kalman import KalmanFilter
+from motion import GetRespiratoryMotion
 from scenarios import SCENARIOS
 from sensors import ApplyBias, ApplyDropout, measure_position
 
@@ -124,6 +125,21 @@ class SimulatorWindow(QMainWindow):
         control_layout.addWidget(self.scenario_combo)
         self.scenario_description = QLabel(wordWrap=True)
         control_layout.addWidget(self.scenario_description)
+        motion_group = QGroupBox("Respiratory motion")
+        motion_settings = QFormLayout(motion_group)
+        self.motion_amplitude = QDoubleSpinBox(minimum=0.0, maximum=10.0, decimals=1,
+                                              singleStep=0.5, suffix=" mm", keyboardTracking=False)
+        self.motion_frequency = QDoubleSpinBox(minimum=0.0, maximum=0.5, decimals=2,
+                                              singleStep=0.05, value=0.2, suffix=" Hz",
+                                              keyboardTracking=False)
+        self.motion_amplitude.setToolTip("Maximum Z displacement from the resting position. Zero keeps anatomy still.")
+        self.motion_frequency.setToolTip("Cycles per second: 0.2 Hz gives one cycle every 5 seconds.")
+        motion_group.setToolTip("Moves organ + target together along Z. Changing settings restarts the selected scenario.")
+        motion_settings.addRow("Amplitude", self.motion_amplitude)
+        motion_settings.addRow("Frequency", self.motion_frequency)
+        self.motion_label = QLabel(wordWrap=True)
+        motion_settings.addRow(self.motion_label)
+        control_layout.addWidget(motion_group)
         control_layout.addWidget(QLabel("Guidance source"))
         self.navigation_mode_combo = QComboBox()
         self.navigation_mode_combo.addItems(["Ideal positions", "Raw tracking", "Filtered tracking"])
@@ -201,6 +217,7 @@ class SimulatorWindow(QMainWindow):
         control_layout.addWidget(keyboard_help)
 
         self.pause_button = QPushButton("Pause movement", checkable=True)
+        self.pause_button.setToolTip("Pauses the instrument; anatomy + sensors continue.")
         self.pause_button.toggled.connect(self.set_paused)
         control_layout.addWidget(self.pause_button)
         self.reset_button = QPushButton("Reset instrument")
@@ -395,6 +412,8 @@ class SimulatorWindow(QMainWindow):
         self.readout_timer.timeout.connect(self.update_sensor_readouts)
         self.load_scenario(self.scenario_combo.currentIndex())
         self.scenario_combo.currentIndexChanged.connect(self.load_scenario)
+        for setting in (self.motion_amplitude, self.motion_frequency):
+            setting.valueChanged.connect(lambda _: self.load_scenario(self.scenario_combo.currentIndex()))
         self.navigation_mode_combo.currentIndexChanged.connect(self.stop_path)
         self.navigation_mode_combo.currentIndexChanged.connect(self.update_sensor_readouts)
         self.planning_mode_combo.currentIndexChanged.connect(self.stop_path)
@@ -427,16 +446,21 @@ class SimulatorWindow(QMainWindow):
         self.scenario_name = self.scenario_combo.itemText(index)
         scenario = SCENARIOS[self.scenario_name]
         self.configuration = scenario["start"].copy()
-        self.target = tip_position(self.port, *scenario["target_configuration"])
+        self.rest_target = tip_position(self.port, *scenario["target_configuration"])
+        self.target = self.rest_target.copy()
+        self.motion_started_time = None
         self.structure_centre = scenario["structure_centre"].copy()
         self.structure_radius = scenario["structure_radius"]
         # places the target on the near surface of the reference ellipsoid
-        self.organ_centre = self.target + np.array([20.0, 0.0, 0.0])
+        self.rest_organ_centre = self.rest_target + np.array([20.0, 0.0, 0.0])
+        self.organ_centre = self.rest_organ_centre.copy()
+        motion_bounds = np.array([0.0, 0.0, self.motion_amplitude.value()])
         direction = (tip_position(self.port, *self.configuration) - self.port) / self.configuration[2]
         handle_end = self.port - (self.shaft_length - self.configuration[2] + 28) * direction
         reference_points = np.array([
             handle_end, self.port, tip_position(self.port, *self.configuration),
-            self.organ_centre - [20, 26, 22], self.organ_centre + [20, 26, 22],
+            self.organ_centre - [20, 26, 22] - motion_bounds,
+            self.organ_centre + [20, 26, 22] + motion_bounds,
             self.structure_centre - self.structure_radius,
             self.structure_centre + self.structure_radius,
         ])
@@ -457,8 +481,9 @@ class SimulatorWindow(QMainWindow):
         self.viewport.enable_lightkit()
         organ = pv.Sphere(radius=1, theta_resolution=64, phi_resolution=48)
         organ.points = organ.points * np.array([20, 26, 22]) + self.organ_centre
-        self.viewport.add_mesh(organ, color="#d9a59b", opacity=0.85,
-                               smooth_shading=True, specular=0.25, specular_power=25)
+        self.organ_actor = self.viewport.add_mesh(
+            organ, color="#d9a59b", opacity=0.85,
+            smooth_shading=True, specular=0.25, specular_power=25)
         self.viewport.add_mesh(pv.Sphere(radius=self.structure_radius, center=self.structure_centre),
                                color="#bc4046", smooth_shading=True, specular=0.3)
         margin = pv.Sphere(radius=self.structure_radius + self.required_clearance,
@@ -466,13 +491,14 @@ class SimulatorWindow(QMainWindow):
         self.margin_actor = self.viewport.add_mesh(
             margin, color="#ce7a7e", opacity=0.12, smooth_shading=True)
         self.margin_actor.SetOrigin(*self.structure_centre)
-        self.viewport.add_mesh(pv.Sphere(radius=2.2, center=self.target),
-                               color="#199a78", smooth_shading=True, ambient=0.25)
+        self.target_actor = self.viewport.add_mesh(
+            pv.Sphere(radius=2.2, center=self.target),
+            color="#199a78", smooth_shading=True, ambient=0.25)
         self.viewport.add_mesh(pv.Disc(center=self.port, normal=(1, 0, 0),
                                        inner=3, outer=6, c_res=64),
                                color="#438198", ambient=0.35)
 
-        # builds each instrument part once; movement changes its transform
+        # builds each instrument part once
         self.shaft_actor = self.viewport.add_mesh(
             pv.Cylinder(center=(0.5, 0, 0), direction=(1, 0, 0),
                         radius=self.tool_radius, height=1, resolution=32),
@@ -504,15 +530,36 @@ class SimulatorWindow(QMainWindow):
             actor.SetVisibility(self.measurements_checkbox.isChecked())
         for actor in (self.tool_estimate_actor, self.target_estimate_actor):
             actor.SetVisibility(self.estimates_checkbox.isChecked())
+        self.label_points = pv.PolyData(np.array([
+            self.port, self.target, self.structure_centre,
+            self.organ_centre + np.array([0.0, 0.0, 22.0])]))
+        self.label_points["labels"] = ["Fixed port", "Target", "Protected structure", "Organ surface"]
         self.label_actor = self.viewport.add_point_labels(
-            np.array([self.port, self.target, self.structure_centre,
-                      self.organ_centre + np.array([0.0, 0.0, 22.0])]),
-            ["Fixed port", "Target", "Protected structure", "Organ surface"],
+            self.label_points, "labels",
             font_size=12, text_color="#25384b", point_size=0, shape_opacity=0.0,
             always_visible=True, show_points=False)
         self.label_actor.SetVisibility(self.labels_checkbox.isChecked())
         self.viewport.add_axes(color="#62788c")
         self.reset_camera()
+
+    def UpdateRespiratoryMotion(self, now=None):
+        now = perf_counter() if now is None else now
+        if self.motion_started_time is None:
+            self.motion_started_time = now
+        self.motion_displacement, self.motion_velocity = GetRespiratoryMotion(
+            self.motion_amplitude.value(), self.motion_frequency.value(), now - self.motion_started_time)
+        offset = np.array([0.0, 0.0, self.motion_displacement])
+        target = self.rest_target + offset
+        if np.array_equal(target, self.target):
+            return
+        self.target = target
+        self.organ_centre = self.rest_organ_centre + offset
+        # translates persistent meshes and labels without changing camera framing
+        self.organ_actor.SetPosition(*offset)
+        self.target_actor.SetPosition(*offset)
+        self.label_points.points[1] = self.target
+        self.label_points.points[3] = self.organ_centre + [0.0, 0.0, 22.0]
+        self.render_pending = True
 
     def reset_camera(self):
         # fits fixed scenario bounds so noise + instrument resets cannot shift the view
@@ -554,7 +601,7 @@ class SimulatorWindow(QMainWindow):
                            - tip_position(self.port, *self.sampled_configuration))
             tool_covariance = self.tool_filter.covariance[:3, :3].copy()
         # freezes selected target estimate; new observations don't move this route
-        self.planned_target = (self.target, self.target_measurement,
+        self.planned_target = (self.sampled_target, self.target_measurement,
                                self.target_estimate)[self.plan_source_index].copy()
         self.planning_cancel = Event()
         # searches with copied scene values; only the UI thread updates widgets
@@ -769,7 +816,7 @@ class SimulatorWindow(QMainWindow):
             return
         self.command = self.configuration.copy()
         self.sync_controls()
-        self.scenario_description.setText("Random start. Target and protected structure stay fixed.")
+        self.scenario_description.setText("Random start within the scenario limits.")
         self.update_instrument()
         self.reset_measurements()
         self.message_label.setText("Instrument reset to a new random starting position. Plan a new route or use manual controls.")
@@ -809,6 +856,9 @@ class SimulatorWindow(QMainWindow):
 
     def update_measurements(self):
         sample_time = perf_counter()
+        self.UpdateRespiratoryMotion(sample_time)
+        self.sampled_target = self.target.copy()
+        self.sampled_motion = (self.motion_displacement, self.motion_velocity)
         if self.last_measurement_time is not None and sample_time - self.last_measurement_time > self.tracking_timeout:
             self.CheckRouteTracking()
             # restarts confirmation periods when observations are delayed
@@ -831,7 +881,7 @@ class SimulatorWindow(QMainWindow):
         for index, (position, noise, dropout, bias, drift, acceleration) in enumerate((
                 (tool_tip, self.tool_noise.value(), self.tool_dropout.value(),
                  self.tool_bias.value(), self.tool_drift.value(), 20.0),
-                (self.target, self.target_noise.value(), self.target_dropout.value(),
+                (self.sampled_target, self.target_noise.value(), self.target_dropout.value(),
                  self.target_bias.value(), self.target_drift.value(), 1.0))):
             # accumulates drift while preserving previous offsets when its rate changes
             drift_rate = direction * drift
@@ -874,7 +924,7 @@ class SimulatorWindow(QMainWindow):
                 actor.SetPosition(*position)
         self.toggle_measurements(None, render=False)
         # compares actual, raw + filtered views of the same task
-        self.target_feedbacks = [get_target_feedback(tool_tip, self.target, self.target_tolerance)]
+        self.target_feedbacks = [get_target_feedback(tool_tip, self.sampled_target, self.target_tolerance)]
         for positions, covariances in (
                 (self.observations, [self.tool_noise.value() ** 2 * np.eye(3),
                                      self.target_noise.value() ** 2 * np.eye(3)]),
@@ -927,6 +977,8 @@ class SimulatorWindow(QMainWindow):
 
     def update_sensor_readouts(self):
         # refreshes one snapshot while sampling + filtering continue at 10 Hz
+        self.motion_label.setText(f"Actual Z offset {self.sampled_motion[0]:.2f} mm\n"
+                                  f"Actual Z velocity {self.sampled_motion[1]:.2f} mm/s")
         self.toggle_measurements(None, render=False)
         if self.measurements_checkbox.isChecked():
             self.render_pending = True
@@ -1050,7 +1102,7 @@ class SimulatorWindow(QMainWindow):
         if self.route_points is None:
             return
         available = self.CheckRouteTracking()
-        target = (self.target, self.target_measurement,
+        target = (self.sampled_target, self.target_measurement,
                   self.target_estimate)[self.plan_source_index]
         reason = None
         if available and np.linalg.norm(target - self.planned_target) > self.target_tolerance:
@@ -1118,6 +1170,7 @@ class SimulatorWindow(QMainWindow):
     def advance_movement(self):
         try:
             now = perf_counter()
+            self.UpdateRespiratoryMotion(now)
             # limits delayed frames to prevent sudden movement jumps
             timestep = min(now - self.last_tick, 0.05)
             self.last_tick = now
