@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
+from queue import Queue
 from threading import Event
 from time import perf_counter
 
@@ -9,13 +10,15 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame,
-    QGroupBox, QHBoxLayout, QLabel, QMainWindow, QPushButton, QScrollArea,
-    QSlider, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
+    QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
+    QPushButton, QScrollArea, QSlider, QSpinBox, QTableWidget, QTableWidgetItem,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 from pyvistaqt import QtInteractor
 
 from astar import find_path, get_uncertainty_margin
+from experiments import CompareMethods
 from feedback import get_target_feedback
 from geometry import movement_is_clear, shaft_clearance, tip_position
 from kalman import KalmanFilter
@@ -65,6 +68,10 @@ class SimulatorWindow(QMainWindow):
         self.following = False
         self.planning_future = None
         self.planning_cancel = None
+        self.comparison_future = None
+        self.comparison_cancel = Event()
+        self.comparison_progress = Queue()
+        self.comparison_result = None
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.pressed_keys = set()
         self.key_directions = {
@@ -94,8 +101,11 @@ class SimulatorWindow(QMainWindow):
             QComboBox, QDoubleSpinBox, QSpinBox { background: white;
                         border: 1px solid #bdcbd6; border-radius: 5px; padding: 5px; }
             QTabWidget::pane { border: none; }
-            QTabBar::tab { background: #e8eef3; padding: 9px 13px; }
+            QTabBar::tab { background: #e8eef3; padding: 9px 8px; font-size: 9pt; }
             QTabBar::tab:selected { background: white; color: #286e9f; }
+            QTableWidget { background: white; alternate-background-color: #edf2f6;
+                           gridline-color: #d9e1e8; }
+            QHeaderView::section { background: #e8eef3; padding: 7px; border: none; }
             QSlider::groove:horizontal { height: 5px; background: #d4dfe7; border-radius: 2px; }
             QSlider::handle:horizontal { background: #286e9f; width: 15px;
                                         margin: -5px 0; border-radius: 7px; }
@@ -361,6 +371,44 @@ class SimulatorWindow(QMainWindow):
         for setting in (self.tool_noise, self.target_noise, self.sensor_seed):
             setting.valueChanged.connect(self.reset_measurements)
 
+        comparison_layout = self.create_control_tab("Experiments")
+        self.comparison_setup_label = QLabel(wordWrap=True)
+        comparison_layout.addWidget(self.comparison_setup_label)
+        comparison_settings = QFormLayout()
+        self.comparison_trials = QSpinBox(minimum=1, maximum=100, value=10,
+                                         keyboardTracking=False)
+        comparison_settings.addRow("Trials per method", self.comparison_trials)
+        comparison_layout.addLayout(comparison_settings)
+        self.comparison_button = QPushButton("Run comparison", objectName="primary")
+        self.comparison_button.setToolTip("Runs all three methods with the selected settings, starting at the scenario's fixed pose. Each trial restarts sensors + breathing, uses a 1 s warmup and a 20 s simulation limit.")
+        self.comparison_button.clicked.connect(self.RunComparison)
+        comparison_layout.addWidget(self.comparison_button)
+        self.comparison_stop_button = QPushButton("Stop comparison", enabled=False)
+        self.comparison_stop_button.clicked.connect(self.comparison_cancel.set)
+        comparison_layout.addWidget(self.comparison_stop_button)
+        self.comparison_status_label = QLabel(wordWrap=True)
+        comparison_layout.addWidget(self.comparison_status_label)
+        self.comparison_dialog = QDialog(self)
+        self.comparison_dialog.setWindowTitle("Planner comparison")
+        self.comparison_dialog.resize(1020, 650)
+        self.comparison_dialog.setMinimumSize(820, 450)
+        result_layout = QVBoxLayout(self.comparison_dialog)
+        self.comparison_result_label = QLabel(wordWrap=True)
+        result_layout.addWidget(self.comparison_result_label)
+        self.comparison_table = QTableWidget(0, 4)
+        self.comparison_table.setHorizontalHeaderLabels(
+            ["Metric / mean ± SD (n)", "Conventional A*", "Proximity-aware A*", "Uncertainty-aware A*"])
+        self.comparison_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.comparison_table.setAlternatingRowColors(True)
+        self.comparison_table.verticalHeader().hide()
+        self.comparison_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.comparison_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        result_layout.addWidget(self.comparison_table)
+        self.comparison_results_button = QPushButton("View results", visible=False)
+        self.comparison_results_button.clicked.connect(self.comparison_dialog.show)
+        comparison_layout.addWidget(self.comparison_results_button)
+        comparison_layout.addStretch()
+
         scene_frame = QFrame(objectName="scene")
         scene_layout = QVBoxLayout(scene_frame)
         scene_layout.setContentsMargins(1, 1, 1, 1)
@@ -410,6 +458,7 @@ class SimulatorWindow(QMainWindow):
         self.sensor_timer.timeout.connect(self.update_measurements)
         self.readout_timer = QTimer(self)
         self.readout_timer.timeout.connect(self.update_sensor_readouts)
+        self.readout_timer.timeout.connect(self.UpdateComparison)
         self.load_scenario(self.scenario_combo.currentIndex())
         self.scenario_combo.currentIndexChanged.connect(self.load_scenario)
         for setting in (self.motion_amplitude, self.motion_frequency):
@@ -424,6 +473,8 @@ class SimulatorWindow(QMainWindow):
         self.proximity_weight.valueChanged.connect(self.stop_path)
         self.uncertainty_scale.valueChanged.connect(self.stop_path)
         self.control_tabs.currentChanged.connect(self.update_sensor_readouts)
+        self.control_tabs.currentChanged.connect(self.UpdateComparison)
+        self.UpdateComparison()
 
         QApplication.instance().installEventFilter(self)
         self.last_tick = perf_counter()
@@ -580,7 +631,124 @@ class SimulatorWindow(QMainWindow):
         self.viewport.render()
         self.render_pending = False
 
+    def RunComparison(self):
+        if self.comparison_future is not None:
+            return
+        if self.planning_future is not None:
+            self.comparison_status_label.setText("Finish or cancel route planning first.")
+            return
+        self.UpdateComparison()
+        # captures widget values before sending plain settings to the worker
+        axis = np.eye(3)[self.sensor_axis.currentIndex()]
+        settings = {
+            "tracking": ("ideal", "raw", "filtered")[self.navigation_mode_combo.currentIndex()],
+            "tool_noise": self.tool_noise.value(), "target_noise": self.target_noise.value(),
+            "tool_dropout": self.tool_dropout.value() / 100,
+            "target_dropout": self.target_dropout.value() / 100,
+            "tool_bias": axis * self.tool_bias.value(), "target_bias": axis * self.target_bias.value(),
+            "tool_drift": axis * self.tool_drift.value(), "target_drift": axis * self.target_drift.value(),
+            "motion_amplitude": self.motion_amplitude.value(),
+            "motion_frequency": self.motion_frequency.value(),
+            "proximity_weight": self.proximity_weight.value(),
+            "uncertainty_scale": self.uncertainty_scale.value(),
+        }
+        seed = self.sensor_seed.value()
+        seeds = range(seed, seed + self.comparison_trials.value())
+        self.comparison_cancel.clear()
+        self.comparison_result = None
+        while not self.comparison_progress.empty():
+            self.comparison_progress.get_nowait()
+        self.comparison_dialog.hide()
+        self.comparison_results_button.hide()
+        self.comparison_status_label.setText(f"Completed 0 / {3 * len(seeds)} trials.")
+        self.comparison_future = self.executor.submit(
+            CompareMethods, self.scenario_combo.currentText(), seeds,
+            cancel_event=self.comparison_cancel, progress=self.comparison_progress.put, **settings)
+        self.comparison_button.setEnabled(False)
+        self.comparison_trials.setEnabled(False)
+        self.comparison_stop_button.setEnabled(True)
+        self.plan_button.setEnabled(False)
+
+    def UpdateComparison(self):
+        if self.comparison_future is None:
+            seed, count = self.sensor_seed.value(), self.comparison_trials.value()
+            self.comparison_setup_label.setText(
+                f"{self.scenario_combo.currentText()}\n{self.navigation_mode_combo.currentText()}\n"
+                f"3 methods × {count} trials · Seeds {seed}–{seed + count - 1}")
+            return
+        # reads worker progress on the UI thread without touching the live scene
+        while not self.comparison_progress.empty():
+            completed, total, mode, seed = self.comparison_progress.get_nowait()
+            state = "Stopping" if self.comparison_cancel.is_set() else "Completed"
+            self.comparison_status_label.setText(f"{state} · {completed} / {total} trials.")
+        if not self.comparison_future.done():
+            return
+        future = self.comparison_future
+        self.comparison_future = None
+        self.comparison_button.setEnabled(True)
+        self.comparison_trials.setEnabled(True)
+        self.comparison_stop_button.setEnabled(False)
+        self.plan_button.setEnabled(not self.route_feedback_active)
+        try:
+            result = future.result()
+        except Exception as error:
+            self.comparison_status_label.setText(f"Comparison failed: {error}")
+            return
+        self.comparison_result = result
+        state = "Stopped" if result["cancelled"] else "Completed"
+        self.comparison_status_label.setText(
+            f"{state} · {len(result['trials'])} / {3 * len(result['seeds'])} trials.")
+        if not result["trials"]:
+            return
+        settings = result["settings"]
+        self.comparison_result_label.setText(
+            f"{result['scenario']} · {settings['tracking'].capitalize()} tracking · "
+            f"Seeds {result['seeds'][0]}–{result['seeds'][-1]}\n"
+            f"Noise σ: tool {settings['tool_noise']:g} / target {settings['target_noise']:g} mm · "
+            f"Dropout: tool {100 * settings['tool_dropout']:g} / target {100 * settings['target_dropout']:g}%\n"
+            f"Bias XYZ (mm): tool {tuple(map(float, settings['tool_bias']))} / target {tuple(map(float, settings['target_bias']))}\n"
+            f"Drift XYZ (mm/s): tool {tuple(map(float, settings['tool_drift']))} / target {tuple(map(float, settings['target_drift']))}\n"
+            f"Breathing: {settings['motion_amplitude']:g} mm / {settings['motion_frequency']:g} Hz · "
+            f"Proximity weight {settings['proximity_weight']:g} · Uncertainty k {settings['uncertainty_scale']:g}")
+        metrics = [
+            ("Final true error · all trials (mm)", "actual_error"),
+            ("Shaft clearance bound (mm)", "minimum_clearance"),
+            ("Travel · successful runs (mm)", "successful_travel"),
+            ("Completion · successful runs (s)", "successful_completion_time"),
+            ("Planning time (s)", "planning_time"),
+            ("Tool raw RMSE (mm)", "tool_raw_rmse"),
+            ("Tool filtered RMSE (mm)", "tool_filtered_rmse"),
+            ("Target raw RMSE (mm)", "target_raw_rmse"),
+            ("Target filtered RMSE (mm)", "target_filtered_rmse"),
+        ]
+        labels = ["Completed trials", "True arrivals", "False arrivals", "Outcomes"]
+        self.comparison_table.setRowCount(len(labels) + len(metrics))
+        for row, label in enumerate(labels + [label for label, _ in metrics]):
+            self.comparison_table.setItem(row, 0, QTableWidgetItem(label))
+        for column, summary in enumerate(result["summary"].values(), 1):
+            rate = summary["success_rate"]
+            values = [str(summary["trials"]),
+                      f"{summary['successes']} / {summary['trials']}"
+                      + (f" ({100 * rate:.0f}%)" if rate is not None else ""),
+                      str(summary["false_arrivals"]),
+                      "\n".join(f"{count} × {status.replace('_', ' ')}"
+                                for status, count in summary["statuses"].items()) or "—"]
+            for _, key in metrics:
+                metric = summary["metrics"][key]
+                values.append(f"{FormatReading(metric['mean'])} ± {FormatReading(metric['sd'])} "
+                              f"(n={metric['count']})")
+            for row, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.comparison_table.setItem(row, column, item)
+        self.comparison_table.resizeRowsToContents()
+        self.comparison_results_button.show()
+        self.comparison_dialog.show()
+
     def plan_path(self):
+        if self.comparison_future is not None:
+            self.message_label.setText("Stop the comparison before planning a route.")
+            return
         source = self.navigation_mode_combo.currentIndex()
         mode = self.planning_mode_combo.currentData()
         if not self.TrackingAvailable(source, mode):
@@ -628,7 +796,7 @@ class SimulatorWindow(QMainWindow):
         future = self.planning_future
         self.planning_future = None
         self.planning_cancel = None
-        self.plan_button.setEnabled(True)
+        self.plan_button.setEnabled(self.comparison_future is None)
         try:
             result = future.result()
         except Exception as error:
@@ -729,7 +897,7 @@ class SimulatorWindow(QMainWindow):
         self.route_finished_time = None
         self.route_result = None
         self.command = self.configuration.copy()
-        self.plan_button.setEnabled(True)
+        self.plan_button.setEnabled(self.comparison_future is None)
         self.follow_button.setEnabled(False)
         self.sync_controls()
         if keep_route and self.path is not None:
@@ -963,7 +1131,7 @@ class SimulatorWindow(QMainWindow):
                 self.route_feedback_active = False
                 self.command = self.configuration.copy()
                 self.sync_controls()
-                self.plan_button.setEnabled(True)
+                self.plan_button.setEnabled(self.comparison_future is None)
                 if reported:
                     outcome = "Verified arrival" if actual["arrived"] else "False arrival"
                 else:
@@ -1286,6 +1454,7 @@ class SimulatorWindow(QMainWindow):
         self.readout_timer.stop()
         if self.planning_cancel is not None:
             self.planning_cancel.set()
+        self.comparison_cancel.set()
         self.executor.shutdown(wait=False, cancel_futures=True)
         QApplication.instance().removeEventFilter(self)
         self.viewport.close()
