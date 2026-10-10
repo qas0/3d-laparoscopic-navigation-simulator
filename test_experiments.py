@@ -5,11 +5,76 @@ from unittest.mock import patch
 import numpy as np
 
 from astar import find_path
-from experiments import CompareMethods, RunTrial
+from experiments import CompareMethods, GetUncertaintyCoverage, RunTrial
 from geometry import tip_position
 from motion import GetRespiratoryMotion
 from scenarios import SCENARIOS
 from sensors import ApplyDropout
+
+
+class UncertaintyCoverageTests(unittest.TestCase):
+    def test_CorrelatedCovarianceUsesTheWholeEllipsoid(self):
+        covariance = np.array([[4.0, 1.0, 0.0], [1.0, 2.0, 0.3], [0.0, 0.3, 1.0]])
+        factor = np.linalg.cholesky(covariance)
+        direction = np.array([1.0, 2.0, -1.0]) / np.sqrt(6.0)
+        inside = factor @ (direction * np.sqrt(7.81))
+        outside = factor @ (direction * np.sqrt(7.82))
+        self.assertTrue(GetUncertaintyCoverage(inside, covariance))
+        self.assertFalse(GetUncertaintyCoverage(outside, covariance))
+
+    def test_RotationAndScalingKeepTheSameCoverage(self):
+        covariance = np.diag([1.0, 4.0, 9.0])
+        rotation = np.array([[0.6, -0.8, 0.0], [0.8, 0.6, 0.0], [0.0, 0.0, 1.0]])
+        for error, expected in (([1.0, 2.0, 3.0], True), ([1.0, 4.0, 6.0], False)):
+            error = np.asarray(error)
+            self.assertEqual(GetUncertaintyCoverage(error, covariance), expected)
+            self.assertEqual(GetUncertaintyCoverage(rotation @ error,
+                             rotation @ covariance @ rotation.T), expected)
+            self.assertEqual(GetUncertaintyCoverage(error * 0.01,
+                             covariance * 0.01 ** 2), expected)
+
+    def test_TinyPositiveCovarianceRetainsItsStandardizedError(self):
+        covariance = np.eye(3) * 1e-24
+        self.assertTrue(GetUncertaintyCoverage([1e-12, 0.0, 0.0], covariance))
+        self.assertFalse(GetUncertaintyCoverage([3e-12, 0.0, 0.0], covariance))
+
+    def test_ZeroCovarianceCoversOnlyNumericallyExactPositions(self):
+        covariance = np.zeros((3, 3))
+        self.assertTrue(GetUncertaintyCoverage([0.0, 0.0, 0.0], covariance))
+        self.assertTrue(GetUncertaintyCoverage([1e-10, 0.0, 0.0], covariance))
+        self.assertFalse(GetUncertaintyCoverage([2e-9, 0.0, 0.0], covariance))
+        self.assertFalse(GetUncertaintyCoverage([5.0, 0.0, 0.0], covariance))
+
+    def test_SingularCovarianceUsesItsRankAndChecksZeroVarianceDirections(self):
+        for covariance, inside, outside in (
+                (np.diag([4.0, 0.0, 0.0]), np.sqrt(3.84), np.sqrt(3.85)),
+                (np.diag([4.0, 9.0, 0.0]), np.sqrt(5.99), np.sqrt(6.00))):
+            self.assertTrue(GetUncertaintyCoverage([2 * inside, 0.0, 0.0], covariance))
+            self.assertFalse(GetUncertaintyCoverage([2 * outside, 0.0, 0.0], covariance))
+            self.assertTrue(GetUncertaintyCoverage([0.0, 0.0, 1e-10], covariance))
+            self.assertFalse(GetUncertaintyCoverage([0.0, 0.0, 2e-9], covariance))
+
+        rotation = np.array([[0.6, -0.8, 0.0], [0.8, 0.6, 0.0], [0.0, 0.0, 1.0]])
+        covariance = rotation @ np.diag([4.0, 0.0, 0.0]) @ rotation.T
+        self.assertTrue(GetUncertaintyCoverage(rotation @ [2.0, 0.0, 0.0], covariance))
+        self.assertFalse(GetUncertaintyCoverage(rotation @ [0.0, 1.0, 0.0], covariance))
+
+    def test_GaussianErrorsHaveApproximatelyNominalCoverage(self):
+        covariance = np.array([[4.0, 1.0, 0.0], [1.0, 2.0, 0.3], [0.0, 0.3, 1.0]])
+        errors = np.random.default_rng(24).multivariate_normal(np.zeros(3), covariance, 5000)
+        fraction = np.mean([GetUncertaintyCoverage(error, covariance) for error in errors])
+        self.assertAlmostEqual(fraction, 0.95, delta=0.015)
+
+    def test_InvalidErrorsAndCovariancesAreRejected(self):
+        for error in ([0.0, 0.0], [[0.0, 0.0, 0.0]], [np.nan, 0.0, 0.0],
+                      [0.0, np.inf, 0.0], ["bad", 0.0, 0.0]):
+            with self.subTest(error=error), self.assertRaises(ValueError):
+                GetUncertaintyCoverage(error, np.eye(3))
+        for covariance in (np.eye(2), np.ones((3, 2)), np.eye(3) * np.nan,
+                           [[1.0, 0.5, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                           np.diag([1.0, -0.1, 1.0]), [[1.0], [0.0, 1.0], [0.0]]):
+            with self.subTest(covariance=covariance), self.assertRaises(ValueError):
+                GetUncertaintyCoverage(np.zeros(3), covariance)
 
 
 class ExperimentTests(unittest.TestCase):
@@ -26,6 +91,9 @@ class ExperimentTests(unittest.TestCase):
         self.assertGreater(trial["completion_time"], 55.0 / 15.0)
         for error in trial["rmse"].values():
             self.assertAlmostEqual(error, 0.0)
+        for sensor in ("tool", "target"):
+            self.assertEqual(trial["predicted_rms"][sensor], 0.0)
+            self.assertEqual(trial["coverage"][sensor], 100.0)
 
     def test_BiasedRawTargetCanReportArrivalAwayFromTheTrueTarget(self):
         trial = RunTrial(tracking="raw", tool_noise=0.0, target_noise=0.0,
@@ -38,6 +106,9 @@ class ExperimentTests(unittest.TestCase):
         self.assertIsNone(trial["completion_time"])
         self.assertGreater(trial["actual_error"], 2.0)
         self.assertAlmostEqual(trial["rmse"]["target_raw"], 8.0)
+        self.assertAlmostEqual(trial["rmse"]["target_filtered"], 8.0)
+        self.assertEqual(trial["predicted_rms"]["target"], 0.0)
+        self.assertEqual(trial["coverage"]["target"], 0.0)
         np.testing.assert_array_equal(trial["planned_target"], [98.0, 0.0, 0.0])
 
     def test_MissingTrackingPreventsFilteredPlanningButIdealCanMove(self):
@@ -54,6 +125,8 @@ class ExperimentTests(unittest.TestCase):
         for source in ("tool_raw", "tool_filtered"):
             self.assertEqual(ideal["samples"][source], 0)
             self.assertIsNone(ideal["rmse"][source])
+        self.assertIsNone(ideal["predicted_rms"]["tool"])
+        self.assertIsNone(ideal["coverage"]["tool"])
         for source in ("target_raw", "target_filtered"):
             self.assertEqual(ideal["samples"][source], ideal["sensor_samples"])
             self.assertAlmostEqual(ideal["rmse"][source], 0.0)
@@ -90,7 +163,8 @@ class ExperimentTests(unittest.TestCase):
         # checks repeated simulation results while leaving wall-clock planning time separate
         for key in ("status", "success", "false_arrival", "reported_arrival", "actual_arrived",
                     "actual_error", "elapsed_time", "completion_time", "travel",
-                    "minimum_clearance", "sensor_samples", "dropped", "rmse", "samples"):
+                    "minimum_clearance", "sensor_samples", "dropped", "rmse", "samples",
+                    "predicted_rms", "coverage"):
             self.assertEqual(first[key], repeated[key], key)
         for key in ("configuration", "planned_target"):
             np.testing.assert_array_equal(first[key], repeated[key])
@@ -144,7 +218,8 @@ class ExperimentTests(unittest.TestCase):
         for summary in comparison["summary"].values():
             self.assertEqual(summary["statuses"], {"tracking_unavailable": 1})
             for name in ("planning_time", "tool_raw_rmse", "target_raw_rmse",
-                         "tool_filtered_rmse", "target_filtered_rmse"):
+                         "tool_filtered_rmse", "target_filtered_rmse", "tool_predicted_rms",
+                         "target_predicted_rms", "tool_coverage", "target_coverage"):
                 self.assertEqual(summary["metrics"][name]["count"], 0)
                 self.assertIsNone(summary["metrics"][name]["mean"])
 
@@ -163,8 +238,16 @@ class ExperimentTests(unittest.TestCase):
             self.assertEqual(summary["success_rate"], 0.0)
 
     def test_PartialDropoutCountsOnlyAvailableReadingsAndInitializedPredictions(self):
-        trial = RunTrial(seed=22, tracking="ideal", tool_noise=0.5, target_noise=0.5,
-                         tool_dropout=0.35, target_dropout=0.2, warmup=0.5, duration=0.8)
+        readings = []
+
+        def RecordCoverage(error, covariance):
+            covered = GetUncertaintyCoverage(error, covariance)
+            readings.append((error.copy(), covariance.copy(), covered))
+            return covered
+
+        with patch("experiments.GetUncertaintyCoverage", side_effect=RecordCoverage):
+            trial = RunTrial(seed=22, tracking="ideal", tool_noise=0.5, target_noise=0.5,
+                             tool_dropout=0.35, target_dropout=0.2, warmup=0.5, duration=0.8)
         self.assertEqual(trial["status"], "timeout")
         self.assertEqual(trial["sensor_samples"], 9)
         for sensor in ("tool", "target"):
@@ -174,8 +257,42 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(trial["samples"]["tool_raw"], 3)
         self.assertEqual(trial["samples"]["tool_filtered"], 6)
         self.assertEqual(trial["samples"]["target_filtered"], 9)
+        self.assertEqual(len(readings), 15)
+        sensor_readings = {"tool": readings[3::2], "target": readings[:3] + readings[4::2]}
+        for sensor, observations in sensor_readings.items():
+            errors, covariances, covered = zip(*observations)
+            self.assertEqual(len(observations), trial["samples"][sensor + "_filtered"])
+            self.assertAlmostEqual(trial["rmse"][sensor + "_filtered"],
+                                   np.sqrt(np.mean(np.sum(np.asarray(errors) ** 2, axis=1))))
+            self.assertAlmostEqual(trial["predicted_rms"][sensor],
+                                   np.sqrt(np.mean([np.trace(value) for value in covariances])))
+            self.assertAlmostEqual(trial["coverage"][sensor], 100 * np.mean(covered))
         for error in trial["rmse"].values():
             self.assertGreater(error, 0.0)
+
+    def test_CalibrationSummaryWeightsTrialsEquallyDespiteDifferentSampleCounts(self):
+        template = RunTrial(tool_noise=0.0, target_noise=0.0, warmup=0.0, duration=0.2)
+
+        def UnequalTrial(scenario, mode, seed, **settings):
+            trial = dict(template, scenario=scenario, mode=mode, seed=seed)
+            trial["samples"] = dict.fromkeys(template["samples"], 1 if seed == 0 else 100)
+            trial["coverage"] = dict.fromkeys(("tool", "target"), 100.0 if seed == 0 else 0.0)
+            trial["predicted_rms"] = dict.fromkeys(("tool", "target"), 1.0 if seed == 0 else 3.0)
+            return trial
+
+        with patch("experiments.RunTrial", side_effect=UnequalTrial):
+            comparison = CompareMethods(seeds=[0, 1])
+        for summary in comparison["summary"].values():
+            self.assertEqual(summary["statuses"], {"timeout": 2})
+            for sensor in ("tool", "target"):
+                coverage = summary["metrics"][sensor + "_coverage"]
+                predicted = summary["metrics"][sensor + "_predicted_rms"]
+                self.assertEqual(coverage["count"], 2)
+                self.assertEqual(coverage["mean"], 50.0)
+                self.assertAlmostEqual(coverage["sd"], 100.0 / np.sqrt(2))
+                self.assertEqual(predicted["count"], 2)
+                self.assertEqual(predicted["mean"], 2.0)
+                self.assertAlmostEqual(predicted["sd"], np.sqrt(2))
 
     def test_SmallerTimestepsKeepArrivalAndCommonSensorSequences(self):
         coarse = RunTrial(tool_noise=0.0, target_noise=0.0, timestep=0.02)

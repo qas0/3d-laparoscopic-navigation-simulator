@@ -9,6 +9,39 @@ from scenarios import SCENARIOS
 from sensors import ApplyBias, ApplyDropout, measure_position
 
 
+def GetUncertaintyCoverage(error, position_covariance):
+    try:
+        error = np.asarray(error, dtype=float)
+        covariance = np.asarray(position_covariance, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("Invalid error or covariance.") from None
+    if (error.shape != (3,) or covariance.shape != (3, 3)
+            or not np.all(np.isfinite(error)) or not np.all(np.isfinite(covariance))):
+        raise ValueError("Invalid error or covariance.")
+    tolerance = 3 * np.finfo(float).eps * np.max(np.abs(covariance))
+    if not np.allclose(covariance, covariance.T, rtol=0, atol=tolerance):
+        raise ValueError("Expected symmetric covariance.")
+    covariance = 0.5 * covariance + 0.5 * covariance.T
+    eigenvalues, directions = np.linalg.eigh(covariance)
+    tolerance = 3 * np.finfo(float).eps * np.max(np.abs(eigenvalues))
+    if np.min(eigenvalues) < -tolerance:
+        raise ValueError("Expected nonnegative covariance.")
+    supported = eigenvalues > tolerance
+    rank = int(np.count_nonzero(supported))
+    thresholds = (3.841, 5.991, 7.815)
+    if rank == 3:
+        score = float(error @ np.linalg.solve(covariance, error))
+    else:
+        projected = directions.T @ error
+        # allows 1e-9 mm rounding error in directions with zero reported uncertainty
+        if np.linalg.norm(projected[~supported]) > 1e-9:
+            return False
+        if rank == 0:
+            return True
+        score = float(np.sum(projected[supported] ** 2 / eigenvalues[supported]))
+    return bool(score <= thresholds[rank - 1])
+
+
 def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
              tracking="filtered", tool_noise=1.0, target_noise=2.0,
              tool_dropout=0.0, target_dropout=0.0,
@@ -84,6 +117,8 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
     acceleration = [20.0, 1.0]
     error_sums = dict.fromkeys(("tool_raw", "target_raw", "tool_filtered", "target_filtered"), 0.0)
     counts = dict.fromkeys(error_sums, 0)
+    covariance_sums = {"tool": 0.0, "target": 0.0}
+    covered = {"tool": 0, "target": 0}
     dropped = {"tool": 0, "target": 0}
     sensor_samples = 0
     plan, planned_target, planned_at = None, None, None
@@ -156,9 +191,13 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
                     error_sums[name + "_raw"] += float(np.sum((observed - position) ** 2))
                     counts[name + "_raw"] += 1
                 if filters[index] is not None:
-                    error_sums[name + "_filtered"] += float(np.sum(
-                        (filters[index].state[:3] - position) ** 2))
+                    error = filters[index].state[:3] - position
+                    covariance = filters[index].covariance[:3, :3]
+                    error_sums[name + "_filtered"] += float(np.sum(error ** 2))
                     counts[name + "_filtered"] += 1
+                    # matches coverage + predicted uncertainty to the filtered RMSE samples
+                    covariance_sums[name] += float(np.trace(covariance))
+                    covered[name] += GetUncertaintyCoverage(error, covariance)
             sensor_samples += 1
 
             available = (tracking == "ideal" and mode != "uncert_aware") or (
@@ -220,6 +259,11 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
         status = "confirmed_arrival" if success else "false_arrival"
     rmse = {name: float(np.sqrt(error_sums[name] / count)) if count else None
             for name, count in counts.items()}
+    predicted_rms, coverage = {}, {}
+    for name in ("tool", "target"):
+        count = counts[name + "_filtered"]
+        predicted_rms[name] = float(np.sqrt(covariance_sums[name] / count)) if count else None
+        coverage[name] = 100 * covered[name] / count if count else None
     return {
         "scenario": scenario, "mode": mode, "seed": int(seed), "tracking": tracking,
         "settings": settings, "status": status, "success": bool(success),
@@ -231,6 +275,7 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
         "plan": plan, "planned_target": planned_target, "true_target": target_position,
         "configuration": configuration, "sensor_samples": sensor_samples,
         "dropped": dropped, "rmse": rmse, "samples": counts,
+        "predicted_rms": predicted_rms, "coverage": coverage,
     }
 
 
@@ -277,6 +322,11 @@ def CompareMethods(scenario="Direct insertion", seeds=range(10), *,
         for name in ("tool_raw", "target_raw", "tool_filtered", "target_filtered"):
             values[name + "_rmse"] = [run["rmse"][name] for run in runs
                                        if run["rmse"][name] is not None]
+        # summarises independent trials rather than pooling dependent sensor samples
+        for metric in ("predicted_rms", "coverage"):
+            for name in ("tool", "target"):
+                values[name + "_" + metric] = [run[metric][name] for run in runs
+                                               if run[metric][name] is not None]
         metrics = {}
         for name, measurements in values.items():
             count = len(measurements)

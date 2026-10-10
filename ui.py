@@ -396,6 +396,11 @@ class SimulatorWindow(QMainWindow):
         self.comparison_result_label = QLabel(wordWrap=True)
         result_layout.addWidget(self.comparison_result_label)
         self.comparison_table = QTableWidget(0, 4)
+        self.comparison_table.setToolTip(
+            "Mean ± sample SD across independent trials; n counts trials.\n"
+            "Predicted RMS = sqrt(mean(trace(P))) over the filtered RMSE samples.\n"
+            "Coverage counts errors inside the nominal 95% covariance region, including warmup + dropout predictions.\n"
+            "Trials can stop early, so coverage describes their observed samples.")
         self.comparison_table.setHorizontalHeaderLabels(
             ["Metric / mean ± SD (n)", "Conventional A*", "Proximity-aware A*", "Uncertainty-aware A*"])
         self.comparison_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -718,8 +723,12 @@ class SimulatorWindow(QMainWindow):
             ("Planning time (s)", "planning_time"),
             ("Tool raw RMSE (mm)", "tool_raw_rmse"),
             ("Tool filtered RMSE (mm)", "tool_filtered_rmse"),
+            ("Tool predicted RMS uncertainty (mm)", "tool_predicted_rms"),
+            ("Tool observed 95% coverage (%)", "tool_coverage"),
             ("Target raw RMSE (mm)", "target_raw_rmse"),
             ("Target filtered RMSE (mm)", "target_filtered_rmse"),
+            ("Target predicted RMS uncertainty (mm)", "target_predicted_rms"),
+            ("Target observed 95% coverage (%)", "target_coverage"),
         ]
         labels = ["Completed trials", "True arrivals", "False arrivals", "Outcomes"]
         self.comparison_table.setRowCount(len(labels) + len(metrics))
