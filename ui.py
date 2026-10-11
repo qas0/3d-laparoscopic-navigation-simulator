@@ -24,7 +24,7 @@ from geometry import movement_is_clear, shaft_clearance, tip_position
 from kalman import KalmanFilter
 from motion import GetRespiratoryMotion
 from scenarios import SCENARIOS
-from sensors import ApplyBias, ApplyDropout, measure_position
+from sensors import ApplyBias, ApplyDropout, ApplyOutlier, measure_position
 
 
 def FormatReading(value):
@@ -260,7 +260,7 @@ class SimulatorWindow(QMainWindow):
             setting.setToolTip("Probability of discarding each reading. Changes preserve the filter.")
             sensor_settings.addRow(name, setting)
         self.sensor_seed = QSpinBox(minimum=0, maximum=999999, value=42, keyboardTracking=False)
-        self.sensor_seed.setToolTip("Repeats Gaussian noise + dropout sequences.")
+        self.sensor_seed.setToolTip("Repeats Gaussian noise, dropout + outlier sequences.")
         sensor_settings.addRow("Sensor seed", self.sensor_seed)
         sensor_layout.addWidget(sensor_group)
         bias_group = QGroupBox("Sensor bias + drift")
@@ -282,6 +282,27 @@ class SimulatorWindow(QMainWindow):
             bias_settings.addRow(name, setting)
         bias_group.setToolTip("Changes preserve the filters. Drift accumulates until Restart sensors clears it; zero rate stops further drift.")
         sensor_layout.addWidget(bias_group)
+        outlier_group = QGroupBox("Sensor outliers")
+        outlier_settings = QFormLayout(outlier_group)
+        self.tool_outlier = QDoubleSpinBox(minimum=0.0, maximum=100.0, decimals=0,
+                                          singleStep=1, suffix=" %", keyboardTracking=False)
+        self.target_outlier = QDoubleSpinBox(minimum=0.0, maximum=100.0, decimals=0,
+                                            singleStep=1, suffix=" %", keyboardTracking=False)
+        for name, setting in (("Tool outliers", self.tool_outlier),
+                              ("Target outliers", self.target_outlier)):
+            setting.setToolTip("Probability of adding a spike to each reading. Changes preserve the filter.")
+            outlier_settings.addRow(name, setting)
+        self.outlier_size = QDoubleSpinBox(minimum=0.0, maximum=50.0, value=20.0,
+                                          decimals=1, singleStep=1, suffix=" mm", keyboardTracking=False)
+        self.outlier_size.setToolTip("3D spike distance in a random direction, added to ordinary sensor error.")
+        outlier_settings.addRow("Spike size", self.outlier_size)
+        self.reject_outliers = QCheckBox("Reject outliers", checked=False)
+        self.reject_outliers.setToolTip("Checks each reading against the prediction + covariance using a nominal 99% region. The first reading initializes the filter; valid motion can also be rejected.")
+        self.reject_outliers.toggled.connect(self.stop_path)
+        outlier_settings.addRow(self.reject_outliers)
+        self.rejected_label = QLabel(wordWrap=True)
+        outlier_settings.addRow(self.rejected_label)
+        sensor_layout.addWidget(outlier_group)
         self.restart_sensor_button = QPushButton("Restart sensors")
         self.restart_sensor_button.clicked.connect(self.reset_measurements)
         sensor_layout.addWidget(self.restart_sensor_button)
@@ -347,7 +368,7 @@ class SimulatorWindow(QMainWindow):
         self.estimate_error_label = QLabel(wordWrap=True)
         self.uncertainty_label = QLabel(wordWrap=True)
         self.rmse_label = QLabel(wordWrap=True)
-        self.uncertainty_label.setToolTip("Model RMS position uncertainty: square root of the three position variances added together. Unknown bias + drift are not included.")
+        self.uncertainty_label.setToolTip("Model RMS position uncertainty: square root of the three position variances added together. Unknown bias, drift + spikes are not included.")
         self.rmse_label.setToolTip("Raw RMSE uses received readings only. Filtered RMSE uses every initialized estimate, including predictions during dropout. These are different sample sets.")
         for label in (self.tool_estimate_label, self.target_estimate_label,
                       self.estimate_error_label, self.uncertainty_label, self.rmse_label):
@@ -376,7 +397,10 @@ class SimulatorWindow(QMainWindow):
         comparison_layout.addWidget(self.comparison_setup_label)
         comparison_settings = QFormLayout()
         self.comparison_type = QComboBox()
-        self.comparison_type.addItems(["Single comparison", "Tool-noise study"])
+        self.comparison_type.addItem("Single comparison")
+        self.comparison_type.addItem("Tool-noise study", "tool_noise")
+        self.comparison_type.addItem("Uncertainty-factor study", "uncertainty_scale")
+        self.comparison_type.addItem("Outlier rejection study", "reject_outliers")
         self.comparison_type.currentIndexChanged.connect(self.UpdateComparison)
         comparison_settings.addRow("Experiment", self.comparison_type)
         self.comparison_trials = QSpinBox(minimum=1, maximum=100, value=10,
@@ -384,7 +408,7 @@ class SimulatorWindow(QMainWindow):
         comparison_settings.addRow("Trials per method", self.comparison_trials)
         comparison_layout.addLayout(comparison_settings)
         self.comparison_button = QPushButton("Run comparison", objectName="primary")
-        self.comparison_button.setToolTip("Runs all three methods from the scenario's fixed pose. The study varies only tool noise, repeating the same seeds at every level. Each trial restarts sensors + breathing, uses a 1 s warmup and a 20 s simulation limit.")
+        self.comparison_button.setToolTip("Runs all three methods from the scenario's fixed pose. Studies vary one setting, keeping other settings + seeds fixed. Each trial restarts sensors + breathing, uses a 1 s warmup and a 20 s simulation limit.")
         self.comparison_button.clicked.connect(self.RunComparison)
         comparison_layout.addWidget(self.comparison_button)
         self.comparison_stop_button = QPushButton("Stop comparison", enabled=False)
@@ -416,13 +440,16 @@ class SimulatorWindow(QMainWindow):
             ("Target filtered RMSE (mm)", "target_filtered_rmse"),
             ("Target predicted RMS uncertainty (mm)", "target_predicted_rms"),
             ("Target observed 95% coverage (%)", "target_coverage"),
+            ("Tool rejected readings", "tool_rejected"),
+            ("Target rejected readings", "target_rejected"),
         ]
         self.comparison_table = QTableWidget(0, 4)
         self.comparison_table.setToolTip(
             "Mean ± sample SD across independent trials; n counts trials.\n"
             "Predicted RMS = sqrt(mean(trace(P))) over the filtered RMSE samples.\n"
             "Coverage counts errors inside the nominal 95% covariance region, including warmup + dropout predictions.\n"
-            "Trials can stop early, so coverage describes their observed samples.")
+            "Trials can stop early, so coverage describes their observed samples.\n"
+            "Rejected counts include any inconsistent reading; they depend on trial duration.")
         self.comparison_table.setHorizontalHeaderLabels(
             ["Metric / mean ± SD (n)", "Conventional A*", "Proximity-aware A*", "Uncertainty-aware A*"])
         self.comparison_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -446,9 +473,9 @@ class SimulatorWindow(QMainWindow):
         self.sensitivity_canvas = FigureCanvasQTAgg(Figure(facecolor="white", layout="constrained"))
         self.sensitivity_axes = self.sensitivity_canvas.figure.add_subplot(111)
         self.sensitivity_canvas.setToolTip(
-            "Points compare complete noise levels using the same seeds. Bars show sample SD, not confidence intervals.\n"
+            "Points compare complete study levels using the same seeds. Bars show sample SD, not confidence intervals.\n"
             "Rates use completed trials. Missing measurements leave gaps.\n"
-            "With ideal tracking, tool noise affects sensor evaluation and the uncertainty margin; other routes can stay the same.")
+            "Uncertainty k affects only uncertainty-aware A*. With ideal tracking, tool noise affects sensor evaluation + the uncertainty margin.")
         graph_layout.addWidget(self.sensitivity_canvas)
         self.comparison_results_button = QPushButton("View results", visible=False)
         self.comparison_results_button.clicked.connect(self.comparison_dialog.show)
@@ -691,6 +718,10 @@ class SimulatorWindow(QMainWindow):
             "tool_noise": self.tool_noise.value(), "target_noise": self.target_noise.value(),
             "tool_dropout": self.tool_dropout.value() / 100,
             "target_dropout": self.target_dropout.value() / 100,
+            "tool_outlier": self.tool_outlier.value() / 100,
+            "target_outlier": self.target_outlier.value() / 100,
+            "outlier_size": self.outlier_size.value(),
+            "reject_outliers": self.reject_outliers.isChecked(),
             "tool_bias": axis * self.tool_bias.value(), "target_bias": axis * self.target_bias.value(),
             "tool_drift": axis * self.tool_drift.value(), "target_drift": axis * self.target_drift.value(),
             "motion_amplitude": self.motion_amplitude.value(),
@@ -706,8 +737,12 @@ class SimulatorWindow(QMainWindow):
             self.comparison_progress.get_nowait()
         self.comparison_dialog.hide()
         self.comparison_results_button.hide()
-        study = self.comparison_type.currentIndex() == 1
-        total = 3 * len(seeds) * (4 if study else 1)
+        parameter = self.comparison_type.currentData()
+        study = parameter is not None
+        if study:
+            settings["parameter"] = parameter
+        level_count = 2 if parameter == "reject_outliers" else 4
+        total = 3 * len(seeds) * (level_count if study else 1)
         self.comparison_status_label.setText(f"Completed 0 / {total} trials.")
         self.comparison_future = self.executor.submit(
             RunSensitivityStudy if study else CompareMethods, self.scenario_combo.currentText(),
@@ -722,14 +757,20 @@ class SimulatorWindow(QMainWindow):
     def UpdateComparison(self):
         if self.comparison_future is None:
             seed, count = self.sensor_seed.value(), self.comparison_trials.value()
-            study = self.comparison_type.currentIndex() == 1
+            parameter = self.comparison_type.currentData()
+            study = parameter is not None
+            levels_label = ("Tool noise σ: 0, 1, 2, 4 mm" if parameter == "tool_noise"
+                            else "Uncertainty k: 0, 0.5, 1, 2")
+            level_count = 2 if parameter == "reject_outliers" else 4
+            if parameter == "reject_outliers":
+                levels_label = "Outlier rejection: off / on"
             self.comparison_button.setText("Run study" if study else "Run comparison")
             self.comparison_stop_button.setText("Stop study" if study else "Stop comparison")
             self.comparison_setup_label.setText(
                 f"{self.scenario_combo.currentText()}\n{self.navigation_mode_combo.currentText()}\n"
-                f"3 methods × {count} trials" + (" × 4 noise levels" if study else "")
+                f"3 methods × {count} trials" + (f" × {level_count} levels" if study else "")
                 + f" · Seeds {seed}–{seed + count - 1}"
-                + ("\nTool noise σ: 0, 1, 2, 4 mm" if study else ""))
+                + (f"\n{levels_label}" if study else ""))
             return
         # reads worker progress on the UI thread without touching the live scene
         while not self.comparison_progress.empty():
@@ -754,7 +795,7 @@ class SimulatorWindow(QMainWindow):
         study = "comparisons" in result
         comparisons = result["comparisons"] if study else [result]
         completed = sum(len(comparison["trials"]) for comparison in comparisons)
-        total = 3 * len(result["seeds"]) * (len(result["noise_levels"]) if study else 1)
+        total = 3 * len(result["seeds"]) * (len(result["levels"]) if study else 1)
         state = "Stopped" if result["cancelled"] else "Completed"
         self.comparison_status_label.setText(f"{state} · {completed} / {total} trials.")
         if not completed:
@@ -763,8 +804,13 @@ class SimulatorWindow(QMainWindow):
         self.comparison_level.clear()
         for comparison in comparisons:
             count, expected = len(comparison["trials"]), 3 * len(result["seeds"])
+            level_label = (f"Tool noise σ {comparison['settings']['tool_noise']:g} mm"
+                           if not study or result["parameter"] == "tool_noise"
+                           else f"Uncertainty k {comparison['settings']['uncertainty_scale']:g}")
+            if study and result["parameter"] == "reject_outliers":
+                level_label = f"Outlier rejection {'on' if comparison['settings']['reject_outliers'] else 'off'}"
             self.comparison_level.addItem(
-                f"Tool noise σ {comparison['settings']['tool_noise']:g} mm · {count} / {expected} trials"
+                f"{level_label} · {count} / {expected} trials"
                 + (" · partial" if count < expected else ""))
         self.comparison_level.blockSignals(False)
         self.comparison_level.setVisible(study)
@@ -776,7 +822,11 @@ class SimulatorWindow(QMainWindow):
         elif not has_graph and graph_index != -1:
             self.comparison_tabs.removeTab(graph_index)
         self.comparison_tabs.setTabText(0, "Results at selected level" if study else "Results")
-        self.comparison_dialog.setWindowTitle("Tool-noise sensitivity study" if study else "Planner comparison")
+        title = ("Tool-noise sensitivity study" if result.get("parameter") == "tool_noise"
+                 else "Uncertainty-factor sensitivity study")
+        if result.get("parameter") == "reject_outliers":
+            title = "Outlier rejection study"
+        self.comparison_dialog.setWindowTitle(title if study else "Planner comparison")
         self.ShowComparison()
         if has_graph:
             self.PlotSensitivity()
@@ -788,6 +838,7 @@ class SimulatorWindow(QMainWindow):
             return
         result = self.comparison_result
         study = "comparisons" in result
+        parameter = result.get("parameter")
         graph_visible = self.comparison_tabs.currentWidget() is self.sensitivity_graph
         self.comparison_level.setVisible(study and not graph_visible)
         if study:
@@ -797,17 +848,25 @@ class SimulatorWindow(QMainWindow):
             result = result["comparisons"][index]
         settings = result["settings"]
         noise_label = f"Noise σ: tool {settings['tool_noise']:g} / target {settings['target_noise']:g} mm"
-        if study and graph_visible:
+        uncertainty_label = f"Uncertainty k {settings['uncertainty_scale']:g}"
+        rejection_label = f"Rejection {'on' if settings['reject_outliers'] else 'off'}"
+        if study and graph_visible and parameter == "tool_noise":
             noise_label = f"Tool noise varies across completed levels · Target noise σ {settings['target_noise']:g} mm"
+        elif study and graph_visible and parameter == "uncertainty_scale":
+            uncertainty_label = "Uncertainty k varies across completed levels"
+        elif study and graph_visible:
+            rejection_label = "Rejection off / on"
         self.comparison_result_label.setText(
             f"{result['scenario']} · {settings['tracking'].capitalize()} tracking · "
             f"Seeds {result['seeds'][0]}–{result['seeds'][-1]}\n"
             f"{noise_label} · "
             f"Dropout: tool {100 * settings['tool_dropout']:g} / target {100 * settings['target_dropout']:g}%\n"
+            f"Outliers: tool {100 * settings['tool_outlier']:g} / target {100 * settings['target_outlier']:g}%"
+            f" · Spike {settings['outlier_size']:g} mm · {rejection_label}\n"
             f"Bias XYZ (mm): tool {tuple(map(float, settings['tool_bias']))} / target {tuple(map(float, settings['target_bias']))}\n"
             f"Drift XYZ (mm/s): tool {tuple(map(float, settings['tool_drift']))} / target {tuple(map(float, settings['target_drift']))}\n"
             f"Breathing: {settings['motion_amplitude']:g} mm / {settings['motion_frequency']:g} Hz · "
-            f"Proximity weight {settings['proximity_weight']:g} · Uncertainty k {settings['uncertainty_scale']:g}")
+            f"Proximity weight {settings['proximity_weight']:g} · {uncertainty_label}")
         metrics = self.comparison_metrics
         labels = ["Completed trials", "True arrivals", "False arrivals", "Outcomes"]
         self.comparison_table.setRowCount(len(labels) + len(metrics))
@@ -838,7 +897,7 @@ class SimulatorWindow(QMainWindow):
         # compares complete levels; partial trial groups remain available in the table
         comparisons = [comparison for comparison in result["comparisons"]
                        if len(comparison["trials"]) == 3 * len(result["seeds"])]
-        levels = np.array([comparison["settings"]["tool_noise"] for comparison in comparisons])
+        levels = np.array([comparison["settings"][result["parameter"]] for comparison in comparisons])
         key = self.sensitivity_metric.currentData()
         axes = self.sensitivity_axes
         axes.clear()
@@ -865,10 +924,13 @@ class SimulatorWindow(QMainWindow):
             if np.any(available):
                 axes.errorbar(levels[available], means[available], yerr=deviations[available],
                               fmt="none", color=color, capsize=4)
-        axes.set_xlabel("Tool noise σ (mm)")
+        axes.set_xlabel("Tool noise σ (mm)" if result["parameter"] == "tool_noise" else "Uncertainty factor k")
         axes.set_ylabel(self.sensitivity_metric.currentText())
-        axes.set_title(f"Complete noise levels: {len(comparisons)} / {len(result['noise_levels'])}")
+        axes.set_title(f"Complete study levels: {len(comparisons)} / {len(result['levels'])}")
         axes.set_xticks(levels)
+        if result["parameter"] == "reject_outliers":
+            axes.set_xlabel("Outlier rejection")
+            axes.set_xticks(levels, ["On" if level else "Off" for level in levels])
         if key in ("success_rate", "false_arrival_rate"):
             axes.set_ylim(0, 100)
         axes.grid(alpha=0.2)
@@ -1127,10 +1189,11 @@ class SimulatorWindow(QMainWindow):
         if self.path is not None or self.planning_future is not None:
             self.stop_path()
             self.message_label.setText("Sensors restarted. Plan a new route with the new readings.")
-        # keeps dropout draws separate from Gaussian noise + instrument resets
+        # keeps fault draws separate from gaussian noise + instrument resets
         seed = self.sensor_seed.value()
         self.sensor_generator = np.random.default_rng(seed)
         self.dropout_generators = [np.random.default_rng([seed, index]) for index in (1, 2)]
+        self.outlier_generators = [np.random.default_rng([seed, index]) for index in (3, 4)]
         self.sensor_drift = np.zeros((2, 3))
         self.measurement_count = 0
         self.tool_filter = None
@@ -1141,6 +1204,9 @@ class SimulatorWindow(QMainWindow):
         self.target_estimate = None
         self.observations = [None, None]
         self.observation_times = [None, None]
+        self.filter_observation_times = [None, None]
+        self.rejected_observations = [False, False]
+        self.rejected_counts = np.zeros(2, dtype=int)
         self.measurement_counts = np.zeros(2, dtype=int)
         self.estimate_counts = np.zeros(2, dtype=int)
         self.measurement_squared_error = np.zeros(2)
@@ -1176,6 +1242,7 @@ class SimulatorWindow(QMainWindow):
                     if self.last_measurement_time is not None else None)
         self.measurement_errors = np.full(2, np.nan)
         self.estimate_errors = np.full(2, np.nan)
+        self.rejected_observations = [False, False]
         filters = [self.tool_filter, self.target_filter]
         readings = [self.tool_measurement, self.target_measurement]
         estimates = [None, None]
@@ -1191,8 +1258,10 @@ class SimulatorWindow(QMainWindow):
                                         drift_rate, timestep or 0.0)
             self.sensor_drift[index] += drift_rate * (timestep or 0.0)
             # draws noise every tick so dropout does not change the Gaussian sequence
-            observation = ApplyDropout(measure_position(biased_position, noise, self.sensor_generator),
-                                       dropout / 100, self.dropout_generators[index])
+            measured = measure_position(biased_position, noise, self.sensor_generator)
+            measured = ApplyOutlier(measured, (self.tool_outlier, self.target_outlier)[index].value() / 100,
+                                    self.outlier_size.value(), self.outlier_generators[index])
+            observation = ApplyDropout(measured, dropout / 100, self.dropout_generators[index])
             self.observations[index] = observation
             estimator = filters[index]
             if estimator is not None:
@@ -1201,8 +1270,13 @@ class SimulatorWindow(QMainWindow):
                 # initialises each filter once from its first received reading
                 if estimator is None:
                     estimator = KalmanFilter(observation, noise, acceleration_std=acceleration)
+                    accepted = True
                 else:
-                    estimator.update(observation)
+                    accepted = estimator.update(observation, reject_outliers=self.reject_outliers.isChecked())
+                self.rejected_observations[index] = not accepted
+                self.rejected_counts[index] += not accepted
+                if accepted:
+                    self.filter_observation_times[index] = sample_time
                 readings[index] = observation
                 self.observation_times[index] = sample_time
                 self.measurement_errors[index] = np.linalg.norm(observation - position)
@@ -1239,7 +1313,8 @@ class SimulatorWindow(QMainWindow):
         self.distance_history.append((sample_time - self.distance_started_time,
                                       *(feedback["distance"] for feedback in self.target_feedbacks)))
         for index, feedback in enumerate(self.target_feedbacks):
-            if not feedback["arrived"] or not self.TrackingAvailable(index):
+            if (not feedback["arrived"] or not self.TrackingAvailable(index)
+                    or index == 2 and any(self.rejected_observations)):
                 self.arrival_started[index] = None
             elif self.arrival_started[index] is None:
                 self.arrival_started[index] = sample_time
@@ -1289,6 +1364,8 @@ class SimulatorWindow(QMainWindow):
         for index, (name, feedback) in enumerate(zip(("Actual", "Raw", "Filtered"), self.target_feedbacks)):
             available = self.TrackingAvailable(index)
             state = ("Within" if feedback["arrived"] else "Outside") if available else "Unavailable"
+            if index == 2 and any(self.rejected_observations):
+                state = "Prediction"
             if index == 2 and not available and np.isfinite(feedback["distance"]):
                 state = "Prediction"
             value = feedback["distance"] if available or index == 2 else None
@@ -1303,6 +1380,8 @@ class SimulatorWindow(QMainWindow):
             self.feedback_status_label.setText(self.route_result_label.text())
         elif not self.TrackingAvailable(mode):
             self.feedback_status_label.setText("Tracking unavailable. Arrival confirmation requires fresh tool + target readings.")
+        elif mode == 2 and any(self.rejected_observations):
+            self.feedback_status_label.setText("Prediction; awaiting accepted tool + target readings.")
         elif self.arrival_confirmed[mode]:
             self.feedback_status_label.setText("Arrival indication stable for 0.5 s.\nActual result is evaluated separately.")
         elif selected["arrived"]:
@@ -1330,12 +1409,15 @@ class SimulatorWindow(QMainWindow):
         headings = "".join(f'<td width="33%" align="right">{axis}</td>' for axis in "XYZ")
         now = perf_counter()
         for label, name, position, index, filtered in readings:
-            received = self.observation_times[index]
+            received = (self.filter_observation_times if filtered else self.observation_times)[index]
             fresh = (received is not None and self.observations[index] is not None
                      and now - received <= self.tracking_timeout)
             status = "Waiting for first reading" if received is None else (
                 f"Fresh · age {now - received:.1f} s" if fresh else
                 f"{'Prediction' if filtered else 'Last reading'} · age {now - received:.1f} s")
+            if self.rejected_observations[index]:
+                status = (f"Prediction · accepted age {now - received:.1f} s" if filtered
+                          else f"{'Fresh' if fresh else 'Last reading'} · rejected by filter")
             values = "".join(f'<td align="right">{FormatReading(value)}</td>'
                              for value in (position if position is not None else (None,) * 3))
             label.setText(f'<b>{name}</b><br>{status}<table width="100%" cellspacing="4">'
@@ -1365,6 +1447,7 @@ class SimulatorWindow(QMainWindow):
             f'Raw samples {self.measurement_counts[0]} / {self.measurement_counts[1]}<br>'
             f'Filtered samples {self.estimate_counts[0]} / {self.estimate_counts[1]}')
         self.measurement_count_label.setText(f"Sample {self.measurement_count}\nReceived: tool {self.measurement_counts[0]} / target {self.measurement_counts[1]}")
+        self.rejected_label.setText(f"Rejected: tool {self.rejected_counts[0]} / target {self.rejected_counts[1]}")
         yaw, pitch = np.rad2deg(self.sampled_configuration[:2])
         self.position_label.setText(f"ACTUAL INSTRUMENT\nYaw {yaw:.1f}° · Pitch {pitch:.1f}° · Depth {self.sampled_configuration[2]:.1f} mm")
         guide_note = (f"\nTip-to-guide {guide_distance:.2f} mm"
@@ -1383,9 +1466,13 @@ class SimulatorWindow(QMainWindow):
     def TrackingAvailable(self, source, mode="conventional"):
         required = (0, 1) if source != 0 else (0,) if mode == "uncert_aware" else ()
         now = perf_counter()
-        return all(self.observations[index] is not None
-                   and self.observation_times[index] is not None
-                   and now - self.observation_times[index] <= self.tracking_timeout for index in required)
+        for index in required:
+            filtered = source == 2 or mode == "uncert_aware" and index == 0
+            received = (self.filter_observation_times if filtered else self.observation_times)[index]
+            if (self.observations[index] is None or received is None
+                    or now - received > self.tracking_timeout):
+                return False
+        return True
 
     def CheckRouteTracking(self):
         if self.path is None or self.route_result is not None:

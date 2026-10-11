@@ -1,10 +1,11 @@
 import unittest
+from unittest.mock import Mock
 
 import numpy as np
 
 from feedback import get_target_feedback
 from kalman import KalmanFilter
-from sensors import ApplyBias, ApplyDropout, measure_position
+from sensors import ApplyBias, ApplyDropout, ApplyOutlier, measure_position
 
 
 class SensorTests(unittest.TestCase):
@@ -110,6 +111,71 @@ class SensorTests(unittest.TestCase):
         for position in [None, [], [1, 2], [[1, 2, 3]], [np.nan, 0, 0], [np.inf, 0, 0]]:
             with self.subTest(position=position), self.assertRaises(ValueError):
                 ApplyDropout(position, 1.0, np.random.default_rng(1))
+
+    def test_OutliersPreserveInputsAndUseFixedThreeDimensionalSize(self):
+        position = np.array([90.0, -4.0, 3.0])
+        original = position.copy()
+        random_generator = np.random.default_rng(81)
+        repeated_generator = np.random.default_rng(81)
+        for _ in range(100):
+            measured = ApplyOutlier(position, 1.0, 20.0, random_generator)
+            repeated = ApplyOutlier(position, 1.0, 20.0, repeated_generator)
+            np.testing.assert_array_equal(measured, repeated)
+            self.assertAlmostEqual(np.linalg.norm(measured - position), 20.0)
+            self.assertFalse(np.shares_memory(measured, position))
+        np.testing.assert_array_equal(position, original)
+
+    def test_OutlierProbabilityAndDirectionsMatchTheModel(self):
+        probability, size, count = 0.3, 20.0, 10000
+        random_generator = np.random.default_rng(82)
+        offsets = np.array([ApplyOutlier(np.zeros(3), probability, size, random_generator)
+                            for _ in range(count)])
+        occurs = np.linalg.norm(offsets, axis=1) > 0
+        standard_error = np.sqrt(probability * (1 - probability) / count)
+        self.assertLess(abs(np.mean(occurs) - probability), 6 * standard_error)
+        directions = offsets[occurs] / size
+        # checks equal variation across axes + no spike direction
+        self.assertTrue(np.all(abs(directions.mean(axis=0)) < 6 / np.sqrt(3 * occurs.sum())))
+        np.testing.assert_allclose(directions.T @ directions / occurs.sum(),
+                                   np.eye(3) / 3, atol=0.035)
+
+    def test_DisabledOutliersPreservePairedDrawsAndProbabilityMasks(self):
+        generators = [np.random.default_rng(83) for _ in range(4)]
+        position = np.zeros(3)
+        for _ in range(100):
+            disabled = ApplyOutlier(position, 0.0, 20.0, generators[0])
+            zero_size = ApplyOutlier(position, 1.0, 0.0, generators[1])
+            low = ApplyOutlier(position, 0.2, 20.0, generators[2])
+            high = ApplyOutlier(position, 0.8, 40.0, generators[3])
+            np.testing.assert_array_equal(disabled, position)
+            np.testing.assert_array_equal(zero_size, position)
+            if np.any(low):
+                np.testing.assert_allclose(high, 2 * low)
+        self.assertEqual(len({generator.random() for generator in generators}), 1)
+
+    def test_ZeroOutlierDirectionLeavesThePositionUnchanged(self):
+        random_generator = Mock()
+        random_generator.random.return_value = 0.0
+        random_generator.standard_normal.return_value = np.zeros(3)
+        measured = ApplyOutlier([1, 2, 3], 1.0, 20.0, random_generator)
+        np.testing.assert_array_equal(measured, [1, 2, 3])
+        random_generator.standard_normal.assert_called_once_with(3)
+
+    def test_InvalidOutlierInputsAreRejected(self):
+        for probability in [-0.1, 1.1, np.nan, np.inf, [0.5], "invalid"]:
+            with self.subTest(probability=probability), self.assertRaises(ValueError):
+                ApplyOutlier([1, 2, 3], probability, 20.0, np.random.default_rng(1))
+        for size in [-1, np.nan, np.inf, [20.0], "invalid"]:
+            with self.subTest(size=size), self.assertRaises(ValueError):
+                ApplyOutlier([1, 2, 3], 0.1, size, np.random.default_rng(1))
+        for position in [None, [], [1, 2], [[1, 2, 3]], [np.nan, 0, 0], [np.inf, 0, 0]]:
+            with self.subTest(position=position), self.assertRaises(ValueError):
+                ApplyOutlier(position, 0.1, 20.0, np.random.default_rng(1))
+        random_generator = Mock()
+        random_generator.random.return_value = 0.0
+        random_generator.standard_normal.return_value = np.array([1.0, 0.0, 0.0])
+        with self.assertRaises(ValueError):
+            ApplyOutlier([1e308, 0, 0], 1.0, 1e308, random_generator)
 
     def test_BiasDisabledPreservesInputsWithoutSharingMemory(self):
         position = np.array([90.0, -4.0, 3.0])

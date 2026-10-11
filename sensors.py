@@ -34,6 +34,32 @@ def ApplyDropout(position, dropout_probability, random_generator):
     return None if random_generator.random() < float(probability) else position
 
 
+def ApplyOutlier(position, outlier_probability, outlier_size, random_generator):
+    try:
+        position = np.asarray(position, dtype=float)
+        probability = np.asarray(outlier_probability, dtype=float)
+        size = np.asarray(outlier_size, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("Invalid outlier inputs.") from None
+    if position.shape != (3,) or not np.all(np.isfinite(position)):
+        raise ValueError("Expected three finite values.")
+    if probability.shape != () or not np.isfinite(probability) or not 0 <= probability <= 1:
+        raise ValueError("Invalid outlier probability.")
+    if size.shape != () or not np.isfinite(size) or size < 0:
+        raise ValueError("Invalid outlier size.")
+
+    # keeps the same draws when probability or spike size changes
+    occurs = random_generator.random() < float(probability)
+    direction = random_generator.standard_normal(3)
+    length = np.linalg.norm(direction)
+    offset = direction / length * float(size) if occurs and length > 0 else np.zeros(3)
+    with np.errstate(over="ignore", invalid="ignore"):
+        measurement = position + offset
+    if not np.all(np.isfinite(measurement)):
+        raise ValueError("Invalid outlier position.")
+    return measurement
+
+
 def ApplyBias(position, bias, drift_rate, elapsed_time):
     try:
         position, bias, drift_rate = [

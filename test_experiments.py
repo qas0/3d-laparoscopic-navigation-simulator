@@ -9,7 +9,7 @@ from experiments import CompareMethods, GetUncertaintyCoverage, RunSensitivitySt
 from geometry import tip_position
 from motion import GetRespiratoryMotion
 from scenarios import SCENARIOS
-from sensors import ApplyDropout
+from sensors import ApplyDropout, ApplyOutlier
 
 
 class UncertaintyCoverageTests(unittest.TestCase):
@@ -430,45 +430,50 @@ class ExperimentTests(unittest.TestCase):
 
 
 class SensitivityStudyTests(unittest.TestCase):
-    def test_NoiseLevelsRepeatTheSameSeedsAndMatchSeparateComparisons(self):
-        settings = dict(tool_noise=12.0, target_noise=0.5, tool_dropout=0.2,
+    def test_StudyLevelsRepeatTheSameSeedsAndMatchSeparateComparisons(self):
+        settings = dict(tool_noise=0.5, target_noise=0.5, tool_dropout=0.2,
                         target_bias=(0.0, 1.0, 0.0), target_drift=(0.1, 0.0, 0.0),
                         motion_amplitude=2.0, warmup=0.1, duration=0.4)
         original = dict(settings)
         start = SCENARIOS["Inaccessible target"]["start"].copy()
-        study = RunSensitivityStudy("Inaccessible target", noise_levels=[2.0, 0.0],
-                                    seeds=(seed for seed in (5, 9)), **settings)
-        self.assertFalse(study["cancelled"])
-        self.assertEqual(study["scenario"], "Inaccessible target")
-        self.assertEqual(study["noise_levels"], [0.0, 2.0])
-        self.assertEqual(study["seeds"], [5, 9])
-        self.assertEqual(len(study["comparisons"]), 2)
-        for noise, comparison in zip(study["noise_levels"], study["comparisons"]):
-            expected_settings = dict(settings, tool_noise=noise)
-            direct = CompareMethods("Inaccessible target", seeds=[5, 9], **expected_settings)
-            self.assertEqual(comparison["seeds"], [5, 9])
-            self.assertEqual(comparison["settings"], direct["settings"])
-            self.assertEqual(len(comparison["trials"]), 6)
-            for trial, expected in zip(comparison["trials"], direct["trials"]):
-                for key in ("mode", "seed", "status", "success", "false_arrival",
-                            "reported_arrival", "actual_arrived", "actual_error", "elapsed_time",
-                            "completion_time", "travel", "minimum_clearance", "sensor_samples",
-                            "dropped", "rmse", "samples", "predicted_rms", "coverage"):
-                    self.assertEqual(trial[key], expected[key], key)
-                for key in ("configuration", "planned_target", "true_target"):
-                    np.testing.assert_array_equal(trial[key], expected[key])
-            for mode, summary in comparison["summary"].items():
-                for key in ("trials", "successes", "success_rate", "false_arrivals", "statuses"):
-                    self.assertEqual(summary[key], direct["summary"][mode][key])
-                for name, metric in summary["metrics"].items():
-                    if name != "planning_time":
-                        self.assertEqual(metric, direct["summary"][mode]["metrics"][name])
+        for parameter, levels in (("tool_noise", [0.0, 2.0]),
+                                  ("uncertainty_scale", [0.0, 0.5, 2.0])):
+            study = RunSensitivityStudy("Inaccessible target", levels=levels[::-1],
+                                        parameter=parameter, seeds=(seed for seed in (5, 9)),
+                                        **settings)
+            self.assertFalse(study["cancelled"])
+            self.assertEqual(study["scenario"], "Inaccessible target")
+            self.assertEqual(study["parameter"], parameter)
+            self.assertEqual(study["levels"], levels)
+            self.assertEqual(study["seeds"], [5, 9])
+            self.assertEqual(len(study["comparisons"]), len(levels))
+            for level, comparison in zip(study["levels"], study["comparisons"]):
+                expected_settings = dict(settings)
+                expected_settings[parameter] = level
+                direct = CompareMethods("Inaccessible target", seeds=[5, 9], **expected_settings)
+                self.assertEqual(comparison["seeds"], [5, 9])
+                self.assertEqual(comparison["settings"], direct["settings"])
+                self.assertEqual(len(comparison["trials"]), 6)
+                for trial, expected in zip(comparison["trials"], direct["trials"]):
+                    for key in ("mode", "seed", "status", "success", "false_arrival",
+                                "reported_arrival", "actual_arrived", "actual_error", "elapsed_time",
+                                "completion_time", "travel", "minimum_clearance", "sensor_samples",
+                                "dropped", "rmse", "samples", "predicted_rms", "coverage"):
+                        self.assertEqual(trial[key], expected[key], key)
+                    for key in ("configuration", "planned_target", "true_target"):
+                        np.testing.assert_array_equal(trial[key], expected[key])
+                for mode, summary in comparison["summary"].items():
+                    for key in ("trials", "successes", "success_rate", "false_arrivals", "statuses"):
+                        self.assertEqual(summary[key], direct["summary"][mode][key])
+                    for name, metric in summary["metrics"].items():
+                        if name != "planning_time":
+                            self.assertEqual(metric, direct["summary"][mode]["metrics"][name])
         self.assertEqual(settings, original)
         np.testing.assert_array_equal(SCENARIOS["Inaccessible target"]["start"], start)
 
     def test_ProgressCountsTrialsAcrossAllNoiseLevels(self):
         progress = []
-        study = RunSensitivityStudy("Inaccessible target", noise_levels=[0.0, 1.0],
+        study = RunSensitivityStudy("Inaccessible target", levels=[0.0, 1.0],
                                     seeds=[4, 6], progress=progress.append,
                                     tool_noise=0.0, target_noise=0.0, warmup=0.0)
         expected = [(index + 1, 12, mode, seed)
@@ -483,7 +488,7 @@ class SensitivityStudyTests(unittest.TestCase):
         cancelled, progress = Event(), []
         cancelled.set()
         with patch("experiments.find_path") as planner, patch("experiments.measure_position") as sensor:
-            study = RunSensitivityStudy(noise_levels=[0.0, 1.0], seeds=[3],
+            study = RunSensitivityStudy(levels=[0.0, 1.0], seeds=[3],
                                         cancel_event=cancelled, progress=progress.append)
         planner.assert_not_called()
         sensor.assert_not_called()
@@ -491,7 +496,7 @@ class SensitivityStudyTests(unittest.TestCase):
         self.assertEqual(study["comparisons"], [])
         self.assertEqual(progress, [])
 
-    def test_CancellationRetainsOnlyCompletedTrialsAtTheCurrentNoiseLevel(self):
+    def test_CancellationRetainsOnlyCompletedTrialsAtTheCurrentUncertaintyLevel(self):
         cancelled, progress = Event(), []
 
         def StopStudy(update):
@@ -499,9 +504,11 @@ class SensitivityStudyTests(unittest.TestCase):
             if update[0] == 4:
                 cancelled.set()
 
-        study = RunSensitivityStudy("Inaccessible target", noise_levels=[0.0, 1.0],
-                                    seeds=[4, 6], cancel_event=cancelled, progress=StopStudy,
+        study = RunSensitivityStudy("Inaccessible target", levels=[0.0, 1.0],
+                                    parameter="uncertainty_scale", seeds=[4, 6],
+                                    cancel_event=cancelled, progress=StopStudy,
                                     target_noise=0.0, warmup=0.0)
+        self.assertEqual(study["parameter"], "uncertainty_scale")
         self.assertTrue(study["cancelled"])
         self.assertEqual(len(study["comparisons"]), 1)
         comparison = study["comparisons"][0]
@@ -520,7 +527,7 @@ class SensitivityStudyTests(unittest.TestCase):
             if update[0] == 3:
                 cancelled.set()
 
-        study = RunSensitivityStudy("Inaccessible target", noise_levels=[0.0, 1.0],
+        study = RunSensitivityStudy("Inaccessible target", levels=[0.0, 1.0],
                                     seeds=[4], cancel_event=cancelled, progress=StopStudy,
                                     target_noise=0.0, warmup=0.0)
         self.assertTrue(study["cancelled"])
@@ -537,7 +544,7 @@ class SensitivityStudyTests(unittest.TestCase):
             if update[0] == update[1]:
                 cancelled.set()
 
-        study = RunSensitivityStudy("Inaccessible target", noise_levels=[0.0, 1.0],
+        study = RunSensitivityStudy("Inaccessible target", levels=[0.0, 1.0],
                                     seeds=[4], cancel_event=cancelled, progress=StopStudy,
                                     target_noise=0.0, warmup=0.0)
         self.assertTrue(cancelled.is_set())
@@ -555,19 +562,222 @@ class SensitivityStudyTests(unittest.TestCase):
             return ApplyDropout(position, probability, generator)
 
         with patch("experiments.ApplyDropout", side_effect=StopMovement):
-            study = RunSensitivityStudy(noise_levels=[0.0, 1.0], seeds=[4],
+            study = RunSensitivityStudy(levels=[0.0, 1.0], seeds=[4],
                                         cancel_event=cancelled, target_noise=0.0)
         self.assertTrue(cancelled.is_set())
         self.assertTrue(study["cancelled"])
         self.assertEqual(study["comparisons"], [])
 
-    def test_InvalidNoiseLevelsAndProgressAreRejected(self):
+    def test_UncertaintyFactorKeepsControlsFixedAndScalesOnlyTheCovarianceAllowance(self):
+        margins = []
+
+        def RecordPlanning(*args, **settings):
+            if settings["mode"] == "uncert_aware":
+                margins.append((settings["tool_offset"].copy(),
+                                settings["tool_covariance"].copy()))
+            return find_path(*args, **settings)
+
+        settings = dict(tracking="filtered", tool_noise=1.0, target_noise=0.5,
+                        tool_bias=(0.2, 0.0, 0.0), warmup=0.5, duration=0.6)
+        with patch("experiments.find_path", side_effect=RecordPlanning):
+            study = RunSensitivityStudy(levels=[0.0, 0.5, 1.0, 2.0], seeds=[5],
+                                        parameter="uncertainty_scale", **settings)
+        self.assertEqual(len(study["comparisons"]), 4)
+        self.assertEqual(len(margins), 4)
+        first = study["comparisons"][0]
+        offset, covariance = margins[0]
+        offset_allowance = float(np.linalg.norm(offset))
+        covariance_allowance = float(np.sqrt(np.linalg.eigvalsh(covariance)[-1]))
+        self.assertGreater(offset_allowance, 0.0)
+        self.assertGreater(covariance_allowance, 0.0)
+        for level, comparison, (offset, covariance) in zip(
+                study["levels"], study["comparisons"], margins):
+            fixed = dict(comparison["settings"])
+            self.assertEqual(fixed.pop("uncertainty_scale"), level)
+            expected = dict(first["settings"])
+            expected.pop("uncertainty_scale")
+            self.assertEqual(fixed, expected)
+            np.testing.assert_array_equal(offset, margins[0][0])
+            np.testing.assert_array_equal(covariance, margins[0][1])
+            cautious = comparison["trials"][2]
+            self.assertAlmostEqual(cautious["plan"]["extra_clearance"],
+                                   offset_allowance + level * covariance_allowance)
+            for trial, control in zip(comparison["trials"][:2], first["trials"][:2]):
+                for key in ("status", "success", "false_arrival", "reported_arrival",
+                            "actual_arrived", "actual_error", "elapsed_time", "completion_time",
+                            "travel", "minimum_clearance", "sensor_samples", "dropped", "rmse",
+                            "samples", "predicted_rms", "coverage"):
+                    self.assertEqual(trial[key], control[key], key)
+                for key in ("configuration", "planned_target", "true_target"):
+                    np.testing.assert_array_equal(trial[key], control[key])
+                np.testing.assert_array_equal(trial["plan"]["path"], control["plan"]["path"])
+                for key, value in trial["plan"].items():
+                    if key not in ("path", "time"):
+                        self.assertEqual(value, control["plan"][key], key)
+
+    def test_DefaultLevelsMatchTheSelectedParameter(self):
+        for parameter, levels in (("tool_noise", [0.0, 1.0, 2.0, 4.0]),
+                                  ("uncertainty_scale", [0.0, 0.5, 1.0, 2.0]),
+                                  ("reject_outliers", [0.0, 1.0])):
+            study = RunSensitivityStudy("Inaccessible target", parameter=parameter, seeds=[0],
+                                        tool_noise=0.0, target_noise=0.0, warmup=0.0)
+            self.assertEqual(study["parameter"], parameter)
+            self.assertEqual(study["levels"], levels)
+            self.assertEqual([result["settings"][parameter] for result in study["comparisons"]],
+                             levels)
+
+    def test_InvalidParametersLevelsAndProgressAreRejected(self):
         for levels in ([], 1.0, [[0.0, 1.0]], [0.0, 0.0], [-1.0, 0.0],
                        [np.nan], [np.inf], ["bad"]):
             with self.subTest(levels=levels), self.assertRaises(ValueError):
-                RunSensitivityStudy(noise_levels=levels, seeds=[0])
+                RunSensitivityStudy(levels=levels, seeds=[0])
+        for parameter in ("target_noise", "unknown", None, []):
+            with self.subTest(parameter=parameter), self.assertRaises(ValueError):
+                RunSensitivityStudy(parameter=parameter, seeds=[0])
         with self.assertRaises(ValueError):
             RunSensitivityStudy(seeds=[0], progress=[])
+
+
+class OutlierExperimentTests(unittest.TestCase):
+    def test_RejectionStudyKeepsFaultDrawsAndSettingsFixedAcrossMethods(self):
+        faults, progress = [], []
+
+        def RecordOutlier(position, probability, size, generator):
+            measured = ApplyOutlier(position, probability, size, generator)
+            faults.append(measured - position)
+            return measured
+
+        settings = dict(tool_noise=0.5, target_noise=0.5, tool_outlier=0.4,
+                        target_outlier=0.6, outlier_size=20.0, tracking="ideal",
+                        warmup=0.5, duration=0.6)
+        with patch("experiments.ApplyOutlier", side_effect=RecordOutlier):
+            study = RunSensitivityStudy("Inaccessible target", parameter="reject_outliers",
+                                        seeds=[4], progress=progress.append, **settings)
+        self.assertEqual(study["parameter"], "reject_outliers")
+        self.assertEqual(study["levels"], [0.0, 1.0])
+        self.assertEqual(len(study["comparisons"]), 2)
+        self.assertEqual([result["settings"]["reject_outliers"]
+                          for result in study["comparisons"]], [False, True])
+        self.assertEqual(progress, [(index + 1, 6, mode, 4)
+                                    for index, mode in enumerate(
+                                        ["conventional", "prox_aware", "uncert_aware"] * 2)])
+        trials = [trial for result in study["comparisons"] for trial in result["trials"]]
+        draws_per_trial = 2 * trials[0]["sensor_samples"]
+        self.assertEqual(len(faults), draws_per_trial * len(trials))
+        self.assertTrue(any(np.linalg.norm(value) > 19.0 for value in faults))
+        for index, trial in enumerate(trials):
+            np.testing.assert_allclose(faults[index * draws_per_trial:(index + 1) * draws_per_trial],
+                                       faults[:draws_per_trial], atol=1e-12)
+            fixed = dict(trial["settings"])
+            fixed.pop("reject_outliers")
+            expected = dict(trials[0]["settings"])
+            expected.pop("reject_outliers")
+            self.assertEqual(fixed, expected)
+            self.assertEqual(trial["rmse"]["tool_raw"], trials[0]["rmse"]["tool_raw"])
+            self.assertEqual(trial["rmse"]["target_raw"], trials[0]["rmse"]["target_raw"])
+
+    def test_RejectedSpikesStayInRawErrorsAndImproveTheStaticTargetEstimate(self):
+        settings = dict(tracking="ideal", tool_noise=1.0, target_noise=1.0,
+                        tool_outlier=0.2, target_outlier=0.2, seed=0)
+        with patch("experiments.measure_position",
+                   side_effect=lambda position, noise, generator: position.copy()):
+            accepted = RunTrial(reject_outliers=False, **settings)
+            checked = RunTrial(reject_outliers=True, **settings)
+        self.assertTrue(accepted["success"])
+        self.assertTrue(checked["success"])
+        for sensor in ("tool", "target"):
+            self.assertEqual(accepted["rmse"][sensor + "_raw"],
+                             checked["rmse"][sensor + "_raw"])
+            self.assertGreater(checked["rmse"][sensor + "_raw"], 0.0)
+            self.assertEqual(checked["samples"][sensor + "_raw"], checked["sensor_samples"])
+            self.assertEqual(checked["dropped"][sensor], 0)
+            self.assertEqual(accepted["rejected"][sensor], 0)
+            self.assertGreater(checked["rejected"][sensor], 0)
+        self.assertLess(checked["rmse"]["target_filtered"],
+                        accepted["rmse"]["target_filtered"])
+
+    def test_ConsecutiveRejectionsStopFilteredAndUncertaintyGuidanceWhenAcceptanceExpires(self):
+        for tracking, mode, status in (("filtered", "conventional", "tracking_lost"),
+                                       ("ideal", "uncert_aware", "tracking_lost"),
+                                       ("raw", "conventional", "not_confirmed"),
+                                       ("ideal", "conventional", "confirmed_arrival")):
+            calls = 0
+
+            def SpikeTool(position, probability, size, generator):
+                nonlocal calls
+                sample, sensor = divmod(calls, 2)
+                calls += 1
+                return position + np.array([100.0, 0.0, 0.0]) if sample >= 11 and sensor == 0 else position
+
+            with patch("experiments.ApplyOutlier", side_effect=SpikeTool), patch(
+                    "experiments.measure_position",
+                    side_effect=lambda position, noise, generator: position.copy()):
+                trial = RunTrial(tracking=tracking, mode=mode, tool_noise=1.0,
+                                 target_noise=1.0, reject_outliers=True)
+            self.assertEqual(trial["status"], status)
+            self.assertEqual(trial["dropped"]["tool"], 0)
+            self.assertEqual(trial["samples"]["tool_raw"], trial["sensor_samples"])
+            if status == "tracking_lost":
+                self.assertAlmostEqual(trial["elapsed_time"], 1.26)
+                self.assertEqual(trial["rejected"]["tool"], 2)
+                self.assertGreater(trial["travel"], 0.0)
+                self.assertLess(trial["travel"], 4.0)
+                self.assertFalse(trial["reported_arrival"])
+            else:
+                self.assertAlmostEqual(trial["travel"], 55.0)
+                self.assertGreater(trial["rejected"]["tool"], 2)
+
+    def test_RejectedReadingCannotCompleteAnArrivalHoldUsingOnlyPrediction(self):
+        calls = 0
+
+        def SpikeTarget(position, probability, size, generator):
+            nonlocal calls
+            sample, sensor = divmod(calls, 2)
+            calls += 1
+            return position + np.array([100.0, 0.0, 0.0]) if sample == 50 and sensor == 1 else position
+
+        with patch("experiments.measure_position",
+                   side_effect=lambda position, noise, generator: position.copy()):
+            baseline = RunTrial(tool_noise=1.0, target_noise=1.0, reject_outliers=True)
+            with patch("experiments.ApplyOutlier", side_effect=SpikeTarget):
+                trial = RunTrial(tool_noise=1.0, target_noise=1.0, reject_outliers=True)
+        self.assertTrue(baseline["success"])
+        self.assertTrue(trial["success"])
+        self.assertEqual(trial["rejected"]["target"], 1)
+        self.assertGreaterEqual(trial["elapsed_time"] - baseline["elapsed_time"], 0.4 - 1e-9)
+        self.assertEqual(trial["dropped"]["target"], 0)
+
+    def test_AnInitialSpikeIsAcceptedBecauseNoPredictionExistsYet(self):
+        trial = RunTrial(tracking="ideal", warmup=0.0, duration=0.02,
+                         tool_noise=0.0, target_noise=0.0, tool_outlier=1.0,
+                         target_outlier=1.0, reject_outliers=True)
+        self.assertEqual(trial["sensor_samples"], 1)
+        self.assertEqual(trial["rejected"], {"tool": 0, "target": 0})
+        self.assertAlmostEqual(trial["rmse"]["tool_raw"], 20.0)
+        self.assertAlmostEqual(trial["rmse"]["target_filtered"], 20.0)
+
+    def test_RejectionMetricsCountIndependentTrialsIncludingZeroRejections(self):
+        comparison = CompareMethods("Inaccessible target", seeds=[0, 1],
+                                    tool_noise=1.0, target_noise=1.0, tool_outlier=0.3,
+                                    target_outlier=0.4, reject_outliers=True)
+        for mode, summary in comparison["summary"].items():
+            runs = [trial for trial in comparison["trials"] if trial["mode"] == mode]
+            for sensor in ("tool", "target"):
+                counts = [trial["rejected"][sensor] for trial in runs]
+                metric = summary["metrics"][sensor + "_rejected"]
+                self.assertEqual(metric["count"], 2)
+                self.assertAlmostEqual(metric["mean"], np.mean(counts))
+                self.assertAlmostEqual(metric["sd"], np.std(counts, ddof=1))
+
+    def test_InvalidOutlierSettingsAndRejectionLevelsAreRejected(self):
+        for settings in ({"tool_outlier": -0.1}, {"target_outlier": 1.1},
+                         {"outlier_size": -1.0}, {"outlier_size": np.inf},
+                         {"reject_outliers": 1}, {"reject_outliers": "yes"}):
+            with self.subTest(settings=settings), self.assertRaises(ValueError):
+                RunTrial(**settings)
+        for levels in ([0.0, 0.5], [2.0], [-1.0]):
+            with self.subTest(levels=levels), self.assertRaises(ValueError):
+                RunSensitivityStudy(parameter="reject_outliers", levels=levels, seeds=[0])
 
 
 if __name__ == "__main__":

@@ -2,8 +2,8 @@ import unittest
 
 import numpy as np
 
-from kalman import KalmanFilter
-from sensors import measure_position
+from kalman import CheckMeasurement, KalmanFilter
+from sensors import ApplyOutlier, measure_position
 
 
 class KalmanTests(unittest.TestCase):
@@ -126,6 +126,93 @@ class KalmanTests(unittest.TestCase):
                 tracker.update(observation)
         np.testing.assert_array_equal(tracker.state, state)
         np.testing.assert_array_equal(tracker.covariance, covariance)
+
+    def test_MeasurementCheckUsesCovarianceAndRankThresholds(self):
+        for rank, threshold in enumerate((6.635, 9.210, 11.345), start=1):
+            covariance = np.diag([4.0] * rank + [0.0] * (3 - rank))
+            boundary = np.array([2 * np.sqrt(threshold), 0, 0])
+            self.assertTrue(CheckMeasurement(boundary * (1 - 1e-8), covariance))
+            self.assertFalse(CheckMeasurement(boundary * (1 + 1e-8), covariance))
+        self.assertTrue(CheckMeasurement([1, 0, 0], np.eye(3), thresholds=(1, 1, 1)))
+        self.assertFalse(CheckMeasurement([1.1, 0, 0], np.eye(3), thresholds=(1, 1, 1)))
+        self.assertFalse(CheckMeasurement([0, 0, 1e-8], np.diag([4, 4, 0])))
+        self.assertTrue(CheckMeasurement([0.5e-9, 0, 0], np.zeros((3, 3))))
+        self.assertFalse(CheckMeasurement([2e-9, 0, 0], np.zeros((3, 3))))
+
+    def test_RotatedSingularCovarianceChecksUnsupportedDirections(self):
+        direction = np.array([1.0, 1.0, 0.0]) / np.sqrt(2)
+        covariance = 4 * np.outer(direction, direction)
+        self.assertTrue(CheckMeasurement(2 * direction, covariance))
+        self.assertFalse(CheckMeasurement(6 * direction, covariance))
+        self.assertFalse(CheckMeasurement([1, -1, 0], covariance))
+
+    def test_MeasurementCheckRejectsInvalidInputs(self):
+        for innovation in [None, [], [1, 2], [[1, 2, 3]], [np.nan, 0, 0], "invalid"]:
+            with self.subTest(innovation=innovation), self.assertRaises(ValueError):
+                CheckMeasurement(innovation, np.eye(3))
+        for covariance in [None, [], np.eye(2), np.diag([1, 1, -0.01]),
+                           np.diag([1, 1, np.inf]), [[1, 0.1, 0], [0, 1, 0], [0, 0, 1]]]:
+            with self.subTest(covariance=covariance), self.assertRaises(ValueError):
+                CheckMeasurement([0, 0, 0], covariance)
+        for thresholds in [(0, 1, 2), (-1, 1, 2), (1, 2), (1, 2, np.inf), "invalid"]:
+            with self.subTest(thresholds=thresholds), self.assertRaises(ValueError):
+                CheckMeasurement([0, 0, 0], np.eye(3), thresholds)
+
+    def test_MeasurementCheckHasLowFalseRejectionForMatchedGaussianNoise(self):
+        count = 10000
+        random_generator = np.random.default_rng(84)
+        covariance = np.diag([1.0, 4.0, 9.0])
+        innovations = random_generator.standard_normal((count, 3)) * [1, 2, 3]
+        rejected = sum(not CheckMeasurement(value, covariance) for value in innovations)
+        standard_error = np.sqrt(0.01 * 0.99 / count)
+        self.assertLess(abs(rejected / count - 0.01), 6 * standard_error)
+
+    def test_RejectedUpdateRetainsPredictionThenAcceptsAConsistentReading(self):
+        tracker = KalmanFilter([0, 0, 0], 1.0, acceleration_std=0.0, velocity_std=0.0)
+        tracker.predict(0.1)
+        state, covariance = tracker.state.copy(), tracker.covariance.copy()
+        self.assertIs(tracker.update([20, 0, 0], reject_outliers=True), False)
+        np.testing.assert_array_equal(tracker.state, state)
+        np.testing.assert_array_equal(tracker.covariance, covariance)
+        self.assertIs(tracker.update([1, 0, 0], reject_outliers=True), True)
+        np.testing.assert_allclose(tracker.state[:3], [0.5, 0, 0])
+
+    def test_ExactFilterRejectionAndDisabledCheckPreserveExistingBehaviour(self):
+        tracker = KalmanFilter([1, 2, 3], 0.0, acceleration_std=0.0, velocity_std=0.0)
+        self.assertIs(tracker.update([1, 2, 3], reject_outliers=True), True)
+        self.assertIs(tracker.update([2, 2, 3], reject_outliers=True), False)
+        np.testing.assert_array_equal(tracker.state[:3], [1, 2, 3])
+        self.assertIs(tracker.update([2, 2, 3]), True)
+        np.testing.assert_array_equal(tracker.state[:3], [2, 2, 3])
+        trackers = [KalmanFilter([20, 0, 0], 1.0) for _ in range(2)]
+        # initialises from first reading before any prediction is available
+        np.testing.assert_array_equal(trackers[0].state[:3], [20, 0, 0])
+        for tracker, enabled in zip(trackers, (False, True)):
+            tracker.predict(0.1)
+            self.assertIs(tracker.update([20.1, 0, 0], reject_outliers=enabled), True)
+        np.testing.assert_array_equal(trackers[0].state, trackers[1].state)
+        np.testing.assert_array_equal(trackers[0].covariance, trackers[1].covariance)
+
+    def test_RejectionReducesErrorFromSeededSpikes(self):
+        noise_generator = np.random.default_rng(85)
+        outlier_generator = np.random.default_rng(86)
+        trackers = [KalmanFilter([0, 0, 0], 1.0, acceleration_std=1.0) for _ in range(2)]
+        errors = [[], []]
+        rejected = 0
+        for sample in range(1, 501):
+            actual = np.array([0.5, -0.2, 0.1]) * (sample * 0.1)
+            measured = measure_position(actual, 1.0, noise_generator)
+            measured = ApplyOutlier(measured, 0.1, 25.0, outlier_generator)
+            for index, tracker in enumerate(trackers):
+                tracker.predict(0.1)
+                accepted = tracker.update(measured, reject_outliers=bool(index))
+                if index and not accepted:
+                    rejected += 1
+                if sample > 20:
+                    errors[index].append(np.linalg.norm(tracker.state[:3] - actual))
+        rmses = [np.sqrt(np.mean(np.square(values))) for values in errors]
+        self.assertGreater(rejected, 20)
+        self.assertLess(rmses[1], 0.4 * rmses[0])
 
 
 if __name__ == "__main__":

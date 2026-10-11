@@ -3,48 +3,21 @@ import numpy as np
 from astar import find_path
 from feedback import get_target_feedback
 from geometry import movement_is_clear, shaft_clearance, tip_position
-from kalman import KalmanFilter
+from kalman import CheckMeasurement, KalmanFilter
 from motion import GetRespiratoryMotion
 from scenarios import SCENARIOS
-from sensors import ApplyBias, ApplyDropout, measure_position
+from sensors import ApplyBias, ApplyDropout, ApplyOutlier, measure_position
 
 
 def GetUncertaintyCoverage(error, position_covariance):
-    try:
-        error = np.asarray(error, dtype=float)
-        covariance = np.asarray(position_covariance, dtype=float)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError("Invalid error or covariance.") from None
-    if (error.shape != (3,) or covariance.shape != (3, 3)
-            or not np.all(np.isfinite(error)) or not np.all(np.isfinite(covariance))):
-        raise ValueError("Invalid error or covariance.")
-    tolerance = 3 * np.finfo(float).eps * np.max(np.abs(covariance))
-    if not np.allclose(covariance, covariance.T, rtol=0, atol=tolerance):
-        raise ValueError("Expected symmetric covariance.")
-    covariance = 0.5 * covariance + 0.5 * covariance.T
-    eigenvalues, directions = np.linalg.eigh(covariance)
-    tolerance = 3 * np.finfo(float).eps * np.max(np.abs(eigenvalues))
-    if np.min(eigenvalues) < -tolerance:
-        raise ValueError("Expected nonnegative covariance.")
-    supported = eigenvalues > tolerance
-    rank = int(np.count_nonzero(supported))
-    thresholds = (3.841, 5.991, 7.815)
-    if rank == 3:
-        score = float(error @ np.linalg.solve(covariance, error))
-    else:
-        projected = directions.T @ error
-        # allows 1e-9 mm rounding error in directions with zero reported uncertainty
-        if np.linalg.norm(projected[~supported]) > 1e-9:
-            return False
-        if rank == 0:
-            return True
-        score = float(np.sum(projected[supported] ** 2 / eigenvalues[supported]))
-    return bool(score <= thresholds[rank - 1])
+    return CheckMeasurement(error, position_covariance, (3.841, 5.991, 7.815))
 
 
 def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
              tracking="filtered", tool_noise=1.0, target_noise=2.0,
              tool_dropout=0.0, target_dropout=0.0,
+             tool_outlier=0.0, target_outlier=0.0, outlier_size=20.0,
+             reject_outliers=False,
              tool_bias=(0.0, 0.0, 0.0), target_bias=(0.0, 0.0, 0.0),
              tool_drift=(0.0, 0.0, 0.0), target_drift=(0.0, 0.0, 0.0),
              motion_amplitude=0.0, motion_frequency=0.2, timestep=0.02,
@@ -62,24 +35,30 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
     if (isinstance(max_expansions, (bool, np.bool_))
             or not isinstance(max_expansions, (int, np.integer)) or max_expansions < 1):
         raise ValueError("Invalid search budget.")
+    if not isinstance(reject_outliers, (bool, np.bool_)):
+        raise ValueError("Expected rejection on or off.")
+    reject_outliers = bool(reject_outliers)
 
     try:
         scalars = np.asarray([tool_noise, target_noise, tool_dropout, target_dropout,
+                              tool_outlier, target_outlier, outlier_size,
                               motion_amplitude, motion_frequency, timestep, duration,
                               warmup, proximity_weight, uncertainty_scale,
                               planning_time_limit], dtype=float)
         vectors = np.asarray([tool_bias, target_bias, tool_drift, target_drift], dtype=float)
     except (TypeError, ValueError, OverflowError):
         raise ValueError("Invalid experiment settings.") from None
-    if (scalars.shape != (12,) or not np.all(np.isfinite(scalars))
+    if (scalars.shape != (15,) or not np.all(np.isfinite(scalars))
             or np.any(scalars < 0) or vectors.shape != (4, 3)
             or not np.all(np.isfinite(vectors))):
         raise ValueError("Invalid experiment settings.")
-    (tool_noise, target_noise, tool_dropout, target_dropout, motion_amplitude,
+    (tool_noise, target_noise, tool_dropout, target_dropout,
+     tool_outlier, target_outlier, outlier_size, motion_amplitude,
      motion_frequency, timestep, duration, warmup, proximity_weight,
      uncertainty_scale, planning_time_limit) = map(float, scalars)
     tool_bias, target_bias, tool_drift, target_drift = vectors
-    if (max(tool_dropout, target_dropout) > 1 or not 0 < timestep <= 0.1
+    if (max(tool_dropout, target_dropout, tool_outlier, target_outlier) > 1
+            or not 0 < timestep <= 0.1
             or duration <= warmup or planning_time_limit <= 0):
         raise ValueError("Invalid probability or timing.")
     sample_frames = round(0.1 / timestep)
@@ -90,6 +69,8 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
     settings = {
         "tracking": tracking, "tool_noise": tool_noise, "target_noise": target_noise,
         "tool_dropout": tool_dropout, "target_dropout": target_dropout,
+        "tool_outlier": tool_outlier, "target_outlier": target_outlier,
+        "outlier_size": outlier_size, "reject_outliers": reject_outliers,
         "tool_bias": tuple(tool_bias), "target_bias": tuple(target_bias),
         "tool_drift": tuple(tool_drift), "target_drift": tuple(target_drift),
         "motion_amplitude": motion_amplitude, "motion_frequency": motion_frequency,
@@ -107,12 +88,17 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
     upper_limits = np.array([np.deg2rad(45), np.deg2rad(35), 110.0])
     speeds = np.array([np.deg2rad(20), np.deg2rad(20), 15.0])
 
-    # repeats Gaussian + dropout draws at the same sample times across methods
+    # repeats noise + fault draws at the same sample times across methods
     noise_generator = np.random.default_rng(seed)
     dropout_generators = [np.random.default_rng([seed, 1]), np.random.default_rng([seed, 2])]
+    outlier_generators = [np.random.default_rng([seed, 3]), np.random.default_rng([seed, 4])]
     filters = [None, None]
     noise = [tool_noise, target_noise]
     dropout = [tool_dropout, target_dropout]
+    outlier = [tool_outlier, target_outlier]
+    accepted_times = [None, None]
+    required_filters = (0, 1) if tracking == "filtered" else (
+        (0,) if mode == "uncert_aware" else ())
     biases, drift_rates = [tool_bias, target_bias], [tool_drift, target_drift]
     acceleration = [20.0, 1.0]
     error_sums = dict.fromkeys(("tool_raw", "target_raw", "tool_filtered", "target_filtered"), 0.0)
@@ -120,6 +106,7 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
     covariance_sums = {"tool": 0.0, "target": 0.0}
     covered = {"tool": 0, "target": 0}
     dropped = {"tool": 0, "target": 0}
+    rejected = {"tool": 0, "target": 0}
     sensor_samples = 0
     plan, planned_target, planned_at = None, None, None
     route_index, route_finished_at, arrival_since = 1, None, None
@@ -135,6 +122,12 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
         elapsed_time = min(frame * timestep, duration)
         step = elapsed_time - previous_time
         previous_time = elapsed_time
+
+        if plan is not None:
+            if any(accepted_times[index] is None or elapsed_time - accepted_times[index] > 0.25 + 1e-9
+                   for index in required_filters):
+                status = "tracking_lost"
+                break
 
         if plan is not None and route_index < len(plan["path"]):
             remaining = plan["path"][route_index] - configuration
@@ -173,18 +166,26 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
         if frame % sample_frames == 0 and np.isclose(
                 elapsed_time, frame * timestep, rtol=0, atol=1e-12):
             observations = []
+            accepted = [False, False]
             for index, (name, position) in enumerate(zip(("tool", "target"),
                                                         (tool_position, target_position))):
                 biased = ApplyBias(position, biases[index], drift_rates[index], elapsed_time)
                 measured = measure_position(biased, noise[index], noise_generator)
+                measured = ApplyOutlier(measured, outlier[index], outlier_size,
+                                        outlier_generators[index])
                 observed = ApplyDropout(measured, dropout[index], dropout_generators[index])
                 observations.append(observed)
                 if filters[index] is not None:
                     filters[index].predict(0.1)
                     if observed is not None:
-                        filters[index].update(observed)
+                        accepted[index] = filters[index].update(observed, reject_outliers)
+                        if not accepted[index]:
+                            rejected[name] += 1
                 elif observed is not None:
                     filters[index] = KalmanFilter(observed, noise[index], acceleration[index])
+                    accepted[index] = True
+                if accepted[index]:
+                    accepted_times[index] = elapsed_time
                 if observed is None:
                     dropped[name] += 1
                 else:
@@ -202,6 +203,9 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
 
             available = (tracking == "ideal" and mode != "uncert_aware") or (
                 observations[0] is not None and (tracking == "ideal" or observations[1] is not None))
+            available = available and all(accepted_times[index] is not None
+                                         and elapsed_time - accepted_times[index] <= 0.25 + 1e-9
+                                         for index in required_filters)
             if elapsed_time >= warmup - 1e-9:
                 if not available:
                     status = "tracking_unavailable" if plan is None else "tracking_lost"
@@ -235,7 +239,7 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
                         route_finished_at = elapsed_time
 
                 feedback = get_target_feedback(selected_tool, selected_target, target_tolerance)
-                if feedback["arrived"]:
+                if feedback["arrived"] and (tracking != "filtered" or all(accepted)):
                     if arrival_since is None:
                         arrival_since = elapsed_time
                     if elapsed_time - arrival_since >= 0.5 - 1e-9:
@@ -274,7 +278,7 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
         "travel": travel, "minimum_clearance": float(minimum_clearance),
         "plan": plan, "planned_target": planned_target, "true_target": target_position,
         "configuration": configuration, "sensor_samples": sensor_samples,
-        "dropped": dropped, "rmse": rmse, "samples": counts,
+        "dropped": dropped, "rejected": rejected, "rmse": rmse, "samples": counts,
         "predicted_rms": predicted_rms, "coverage": coverage,
     }
 
@@ -327,6 +331,8 @@ def CompareMethods(scenario="Direct insertion", seeds=range(10), *,
             for name in ("tool", "target"):
                 values[name + "_" + metric] = [run[metric][name] for run in runs
                                                if run[metric][name] is not None]
+        for name in ("tool", "target"):
+            values[name + "_rejected"] = [run["rejected"][name] for run in runs]
         metrics = {}
         for name, measurements in values.items():
             count = len(measurements)
@@ -342,15 +348,24 @@ def CompareMethods(scenario="Direct insertion", seeds=range(10), *,
             "cancelled": cancelled}
 
 
-def RunSensitivityStudy(scenario="Direct insertion", noise_levels=(0.0, 1.0, 2.0, 4.0),
-                        seeds=range(10), *, cancel_event=None, progress=None, **settings):
+def RunSensitivityStudy(scenario="Direct insertion", levels=None, seeds=range(10), *,
+                        parameter="tool_noise", cancel_event=None, progress=None, **settings):
+    if not isinstance(parameter, str) or parameter not in (
+            "tool_noise", "uncertainty_scale", "reject_outliers"):
+        raise ValueError("Invalid study parameter.")
+    if levels is None:
+        levels = {"tool_noise": (0.0, 1.0, 2.0, 4.0),
+                  "uncertainty_scale": (0.0, 0.5, 1.0, 2.0),
+                  "reject_outliers": (0.0, 1.0)}[parameter]
     try:
-        levels = np.asarray(noise_levels, dtype=float)
+        levels = np.asarray(levels, dtype=float)
     except (TypeError, ValueError, OverflowError):
-        raise ValueError("Invalid noise levels.") from None
+        raise ValueError("Invalid study levels.") from None
     if (levels.ndim != 1 or not levels.size or not np.all(np.isfinite(levels))
             or np.any(levels < 0) or np.unique(levels).size != levels.size):
-        raise ValueError("Expected different nonnegative noise levels.")
+        raise ValueError("Expected different nonnegative study levels.")
+    if parameter == "reject_outliers" and not np.all(np.isin(levels, (0.0, 1.0))):
+        raise ValueError("Expected rejection levels 0 or 1.")
     if progress is not None and not callable(progress):
         raise ValueError("Invalid progress callback.")
     levels = np.sort(levels).tolist()
@@ -359,7 +374,8 @@ def RunSensitivityStudy(scenario="Direct insertion", noise_levels=(0.0, 1.0, 2.0
     completed, total = 0, 3 * len(seeds) * len(levels)
     cancelled = False
     for level in levels:
-        level_settings = dict(settings, tool_noise=level)
+        level_settings = dict(settings)
+        level_settings[parameter] = bool(level) if parameter == "reject_outliers" else level
 
         def ReportProgress(update):
             count, _, mode, seed = update
@@ -374,5 +390,6 @@ def RunSensitivityStudy(scenario="Direct insertion", noise_levels=(0.0, 1.0, 2.0
         if comparison["cancelled"] or (cancel_event is not None and cancel_event.is_set()):
             cancelled = completed < total
             break
-    return {"scenario": scenario, "noise_levels": levels, "seeds": [int(seed) for seed in seeds],
+    return {"scenario": scenario, "parameter": parameter, "levels": levels,
+            "seeds": [int(seed) for seed in seeds],
             "comparisons": comparisons, "cancelled": cancelled}

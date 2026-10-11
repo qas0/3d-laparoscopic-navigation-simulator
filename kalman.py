@@ -1,6 +1,41 @@
 import numpy as np
 
 
+def CheckMeasurement(innovation, covariance, thresholds=(6.635, 9.210, 11.345)):
+    try:
+        innovation = np.asarray(innovation, dtype=float)
+        covariance = np.asarray(covariance, dtype=float)
+        thresholds = np.asarray(thresholds, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("Invalid error or covariance.") from None
+    if (innovation.shape != (3,) or covariance.shape != (3, 3)
+            or not np.all(np.isfinite(innovation)) or not np.all(np.isfinite(covariance))):
+        raise ValueError("Invalid error or covariance.")
+    if thresholds.shape != (3,) or not np.all(np.isfinite(thresholds)) or np.any(thresholds <= 0):
+        raise ValueError("Invalid thresholds.")
+    tolerance = 3 * np.finfo(float).eps * np.max(np.abs(covariance))
+    if not np.allclose(covariance, covariance.T, rtol=0, atol=tolerance):
+        raise ValueError("Expected symmetric covariance.")
+    covariance = 0.5 * covariance + 0.5 * covariance.T
+    eigenvalues, directions = np.linalg.eigh(covariance)
+    tolerance = 3 * np.finfo(float).eps * np.max(np.abs(eigenvalues))
+    if np.min(eigenvalues) < -tolerance:
+        raise ValueError("Expected nonnegative covariance.")
+    supported = eigenvalues > tolerance
+    rank = int(np.count_nonzero(supported))
+    if rank == 3:
+        score = float(innovation @ np.linalg.solve(covariance, innovation))
+    else:
+        projected = directions.T @ innovation
+        # allows 1e-9 mm rounding error in directions with zero reported uncertainty
+        if np.linalg.norm(projected[~supported]) > 1e-9:
+            return False
+        if rank == 0:
+            return True
+        score = float(np.sum(projected[supported] ** 2 / eigenvalues[supported]))
+    return bool(score <= thresholds[rank - 1])
+
+
 class KalmanFilter:
     def __init__(self, position, noise_std, acceleration_std=10.0, velocity_std=25.0):
         try:
@@ -39,7 +74,7 @@ class KalmanFilter:
         self.covariance = transition @ self.covariance @ transition.T + process_noise
         self.covariance = (self.covariance + self.covariance.T) / 2
 
-    def update(self, position):
+    def update(self, position, reject_outliers=False):
         try:
             position = np.asarray(position, dtype=float)
         except (TypeError, ValueError, OverflowError):
@@ -51,6 +86,8 @@ class KalmanFilter:
         measurement_noise = self.noise_std ** 2 * np.eye(3)
         innovation = position - measurement @ self.state
         innovation_covariance = measurement @ self.covariance @ measurement.T + measurement_noise
+        if reject_outliers and not CheckMeasurement(innovation, innovation_covariance):
+            return False
         cross_covariance = self.covariance @ measurement.T
 
         if self.noise_std == 0 and not np.any(innovation_covariance):
@@ -71,3 +108,4 @@ class KalmanFilter:
             self.state[:3] = position
             self.covariance[:3, :] = 0
             self.covariance[:, :3] = 0
+        return True
