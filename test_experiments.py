@@ -5,7 +5,7 @@ from unittest.mock import patch
 import numpy as np
 
 from astar import find_path
-from experiments import CompareMethods, GetUncertaintyCoverage, RunTrial
+from experiments import CompareMethods, GetUncertaintyCoverage, RunSensitivityStudy, RunTrial
 from geometry import tip_position
 from motion import GetRespiratoryMotion
 from scenarios import SCENARIOS
@@ -427,6 +427,147 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(progress, [(1, 3, "conventional", 4), (2, 3, "prox_aware", 4),
                                     (3, 3, "uncert_aware", 4)])
         self.assertEqual(len(comparison["trials"]), 3)
+
+
+class SensitivityStudyTests(unittest.TestCase):
+    def test_NoiseLevelsRepeatTheSameSeedsAndMatchSeparateComparisons(self):
+        settings = dict(tool_noise=12.0, target_noise=0.5, tool_dropout=0.2,
+                        target_bias=(0.0, 1.0, 0.0), target_drift=(0.1, 0.0, 0.0),
+                        motion_amplitude=2.0, warmup=0.1, duration=0.4)
+        original = dict(settings)
+        start = SCENARIOS["Inaccessible target"]["start"].copy()
+        study = RunSensitivityStudy("Inaccessible target", noise_levels=[2.0, 0.0],
+                                    seeds=(seed for seed in (5, 9)), **settings)
+        self.assertFalse(study["cancelled"])
+        self.assertEqual(study["scenario"], "Inaccessible target")
+        self.assertEqual(study["noise_levels"], [0.0, 2.0])
+        self.assertEqual(study["seeds"], [5, 9])
+        self.assertEqual(len(study["comparisons"]), 2)
+        for noise, comparison in zip(study["noise_levels"], study["comparisons"]):
+            expected_settings = dict(settings, tool_noise=noise)
+            direct = CompareMethods("Inaccessible target", seeds=[5, 9], **expected_settings)
+            self.assertEqual(comparison["seeds"], [5, 9])
+            self.assertEqual(comparison["settings"], direct["settings"])
+            self.assertEqual(len(comparison["trials"]), 6)
+            for trial, expected in zip(comparison["trials"], direct["trials"]):
+                for key in ("mode", "seed", "status", "success", "false_arrival",
+                            "reported_arrival", "actual_arrived", "actual_error", "elapsed_time",
+                            "completion_time", "travel", "minimum_clearance", "sensor_samples",
+                            "dropped", "rmse", "samples", "predicted_rms", "coverage"):
+                    self.assertEqual(trial[key], expected[key], key)
+                for key in ("configuration", "planned_target", "true_target"):
+                    np.testing.assert_array_equal(trial[key], expected[key])
+            for mode, summary in comparison["summary"].items():
+                for key in ("trials", "successes", "success_rate", "false_arrivals", "statuses"):
+                    self.assertEqual(summary[key], direct["summary"][mode][key])
+                for name, metric in summary["metrics"].items():
+                    if name != "planning_time":
+                        self.assertEqual(metric, direct["summary"][mode]["metrics"][name])
+        self.assertEqual(settings, original)
+        np.testing.assert_array_equal(SCENARIOS["Inaccessible target"]["start"], start)
+
+    def test_ProgressCountsTrialsAcrossAllNoiseLevels(self):
+        progress = []
+        study = RunSensitivityStudy("Inaccessible target", noise_levels=[0.0, 1.0],
+                                    seeds=[4, 6], progress=progress.append,
+                                    tool_noise=0.0, target_noise=0.0, warmup=0.0)
+        expected = [(index + 1, 12, mode, seed)
+                    for index, (mode, seed) in enumerate(
+                        [(mode, seed) for _ in range(2)
+                         for mode in ("conventional", "prox_aware", "uncert_aware")
+                         for seed in (4, 6)])]
+        self.assertEqual(progress, expected)
+        self.assertEqual(sum(len(result["trials"]) for result in study["comparisons"]), 12)
+
+    def test_PrecancelledStudyDoesNotStartAnExperiment(self):
+        cancelled, progress = Event(), []
+        cancelled.set()
+        with patch("experiments.find_path") as planner, patch("experiments.measure_position") as sensor:
+            study = RunSensitivityStudy(noise_levels=[0.0, 1.0], seeds=[3],
+                                        cancel_event=cancelled, progress=progress.append)
+        planner.assert_not_called()
+        sensor.assert_not_called()
+        self.assertTrue(study["cancelled"])
+        self.assertEqual(study["comparisons"], [])
+        self.assertEqual(progress, [])
+
+    def test_CancellationRetainsOnlyCompletedTrialsAtTheCurrentNoiseLevel(self):
+        cancelled, progress = Event(), []
+
+        def StopStudy(update):
+            progress.append(update)
+            if update[0] == 4:
+                cancelled.set()
+
+        study = RunSensitivityStudy("Inaccessible target", noise_levels=[0.0, 1.0],
+                                    seeds=[4, 6], cancel_event=cancelled, progress=StopStudy,
+                                    target_noise=0.0, warmup=0.0)
+        self.assertTrue(study["cancelled"])
+        self.assertEqual(len(study["comparisons"]), 1)
+        comparison = study["comparisons"][0]
+        self.assertTrue(comparison["cancelled"])
+        self.assertEqual(len(comparison["trials"]), 4)
+        self.assertEqual(progress[-1], (4, 12, "prox_aware", 6))
+        self.assertEqual(comparison["summary"]["conventional"]["trials"], 2)
+        self.assertEqual(comparison["summary"]["prox_aware"]["trials"], 2)
+        self.assertEqual(comparison["summary"]["uncert_aware"]["trials"], 0)
+        self.assertTrue(all(trial["status"] != "cancelled" for trial in comparison["trials"]))
+
+    def test_CancellationBetweenLevelsLeavesTheNextLevelUnstarted(self):
+        cancelled = Event()
+
+        def StopStudy(update):
+            if update[0] == 3:
+                cancelled.set()
+
+        study = RunSensitivityStudy("Inaccessible target", noise_levels=[0.0, 1.0],
+                                    seeds=[4], cancel_event=cancelled, progress=StopStudy,
+                                    target_noise=0.0, warmup=0.0)
+        self.assertTrue(study["cancelled"])
+        self.assertEqual(len(study["comparisons"]), 1)
+        self.assertFalse(study["comparisons"][0]["cancelled"])
+        self.assertEqual(len(study["comparisons"][0]["trials"]), 3)
+        self.assertEqual(study["comparisons"][0]["settings"]["tool_noise"], 0.0)
+
+    def test_CancellationAfterTheFinalTrialStillReportsACompleteStudy(self):
+        cancelled, progress = Event(), []
+
+        def StopStudy(update):
+            progress.append(update)
+            if update[0] == update[1]:
+                cancelled.set()
+
+        study = RunSensitivityStudy("Inaccessible target", noise_levels=[0.0, 1.0],
+                                    seeds=[4], cancel_event=cancelled, progress=StopStudy,
+                                    target_noise=0.0, warmup=0.0)
+        self.assertTrue(cancelled.is_set())
+        self.assertFalse(study["cancelled"])
+        self.assertEqual(len(study["comparisons"]), 2)
+        self.assertEqual(progress[-1], (6, 6, "uncert_aware", 4))
+        self.assertTrue(all(not comparison["cancelled"] for comparison in study["comparisons"]))
+
+    def test_CancellationDuringTheFirstTrialDoesNotRetainAnEmptyLevel(self):
+        cancelled = Event()
+
+        def StopMovement(position, probability, generator):
+            if 40.0 < position[0] < 80.0:
+                cancelled.set()
+            return ApplyDropout(position, probability, generator)
+
+        with patch("experiments.ApplyDropout", side_effect=StopMovement):
+            study = RunSensitivityStudy(noise_levels=[0.0, 1.0], seeds=[4],
+                                        cancel_event=cancelled, target_noise=0.0)
+        self.assertTrue(cancelled.is_set())
+        self.assertTrue(study["cancelled"])
+        self.assertEqual(study["comparisons"], [])
+
+    def test_InvalidNoiseLevelsAndProgressAreRejected(self):
+        for levels in ([], 1.0, [[0.0, 1.0]], [0.0, 0.0], [-1.0, 0.0],
+                       [np.nan], [np.inf], ["bad"]):
+            with self.subTest(levels=levels), self.assertRaises(ValueError):
+                RunSensitivityStudy(noise_levels=levels, seeds=[0])
+        with self.assertRaises(ValueError):
+            RunSensitivityStudy(seeds=[0], progress=[])
 
 
 if __name__ == "__main__":

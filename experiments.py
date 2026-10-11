@@ -340,3 +340,39 @@ def CompareMethods(scenario="Direct insertion", seeds=range(10), *,
     return {"scenario": scenario, "seeds": [int(seed) for seed in seeds],
             "settings": resolved_settings, "trials": trials, "summary": summary,
             "cancelled": cancelled}
+
+
+def RunSensitivityStudy(scenario="Direct insertion", noise_levels=(0.0, 1.0, 2.0, 4.0),
+                        seeds=range(10), *, cancel_event=None, progress=None, **settings):
+    try:
+        levels = np.asarray(noise_levels, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("Invalid noise levels.") from None
+    if (levels.ndim != 1 or not levels.size or not np.all(np.isfinite(levels))
+            or np.any(levels < 0) or np.unique(levels).size != levels.size):
+        raise ValueError("Expected different nonnegative noise levels.")
+    if progress is not None and not callable(progress):
+        raise ValueError("Invalid progress callback.")
+    levels = np.sort(levels).tolist()
+    seeds = list(seeds)
+    comparisons = []
+    completed, total = 0, 3 * len(seeds) * len(levels)
+    cancelled = False
+    for level in levels:
+        level_settings = dict(settings, tool_noise=level)
+
+        def ReportProgress(update):
+            count, _, mode, seed = update
+            progress((completed + count, total, mode, seed))
+
+        comparison = CompareMethods(scenario, seeds, cancel_event=cancel_event,
+                                    progress=ReportProgress if progress is not None else None,
+                                    **level_settings)
+        if comparison["trials"]:
+            comparisons.append(comparison)
+        completed += len(comparison["trials"])
+        if comparison["cancelled"] or (cancel_event is not None and cancel_event.is_set()):
+            cancelled = completed < total
+            break
+    return {"scenario": scenario, "noise_levels": levels, "seeds": [int(seed) for seed in seeds],
+            "comparisons": comparisons, "cancelled": cancelled}

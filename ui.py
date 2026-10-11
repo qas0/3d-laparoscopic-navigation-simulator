@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 from pyvistaqt import QtInteractor
 
 from astar import find_path, get_uncertainty_margin
-from experiments import CompareMethods
+from experiments import CompareMethods, RunSensitivityStudy
 from feedback import get_target_feedback
 from geometry import movement_is_clear, shaft_clearance, tip_position
 from kalman import KalmanFilter
@@ -375,12 +375,16 @@ class SimulatorWindow(QMainWindow):
         self.comparison_setup_label = QLabel(wordWrap=True)
         comparison_layout.addWidget(self.comparison_setup_label)
         comparison_settings = QFormLayout()
+        self.comparison_type = QComboBox()
+        self.comparison_type.addItems(["Single comparison", "Tool-noise study"])
+        self.comparison_type.currentIndexChanged.connect(self.UpdateComparison)
+        comparison_settings.addRow("Experiment", self.comparison_type)
         self.comparison_trials = QSpinBox(minimum=1, maximum=100, value=10,
                                          keyboardTracking=False)
         comparison_settings.addRow("Trials per method", self.comparison_trials)
         comparison_layout.addLayout(comparison_settings)
         self.comparison_button = QPushButton("Run comparison", objectName="primary")
-        self.comparison_button.setToolTip("Runs all three methods with the selected settings, starting at the scenario's fixed pose. Each trial restarts sensors + breathing, uses a 1 s warmup and a 20 s simulation limit.")
+        self.comparison_button.setToolTip("Runs all three methods from the scenario's fixed pose. The study varies only tool noise, repeating the same seeds at every level. Each trial restarts sensors + breathing, uses a 1 s warmup and a 20 s simulation limit.")
         self.comparison_button.clicked.connect(self.RunComparison)
         comparison_layout.addWidget(self.comparison_button)
         self.comparison_stop_button = QPushButton("Stop comparison", enabled=False)
@@ -395,6 +399,24 @@ class SimulatorWindow(QMainWindow):
         result_layout = QVBoxLayout(self.comparison_dialog)
         self.comparison_result_label = QLabel(wordWrap=True)
         result_layout.addWidget(self.comparison_result_label)
+        self.comparison_level = QComboBox(visible=False)
+        self.comparison_level.currentIndexChanged.connect(self.ShowComparison)
+        result_layout.addWidget(self.comparison_level)
+        self.comparison_metrics = [
+            ("Final true error · all trials (mm)", "actual_error"),
+            ("Shaft clearance bound (mm)", "minimum_clearance"),
+            ("Travel · successful runs (mm)", "successful_travel"),
+            ("Completion · successful runs (s)", "successful_completion_time"),
+            ("Planning time (s)", "planning_time"),
+            ("Tool raw RMSE (mm)", "tool_raw_rmse"),
+            ("Tool filtered RMSE (mm)", "tool_filtered_rmse"),
+            ("Tool predicted RMS uncertainty (mm)", "tool_predicted_rms"),
+            ("Tool observed 95% coverage (%)", "tool_coverage"),
+            ("Target raw RMSE (mm)", "target_raw_rmse"),
+            ("Target filtered RMSE (mm)", "target_filtered_rmse"),
+            ("Target predicted RMS uncertainty (mm)", "target_predicted_rms"),
+            ("Target observed 95% coverage (%)", "target_coverage"),
+        ]
         self.comparison_table = QTableWidget(0, 4)
         self.comparison_table.setToolTip(
             "Mean ± sample SD across independent trials; n counts trials.\n"
@@ -408,7 +430,26 @@ class SimulatorWindow(QMainWindow):
         self.comparison_table.verticalHeader().hide()
         self.comparison_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.comparison_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        result_layout.addWidget(self.comparison_table)
+        self.comparison_tabs = QTabWidget()
+        self.comparison_tabs.tabBar().setAutoHide(True)
+        self.comparison_tabs.addTab(self.comparison_table, "Results at selected level")
+        self.comparison_tabs.currentChanged.connect(self.ShowComparison)
+        result_layout.addWidget(self.comparison_tabs)
+        self.sensitivity_graph = QWidget()
+        graph_layout = QVBoxLayout(self.sensitivity_graph)
+        self.sensitivity_metric = QComboBox()
+        for label, key in [("Successful completion (%)", "success_rate"),
+                           ("False arrivals (%)", "false_arrival_rate")] + self.comparison_metrics:
+            self.sensitivity_metric.addItem(label, key)
+        self.sensitivity_metric.currentIndexChanged.connect(self.PlotSensitivity)
+        graph_layout.addWidget(self.sensitivity_metric)
+        self.sensitivity_canvas = FigureCanvasQTAgg(Figure(facecolor="white", layout="constrained"))
+        self.sensitivity_axes = self.sensitivity_canvas.figure.add_subplot(111)
+        self.sensitivity_canvas.setToolTip(
+            "Points compare complete noise levels using the same seeds. Bars show sample SD, not confidence intervals.\n"
+            "Rates use completed trials. Missing measurements leave gaps.\n"
+            "With ideal tracking, tool noise affects sensor evaluation and the uncertainty margin; other routes can stay the same.")
+        graph_layout.addWidget(self.sensitivity_canvas)
         self.comparison_results_button = QPushButton("View results", visible=False)
         self.comparison_results_button.clicked.connect(self.comparison_dialog.show)
         comparison_layout.addWidget(self.comparison_results_button)
@@ -665,11 +706,15 @@ class SimulatorWindow(QMainWindow):
             self.comparison_progress.get_nowait()
         self.comparison_dialog.hide()
         self.comparison_results_button.hide()
-        self.comparison_status_label.setText(f"Completed 0 / {3 * len(seeds)} trials.")
+        study = self.comparison_type.currentIndex() == 1
+        total = 3 * len(seeds) * (4 if study else 1)
+        self.comparison_status_label.setText(f"Completed 0 / {total} trials.")
         self.comparison_future = self.executor.submit(
-            CompareMethods, self.scenario_combo.currentText(), seeds,
+            RunSensitivityStudy if study else CompareMethods, self.scenario_combo.currentText(),
+            seeds=seeds,
             cancel_event=self.comparison_cancel, progress=self.comparison_progress.put, **settings)
         self.comparison_button.setEnabled(False)
+        self.comparison_type.setEnabled(False)
         self.comparison_trials.setEnabled(False)
         self.comparison_stop_button.setEnabled(True)
         self.plan_button.setEnabled(False)
@@ -677,9 +722,14 @@ class SimulatorWindow(QMainWindow):
     def UpdateComparison(self):
         if self.comparison_future is None:
             seed, count = self.sensor_seed.value(), self.comparison_trials.value()
+            study = self.comparison_type.currentIndex() == 1
+            self.comparison_button.setText("Run study" if study else "Run comparison")
+            self.comparison_stop_button.setText("Stop study" if study else "Stop comparison")
             self.comparison_setup_label.setText(
                 f"{self.scenario_combo.currentText()}\n{self.navigation_mode_combo.currentText()}\n"
-                f"3 methods × {count} trials · Seeds {seed}–{seed + count - 1}")
+                f"3 methods × {count} trials" + (" × 4 noise levels" if study else "")
+                + f" · Seeds {seed}–{seed + count - 1}"
+                + ("\nTool noise σ: 0, 1, 2, 4 mm" if study else ""))
             return
         # reads worker progress on the UI thread without touching the live scene
         while not self.comparison_progress.empty():
@@ -691,6 +741,7 @@ class SimulatorWindow(QMainWindow):
         future = self.comparison_future
         self.comparison_future = None
         self.comparison_button.setEnabled(True)
+        self.comparison_type.setEnabled(True)
         self.comparison_trials.setEnabled(True)
         self.comparison_stop_button.setEnabled(False)
         self.plan_button.setEnabled(not self.route_feedback_active)
@@ -700,36 +751,64 @@ class SimulatorWindow(QMainWindow):
             self.comparison_status_label.setText(f"Comparison failed: {error}")
             return
         self.comparison_result = result
+        study = "comparisons" in result
+        comparisons = result["comparisons"] if study else [result]
+        completed = sum(len(comparison["trials"]) for comparison in comparisons)
+        total = 3 * len(result["seeds"]) * (len(result["noise_levels"]) if study else 1)
         state = "Stopped" if result["cancelled"] else "Completed"
-        self.comparison_status_label.setText(
-            f"{state} · {len(result['trials'])} / {3 * len(result['seeds'])} trials.")
-        if not result["trials"]:
+        self.comparison_status_label.setText(f"{state} · {completed} / {total} trials.")
+        if not completed:
             return
+        self.comparison_level.blockSignals(True)
+        self.comparison_level.clear()
+        for comparison in comparisons:
+            count, expected = len(comparison["trials"]), 3 * len(result["seeds"])
+            self.comparison_level.addItem(
+                f"Tool noise σ {comparison['settings']['tool_noise']:g} mm · {count} / {expected} trials"
+                + (" · partial" if count < expected else ""))
+        self.comparison_level.blockSignals(False)
+        self.comparison_level.setVisible(study)
+        graph_index = self.comparison_tabs.indexOf(self.sensitivity_graph)
+        has_graph = study and any(len(comparison["trials"]) == 3 * len(result["seeds"])
+                                  for comparison in comparisons)
+        if has_graph and graph_index == -1:
+            self.comparison_tabs.addTab(self.sensitivity_graph, "Sensitivity graph")
+        elif not has_graph and graph_index != -1:
+            self.comparison_tabs.removeTab(graph_index)
+        self.comparison_tabs.setTabText(0, "Results at selected level" if study else "Results")
+        self.comparison_dialog.setWindowTitle("Tool-noise sensitivity study" if study else "Planner comparison")
+        self.ShowComparison()
+        if has_graph:
+            self.PlotSensitivity()
+        self.comparison_results_button.show()
+        self.comparison_dialog.show()
+
+    def ShowComparison(self):
+        if self.comparison_result is None:
+            return
+        result = self.comparison_result
+        study = "comparisons" in result
+        graph_visible = self.comparison_tabs.currentWidget() is self.sensitivity_graph
+        self.comparison_level.setVisible(study and not graph_visible)
+        if study:
+            index = self.comparison_level.currentIndex()
+            if index < 0:
+                return
+            result = result["comparisons"][index]
         settings = result["settings"]
+        noise_label = f"Noise σ: tool {settings['tool_noise']:g} / target {settings['target_noise']:g} mm"
+        if study and graph_visible:
+            noise_label = f"Tool noise varies across completed levels · Target noise σ {settings['target_noise']:g} mm"
         self.comparison_result_label.setText(
             f"{result['scenario']} · {settings['tracking'].capitalize()} tracking · "
             f"Seeds {result['seeds'][0]}–{result['seeds'][-1]}\n"
-            f"Noise σ: tool {settings['tool_noise']:g} / target {settings['target_noise']:g} mm · "
+            f"{noise_label} · "
             f"Dropout: tool {100 * settings['tool_dropout']:g} / target {100 * settings['target_dropout']:g}%\n"
             f"Bias XYZ (mm): tool {tuple(map(float, settings['tool_bias']))} / target {tuple(map(float, settings['target_bias']))}\n"
             f"Drift XYZ (mm/s): tool {tuple(map(float, settings['tool_drift']))} / target {tuple(map(float, settings['target_drift']))}\n"
             f"Breathing: {settings['motion_amplitude']:g} mm / {settings['motion_frequency']:g} Hz · "
             f"Proximity weight {settings['proximity_weight']:g} · Uncertainty k {settings['uncertainty_scale']:g}")
-        metrics = [
-            ("Final true error · all trials (mm)", "actual_error"),
-            ("Shaft clearance bound (mm)", "minimum_clearance"),
-            ("Travel · successful runs (mm)", "successful_travel"),
-            ("Completion · successful runs (s)", "successful_completion_time"),
-            ("Planning time (s)", "planning_time"),
-            ("Tool raw RMSE (mm)", "tool_raw_rmse"),
-            ("Tool filtered RMSE (mm)", "tool_filtered_rmse"),
-            ("Tool predicted RMS uncertainty (mm)", "tool_predicted_rms"),
-            ("Tool observed 95% coverage (%)", "tool_coverage"),
-            ("Target raw RMSE (mm)", "target_raw_rmse"),
-            ("Target filtered RMSE (mm)", "target_filtered_rmse"),
-            ("Target predicted RMS uncertainty (mm)", "target_predicted_rms"),
-            ("Target observed 95% coverage (%)", "target_coverage"),
-        ]
+        metrics = self.comparison_metrics
         labels = ["Completed trials", "True arrivals", "False arrivals", "Outcomes"]
         self.comparison_table.setRowCount(len(labels) + len(metrics))
         for row, label in enumerate(labels + [label for label, _ in metrics]):
@@ -751,8 +830,54 @@ class SimulatorWindow(QMainWindow):
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.comparison_table.setItem(row, column, item)
         self.comparison_table.resizeRowsToContents()
-        self.comparison_results_button.show()
-        self.comparison_dialog.show()
+
+    def PlotSensitivity(self):
+        result = self.comparison_result
+        if result is None or "comparisons" not in result:
+            return
+        # compares complete levels; partial trial groups remain available in the table
+        comparisons = [comparison for comparison in result["comparisons"]
+                       if len(comparison["trials"]) == 3 * len(result["seeds"])]
+        levels = np.array([comparison["settings"]["tool_noise"] for comparison in comparisons])
+        key = self.sensitivity_metric.currentData()
+        axes = self.sensitivity_axes
+        axes.clear()
+        for column, (mode, color) in enumerate(zip(
+                ("conventional", "prox_aware", "uncert_aware"),
+                ("#286e9f", "#00877b", "#7757b5")), 1):
+            means, deviations = [], []
+            for comparison in comparisons:
+                summary = comparison["summary"][mode]
+                if key in ("success_rate", "false_arrival_rate"):
+                    mean = 100 * (summary["success_rate"] if key == "success_rate"
+                                  else summary["false_arrivals"] / summary["trials"])
+                    deviation = None
+                else:
+                    mean, deviation = (summary["metrics"][key][field] for field in ("mean", "sd"))
+                means.append(np.nan if mean is None else mean)
+                deviations.append(np.nan if deviation is None else deviation)
+            means, deviations = np.asarray(means), np.asarray(deviations)
+            if not np.any(np.isfinite(means)):
+                continue
+            axes.plot(levels, means, "o-", color=color,
+                      label=self.comparison_table.horizontalHeaderItem(column).text())
+            available = np.isfinite(means) & np.isfinite(deviations)
+            if np.any(available):
+                axes.errorbar(levels[available], means[available], yerr=deviations[available],
+                              fmt="none", color=color, capsize=4)
+        axes.set_xlabel("Tool noise σ (mm)")
+        axes.set_ylabel(self.sensitivity_metric.currentText())
+        axes.set_title(f"Complete noise levels: {len(comparisons)} / {len(result['noise_levels'])}")
+        axes.set_xticks(levels)
+        if key in ("success_rate", "false_arrival_rate"):
+            axes.set_ylim(0, 100)
+        axes.grid(alpha=0.2)
+        if axes.lines:
+            axes.legend()
+        else:
+            axes.text(0.5, 0.5, "No available measurements for this metric",
+                      ha="center", va="center", transform=axes.transAxes)
+        self.sensitivity_canvas.draw_idle()
 
     def plan_path(self):
         if self.comparison_future is not None:
@@ -1468,4 +1593,5 @@ class SimulatorWindow(QMainWindow):
         QApplication.instance().removeEventFilter(self)
         self.viewport.close()
         self.distance_canvas.close()
+        self.sensitivity_canvas.close()
         super().closeEvent(event)
