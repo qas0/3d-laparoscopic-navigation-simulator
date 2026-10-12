@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from feedback import get_target_feedback
+from feedback import GetRouteGuidance, get_target_feedback
 
 
 class FeedbackTests(unittest.TestCase):
@@ -100,6 +100,112 @@ class FeedbackTests(unittest.TestCase):
                     settings = {"tool_covariance": np.eye(3), "target_covariance": np.eye(3)}
                     settings[argument] = covariance
                     get_target_feedback([0, 0, 0], [1, 0, 0], **settings)
+
+
+class RouteGuidanceTests(unittest.TestCase):
+    def test_ChangesRetainRadiansMillimetresAndSigns(self):
+        current = [np.deg2rad(10), np.deg2rad(-5), 60]
+        path = [[np.deg2rad(-2), np.deg2rad(3), 45]]
+        guidance = GetRouteGuidance(current, path)
+        self.assertEqual(guidance["waypoint"], 0)
+        self.assertFalse(guidance["complete"])
+        np.testing.assert_allclose(guidance["change"],
+                                   [np.deg2rad(-12), np.deg2rad(8), -15])
+
+    def test_RetractionPrecedesRotationAndReinsertion(self):
+        angle = np.deg2rad(20)
+        path = np.array([[0, 0, 80], [0, 0, 40],
+                         [angle, 0, 40], [angle, 0, 80]])
+        waypoint = 0
+        for current, expected_index, expected_change in [
+                (path[0], 1, [0, 0, -40]),
+                (path[1], 2, [angle, 0, 0]),
+                (path[2], 3, [0, 0, 40])]:
+            with self.subTest(waypoint=expected_index):
+                guidance = GetRouteGuidance(current, path, waypoint)
+                self.assertEqual(guidance["waypoint"], expected_index)
+                self.assertFalse(guidance["complete"])
+                np.testing.assert_allclose(guidance["change"], expected_change)
+                waypoint = guidance["waypoint"]
+
+    def test_NearbyLaterWaypointDoesNotSkipEarlierMovement(self):
+        angle = np.deg2rad(20)
+        path = [[0, 0, 80], [0, 0, 40], [angle, 0, 40], [angle, 0, 80]]
+        guidance = GetRouteGuidance(path[-1], path, 1)
+        self.assertEqual(guidance["waypoint"], 1)
+        self.assertFalse(guidance["complete"])
+        np.testing.assert_allclose(guidance["change"], [-angle, 0, -40])
+
+    def test_AllAxesMustBeWithinTheirTolerances(self):
+        path = [[0, 0, 40], [0, 0, 60]]
+        for current in [[np.deg2rad(0.6), 0, 40],
+                        [0, np.deg2rad(0.6), 40], [0, 0, 40.6]]:
+            with self.subTest(current=current):
+                guidance = GetRouteGuidance(current, path)
+                self.assertEqual(guidance["waypoint"], 0)
+                np.testing.assert_allclose(guidance["change"], np.array(path[0]) - current)
+        reached = GetRouteGuidance([np.deg2rad(0.4), np.deg2rad(-0.4), 40.4], path)
+        self.assertEqual(reached["waypoint"], 1)
+
+    def test_ExplicitTolerancesIncludeBoundaryAndRounding(self):
+        path = [[0, 0, 40], [0, 0, 60]]
+        guidance = GetRouteGuidance([0.1 + 0.5e-9, -0.1, 42], path,
+                                    angle_tolerance=0.1, depth_tolerance=2)
+        self.assertEqual(guidance["waypoint"], 1)
+        for current in [[0.1 + 2e-9, 0, 40], [0, 0, 42 + 2e-9]]:
+            with self.subTest(current=current):
+                self.assertEqual(GetRouteGuidance(current, path, angle_tolerance=0.1,
+                                                   depth_tolerance=2)["waypoint"], 0)
+        self.assertTrue(GetRouteGuidance([0, 0, 40], path[:1],
+                                         angle_tolerance=0, depth_tolerance=0)["complete"])
+        self.assertFalse(GetRouteGuidance([0, 0, 40.01], path[:1],
+                                          angle_tolerance=0, depth_tolerance=0)["complete"])
+
+    def test_OnePointAndFinishedRoutesReturnZeroChanges(self):
+        path = [[0, 0, 40]]
+        for current, waypoint in [([0, 0, 40], 0), ([0.2, -0.1, 60], 1)]:
+            with self.subTest(waypoint=waypoint):
+                guidance = GetRouteGuidance(current, path, waypoint)
+                self.assertEqual(guidance["waypoint"], 1)
+                self.assertTrue(guidance["complete"])
+                np.testing.assert_array_equal(guidance["change"], np.zeros(3))
+
+    def test_ExistingProgressSurvivesTakeoverAndBacktracking(self):
+        path = [[0, 0, 40], [0.2, 0, 40], [0.2, 0, 60]]
+        takeover = GetRouteGuidance(path[1], path, np.int64(1))
+        self.assertEqual(takeover["waypoint"], 2)
+        backtracked = GetRouteGuidance(path[0], path, takeover["waypoint"])
+        self.assertEqual(backtracked["waypoint"], 2)
+        np.testing.assert_allclose(backtracked["change"], [0.2, 0, 20])
+
+    def test_InputsAndReturnedChangesDoNotShareMutableState(self):
+        current = np.array([0.1, -0.2, 40.0])
+        path = np.array([[0.3, 0.1, 60.0]])
+        original_current, original_path = current.copy(), path.copy()
+        guidance = GetRouteGuidance(current, path)
+        guidance["change"][:] = 0
+        np.testing.assert_array_equal(current, original_current)
+        np.testing.assert_array_equal(path, original_path)
+
+    def test_InvalidConfigurationsAndPathsAreRejected(self):
+        for current in [[], [0, 40], [[0, 0, 40]], [0, 0, -1],
+                        [np.nan, 0, 40], [0, np.inf, 40], ["invalid", 0, 40]]:
+            with self.subTest(current=current), self.assertRaises(ValueError):
+                GetRouteGuidance(current, [[0, 0, 40]])
+        for path in [[], [0, 0, 40], [[0, 40]], [[[0, 0, 40]]],
+                     [[0, 0, 40], [0, 0, -1]], [[0, 0, np.inf]],
+                     [[np.nan, 0, 40]], [["invalid", 0, 40]]]:
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                GetRouteGuidance([0, 0, 40], path)
+
+    def test_InvalidIndicesAndTolerancesAreRejected(self):
+        for waypoint in [-1, 2, 0.0, True, np.bool_(False), [0], None, np.nan]:
+            with self.subTest(waypoint=waypoint), self.assertRaises(ValueError):
+                GetRouteGuidance([0, 0, 40], [[0, 0, 40]], waypoint)
+        for tolerance in [-1, np.nan, np.inf, -np.inf, [0.5], "invalid"]:
+            for argument in ["angle_tolerance", "depth_tolerance"]:
+                with self.subTest(argument=argument, tolerance=tolerance), self.assertRaises(ValueError):
+                    GetRouteGuidance([0, 0, 40], [[0, 0, 40]], **{argument: tolerance})
 
 
 if __name__ == "__main__":

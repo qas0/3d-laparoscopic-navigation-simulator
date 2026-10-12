@@ -19,7 +19,7 @@ from pyvistaqt import QtInteractor
 
 from astar import find_path, get_uncertainty_margin
 from experiments import CompareMethods, RunSensitivityStudy
-from feedback import get_target_feedback
+from feedback import GetRouteGuidance, get_target_feedback
 from geometry import movement_is_clear, shaft_clearance, tip_position
 from kalman import KalmanFilter
 from motion import GetRespiratoryMotion
@@ -1601,6 +1601,10 @@ class SimulatorWindow(QMainWindow):
             return
         self.CheckRouteTracking()
         available = self.TrackingAvailable(self.plan_source_index, self.plan_mode, accepted=True)
+        guidance = None
+        if not self.route_feedback_active:
+            guidance = GetRouteGuidance(self.configuration, self.path, self.path_index)
+            self.path_index = guidance["waypoint"]
         if not refresh or self.route_result is not None:
             return
         tool = (tip_position(self.port, *self.sampled_configuration),
@@ -1625,6 +1629,25 @@ class SimulatorWindow(QMainWindow):
             status = f"Tracking paused · recovery {self.tracking_recovery_samples} / 2 samples."
         elif self.guidance_warning is not None:
             status = f"Replan advised: {self.guidance_warning}"
+        elif guidance is not None:
+            if not available:
+                status = "Tracking unavailable; movement guidance paused."
+            elif self.guidance_warning_pending is not None:
+                status = "Tracking changed; movement guidance paused."
+            elif guidance["complete"]:
+                status = "Waypoints reached; check target feedback."
+            elif not movement_is_clear(
+                    self.port, self.configuration, self.path[self.path_index], self.tool_radius,
+                    self.structure_centre, self.structure_radius, self.route_clearance):
+                status = "Next waypoint blocked; plan a fresh route."
+            else:
+                yaw, pitch = np.rad2deg(guidance["change"][:2])
+                moves = [f"{name} {value:+.1f}°" for name, value in (("Yaw", yaw), ("Pitch", pitch))
+                         if round(value, 1) != 0]
+                depth = guidance["change"][2]
+                if round(depth, 1) != 0:
+                    moves.append(f"{'Insert' if depth > 0 else 'Retract'} {abs(depth):.1f} mm")
+                status = f"Waypoint {self.path_index} / {len(self.path) - 1} · " + " · ".join(moves)
         if self.plan_source_index == 2 and not available:
             status += " Tip-to-guide uses prediction."
         if self.manual_guidance and self.sampled_clearance < self.route_clearance:
@@ -1703,6 +1726,7 @@ class SimulatorWindow(QMainWindow):
                         self.message_label.setText(
                             f"Following route · waypoint {self.path_index} of {len(self.path) - 1}.")
                 else:
+                    self.update_route_guidance(refresh=False)
                     self.message_label.setText("Manual movement · shaft clearance maintained.")
             else:
                 if self.following:

@@ -44,3 +44,39 @@ def get_target_feedback(tool_position, target_position, target_tolerance=2.0,
     return {"distance": distance,
             "arrived": bool(distance <= float(target_tolerance) + 1e-9),
             "uncertainty": uncertainty}
+
+
+def GetRouteGuidance(configuration, path, waypoint=0,
+                     angle_tolerance=np.deg2rad(0.5), depth_tolerance=0.5):
+    try:
+        configuration = np.asarray(configuration, dtype=float)
+        path = np.asarray(path, dtype=float)
+        tolerances = np.asarray((angle_tolerance, depth_tolerance), dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("Invalid route inputs.") from None
+
+    if (configuration.shape != (3,) or path.ndim != 2
+            or path.shape[0] == 0 or path.shape[1] != 3):
+        raise ValueError("Expected three-value configurations.")
+    if not np.all(np.isfinite(configuration)) or not np.all(np.isfinite(path)):
+        raise ValueError("Configurations must be finite.")
+    if configuration[2] < 0 or np.any(path[:, 2] < 0):
+        raise ValueError("Depth cannot be negative.")
+    if (tolerances.shape != (2,) or not np.all(np.isfinite(tolerances))
+            or np.any(tolerances < 0)):
+        raise ValueError("Invalid route tolerances.")
+    if (isinstance(waypoint, (bool, np.bool_))
+            or not isinstance(waypoint, (int, np.integer))
+            or not 0 <= waypoint <= len(path)):
+        raise ValueError("Invalid waypoint.")
+
+    # advances through reached configurations in their planned order
+    waypoint = int(waypoint)
+    tolerances = tolerances[[0, 0, 1]]
+    while waypoint < len(path):
+        change = path[waypoint] - configuration
+        if not np.all(np.abs(change) <= tolerances + 1e-9):
+            return {"waypoint": waypoint, "complete": False, "change": change}
+        waypoint += 1
+
+    return {"waypoint": waypoint, "complete": True, "change": np.zeros(3)}
