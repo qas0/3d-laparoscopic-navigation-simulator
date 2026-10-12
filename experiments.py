@@ -113,6 +113,7 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
     plan, planned_target, planned_at = None, None, None
     route_index, route_finished_at, arrival_since = 1, None, None
     paused_since, paused_time, pause_count, recovery_samples = None, 0.0, 0, 0
+    pending_reason, pending_since = None, None
     elapsed_time, previous_time, travel = 0.0, 0.0, 0.0
     minimum_clearance = shaft_clearance(port, tip_position(port, *configuration),
                                         tool_radius, structure_centre, structure_radius)
@@ -211,6 +212,16 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
             available = available and all(accepted_times[index] is not None
                                          and elapsed_time - accepted_times[index] <= 0.25 + 1e-9
                                          for index in required_filters)
+            route_reason = None
+            if sampled and available:
+                if np.linalg.norm(selected_target - planned_target) > target_tolerance + 1e-9:
+                    route_reason = "target"
+                elif mode == "uncert_aware":
+                    margin = get_uncertainty_margin(filters[0].state[:3] - tool_position,
+                                                    filters[0].covariance[:3, :3],
+                                                    uncertainty_scale)
+                    if margin > plan["extra_clearance"] + 1e-9:
+                        route_reason = "uncertainty"
             if paused_since is not None and elapsed_time - paused_since > 1.0 + 1e-9:
                 status = "tracking_lost"
                 break
@@ -220,19 +231,13 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
                     pause_count += 1
                 recovery_samples = 0
                 arrival_since = None
+                pending_reason, pending_since = None, None
             elif paused_since is not None and sampled:
                 recovery_samples += 1
                 if recovery_samples >= 2:
                     clearance = shaft_clearance(port, tool_position, tool_radius,
                                                 structure_centre, structure_radius)
-                    usable = (np.linalg.norm(selected_target - planned_target)
-                              <= target_tolerance + 1e-9
-                              and clearance >= plan["required_clearance"])
-                    if mode == "uncert_aware":
-                        margin = get_uncertainty_margin(filters[0].state[:3] - tool_position,
-                                                        filters[0].covariance[:3, :3],
-                                                        uncertainty_scale)
-                        usable = usable and margin <= plan["extra_clearance"] + 1e-9
+                    usable = (route_reason is None and clearance >= plan["required_clearance"])
                     if usable and route_index < len(plan["path"]):
                         usable = movement_is_clear(port, configuration, plan["path"][route_index],
                                                    tool_radius, structure_centre, structure_radius,
@@ -249,6 +254,15 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
                     resumed = True
 
             if sampled and paused_since is None:
+                # stops a frozen route after the same mismatch persists for half a second
+                if route_reason is None:
+                    pending_reason, pending_since = None, None
+                elif route_reason != pending_reason:
+                    pending_reason, pending_since = route_reason, elapsed_time
+                elif elapsed_time - pending_since >= 0.5 - 1e-9:
+                    arrival_since = None
+                    status = "replan_required"
+                    break
                 feedback = get_target_feedback(selected_tool, selected_target, target_tolerance)
                 if feedback["arrived"] and (tracking != "filtered" or all(accepted)):
                     if arrival_since is None:

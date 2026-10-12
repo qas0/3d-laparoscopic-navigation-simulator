@@ -1233,6 +1233,7 @@ class SimulatorWindow(QMainWindow):
         self.readout_timer.start(500)
 
     def update_measurements(self):
+        route_active = self.route_feedback_active
         sample_time = perf_counter()
         self.UpdateRespiratoryMotion(sample_time)
         self.sampled_target = self.target.copy()
@@ -1323,9 +1324,11 @@ class SimulatorWindow(QMainWindow):
         self.distance_history.append((sample_time - self.distance_started_time,
                                       *(feedback["distance"] for feedback in self.target_feedbacks)))
         self.CheckRouteTracking()
+        route_stopped = route_active and not self.route_feedback_active
         for index, feedback in enumerate(self.target_feedbacks):
             if (not feedback["arrived"] or not self.TrackingAvailable(index)
                     or self.tracking_paused_time is not None
+                    or route_stopped
                     or index == 2 and any(self.rejected_observations)):
                 self.arrival_started[index] = None
             elif self.arrival_started[index] is None:
@@ -1507,28 +1510,7 @@ class SimulatorWindow(QMainWindow):
         if self.tracking_recovery_samples < 2:
             self.message_label.setText("Tracking recovering · 1 / 2 fresh samples. Movement stays paused.")
             return False
-        target = (self.sampled_target, self.target_measurement,
-                  self.target_estimate)[self.plan_source_index]
-        reason = None
-        if np.linalg.norm(target - self.planned_target) > self.target_tolerance + 1e-9:
-            reason = "Target tracking differs from the snapshot."
-        elif self.plan_mode == "uncert_aware":
-            offset = self.tool_estimate - tip_position(self.port, *self.sampled_configuration)
-            margin = get_uncertainty_margin(offset, self.tool_filter.covariance[:3, :3],
-                                            self.plan_uncertainty_scale)
-            if margin > self.route_clearance - self.required_clearance + 1e-9:
-                reason = "Tool tracking exceeds the planned margin."
-        clearance = shaft_clearance(self.port, tip_position(self.port, *self.configuration),
-                                    self.tool_radius, self.structure_centre, self.structure_radius)
-        if reason is None and (clearance < self.route_clearance or (
-                self.path_index < len(self.path) and not movement_is_clear(
-                    self.port, self.configuration, self.path[self.path_index], self.tool_radius,
-                    self.structure_centre, self.structure_radius, self.route_clearance))):
-            reason = "Remaining route lacks the planned clearance."
-        if reason is not None:
-            self.guidance_warning = reason
-            self.stop_path(keep_route=True)
-            self.message_label.setText(f"Tracking returned. {reason} Plan a fresh route; the guide stays visible.")
+        if not self.CheckRouteValidity(immediate=True):
             return False
         # excludes the interruption from arrival checking time after movement ends
         if self.route_finished_time is not None:
@@ -1546,10 +1528,14 @@ class SimulatorWindow(QMainWindow):
         if self.path is None or self.route_result is not None:
             return True
         available = self.TrackingAvailable(self.plan_source_index, self.plan_mode, accepted=True)
+        if not available:
+            self.guidance_warning_pending = None
+            self.guidance_warning_started = None
         if not self.route_feedback_active:
+            valid = self.CheckRouteValidity() if available else False
             if not self.manual_guidance:
-                self.follow_button.setEnabled(available and self.guidance_warning is None)
-            return available
+                self.follow_button.setEnabled(valid)
+            return valid
         now = perf_counter()
         if self.tracking_paused_time is not None and now - self.tracking_paused_time > 1.0 + 1e-9:
             self.guidance_warning = "Tracking did not recover within 1 s."
@@ -1561,31 +1547,60 @@ class SimulatorWindow(QMainWindow):
             return False
         if self.tracking_paused_time is not None:
             return self.ResumeAfterTrackingRecovery(now)
-        return True
+        return self.CheckRouteValidity()
+
+    def CheckRouteValidity(self, *, immediate=False):
+        if self.path is None or self.route_result is not None:
+            return True
+        if self.guidance_warning is not None:
+            return False
+        if not self.TrackingAvailable(self.plan_source_index, self.plan_mode, accepted=True):
+            self.guidance_warning_pending = None
+            self.guidance_warning_started = None
+            return False
+        target = (self.sampled_target, self.target_measurement,
+                  self.target_estimate)[self.plan_source_index]
+        reason = None
+        if np.linalg.norm(target - self.planned_target) > self.target_tolerance + 1e-9:
+            reason = "Target tracking differs from the snapshot."
+        elif self.plan_mode == "uncert_aware":
+            offset = self.tool_estimate - tip_position(self.port, *self.sampled_configuration)
+            margin = get_uncertainty_margin(offset, self.tool_filter.covariance[:3, :3],
+                                            self.plan_uncertainty_scale)
+            if margin > self.route_clearance - self.required_clearance + 1e-9:
+                reason = "Tool tracking exceeds the planned margin."
+        if immediate:
+            clearance = shaft_clearance(self.port, tip_position(self.port, *self.configuration),
+                                        self.tool_radius, self.structure_centre, self.structure_radius)
+            if reason is None and (clearance < self.route_clearance or (
+                    self.path_index < len(self.path) and not movement_is_clear(
+                        self.port, self.configuration, self.path[self.path_index], self.tool_radius,
+                        self.structure_centre, self.structure_radius, self.route_clearance))):
+                reason = "Remaining route lacks the planned clearance."
+        else:
+            if reason != self.guidance_warning_pending:
+                self.guidance_warning_pending = reason
+                self.guidance_warning_started = self.last_measurement_time if reason is not None else None
+            if (reason is None
+                    or self.last_measurement_time - self.guidance_warning_started < 0.5 - 1e-9):
+                return True
+        if reason is None:
+            return True
+        self.guidance_warning = reason
+        self.arrival_started = [None, None, None]
+        self.arrival_confirmed = [False, False, False]
+        if self.route_feedback_active:
+            self.stop_path(keep_route=True)
+            self.message_label.setText(f"Route stopped. {reason} Plan a fresh route; the guide stays visible.")
+        else:
+            self.follow_button.setEnabled(False)
+        return False
 
     def update_route_guidance(self, refresh=True):
         if self.route_points is None:
             return
-        available = self.CheckRouteTracking()
-        target = (self.sampled_target, self.target_measurement,
-                  self.target_estimate)[self.plan_source_index]
-        reason = None
-        if available and np.linalg.norm(target - self.planned_target) > self.target_tolerance:
-            reason = "Target tracking differs from the snapshot."
-        elif available and self.plan_mode == "uncert_aware":
-            offset = self.tool_estimate - tip_position(self.port, *self.sampled_configuration)
-            live_margin = get_uncertainty_margin(offset, self.tool_filter.covariance[:3, :3],
-                                                 self.plan_uncertainty_scale)
-            if round(live_margin, 2) > round(self.route_clearance - self.required_clearance, 2):
-                reason = "Tool tracking exceeds the planned margin."
-        # keeps brief noise changes from flickering the warning
-        if reason != self.guidance_warning_pending:
-            self.guidance_warning_pending = reason
-            self.guidance_warning_started = self.last_measurement_time if reason is not None else None
-        elif (reason is not None and self.guidance_warning is None
-              and self.last_measurement_time - self.guidance_warning_started >= 0.5 - 1e-9):
-            self.guidance_warning = reason
-            self.follow_button.setEnabled(False)
+        self.CheckRouteTracking()
+        available = self.TrackingAvailable(self.plan_source_index, self.plan_mode, accepted=True)
         if not refresh or self.route_result is not None:
             return
         tool = (tip_position(self.port, *self.sampled_configuration),
