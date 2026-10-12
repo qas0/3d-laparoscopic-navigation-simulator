@@ -82,13 +82,12 @@ class KalmanFilter:
         if position.shape != (3,) or not np.all(np.isfinite(position)):
             raise ValueError("Expected three finite values.")
 
-        measurement = np.hstack((np.eye(3), np.zeros((3, 3))))
         measurement_noise = self.noise_std ** 2 * np.eye(3)
-        innovation = position - measurement @ self.state
-        innovation_covariance = measurement @ self.covariance @ measurement.T + measurement_noise
+        innovation = position - self.state[:3]
+        innovation_covariance = self.covariance[:3, :3] + measurement_noise
         if reject_outliers and not CheckMeasurement(innovation, innovation_covariance):
             return False
-        cross_covariance = self.covariance @ measurement.T
+        cross_covariance = self.covariance[:, :3]
 
         if self.noise_std == 0 and not np.any(innovation_covariance):
             # keeps velocity unchanged when exact observations leave no uncertainty
@@ -96,8 +95,11 @@ class KalmanFilter:
         else:
             gain = np.linalg.solve(innovation_covariance, cross_covariance.T).T
 
+        if self.noise_std == 0:
+            velocity_scale = np.max(np.abs(self.covariance[3:, 3:]))
         self.state = self.state + gain @ innovation
-        correction = np.eye(6) - gain @ measurement
+        correction = np.eye(6)
+        correction[:, :3] -= gain
         # uses the Joseph form to preserve covariance under floating-point rounding
         self.covariance = (correction @ self.covariance @ correction.T
                            + gain @ measurement_noise @ gain.T)
@@ -108,4 +110,8 @@ class KalmanFilter:
             self.state[:3] = position
             self.covariance[:3, :] = 0
             self.covariance[:, :3] = 0
+            eigenvalues, directions = np.linalg.eigh(self.covariance[3:, 3:])
+            # removes small negative velocity variances caused by rounding
+            if -6 * np.finfo(float).eps * velocity_scale <= eigenvalues[0] < 0:
+                self.covariance[3:, 3:] = (directions * np.maximum(eigenvalues, 0)) @ directions.T
         return True

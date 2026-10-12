@@ -104,6 +104,17 @@ class KalmanTests(unittest.TestCase):
             previous_variance = variance.copy()
         np.testing.assert_allclose(tracker.state[:3], [1, 2, 3], atol=1e-12)
 
+    def test_ExactConstantVelocityTrackingKeepsNonnegativeCovariance(self):
+        tracker = KalmanFilter([0, 0, 0], 0.0, acceleration_std=0.0)
+        velocity = np.array([2.0, -1.0, 0.5])
+        elapsed_time = 0.0
+        for timestep in (0.07, 0.1, 0.13, 0.03, 0.19):
+            elapsed_time += timestep
+            tracker.predict(timestep)
+            self.assertTrue(tracker.update(velocity * elapsed_time, reject_outliers=True))
+            np.testing.assert_allclose(tracker.state[3:], velocity, atol=1e-12)
+            self.assertGreaterEqual(np.linalg.eigvalsh(tracker.covariance).min(), 0.0)
+
     def test_invalid_initial_values_are_rejected(self):
         settings = {"position": [1, 2, 3], "noise_std": 1.0}
         for changes in [{"position": [1, 2]}, {"position": [[1, 2, 3]]},

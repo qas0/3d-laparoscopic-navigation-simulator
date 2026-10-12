@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from geometry import instrument_direction, movement_is_clear, shaft_clearance, tip_position
+from geometry import CheckRemainingRoute, instrument_direction, movement_is_clear, shaft_clearance, tip_position
 
 
 class GeometryTests(unittest.TestCase):
@@ -91,6 +91,46 @@ class GeometryTests(unittest.TestCase):
                     tip = tip_position(port, *(start + fraction * (end - start)))
                     self.assertGreaterEqual(shaft_clearance(port, tip, 1.5, centre, 6), 2)
         self.assertGreater(accepted, 0)
+
+
+class RemainingRouteTests(unittest.TestCase):
+    def test_SpareClearanceAllowsAnIncreasedRequirementWithoutChangingThePath(self):
+        path = np.array([[0.0, 0.0, 35.0], [0.0, 0.0, 50.0], [0.0, 0.0, 90.0]])
+        original = path.copy()
+        self.assertTrue(CheckRemainingRoute(
+            [0, 0, 0], path[0], path, 1, 1.5, [65, 11, 0], 6, 3.4))
+        np.testing.assert_array_equal(path, original)
+
+    def test_AFutureBottleneckFailsDespiteAClearCurrentShaftAndNextEdge(self):
+        path = np.array([[0.0, 0.0, 35.0], [0.0, 0.0, 50.0], [0.0, 0.0, 90.0]])
+        self.assertGreater(shaft_clearance([0, 0, 0], tip_position([0, 0, 0], *path[0]),
+                                           1.5, [65, 11, 0], 6), 4.0)
+        self.assertTrue(movement_is_clear([0, 0, 0], path[0], path[1],
+                                          1.5, [65, 11, 0], 6, 4.0))
+        self.assertFalse(CheckRemainingRoute(
+            [0, 0, 0], path[0], path, 1, 1.5, [65, 11, 0], 6, 4.0))
+
+    def test_CompletedNarrowEdgesDoNotInvalidateTheRemainingRoute(self):
+        path = np.array([[0.0, 0.0, 90.0], [0.0, 0.0, 35.0], [0.3, 0.0, 35.0]])
+        self.assertFalse(CheckRemainingRoute(
+            [0, 0, 0], path[0], path, 1, 1.5, [65, 11, 0], 6, 4.0))
+        self.assertTrue(CheckRemainingRoute(
+            [0, 0, 0], path[1], path, 2, 1.5, [65, 11, 0], 6, 4.0))
+
+    def test_TheCurrentShaftIsCheckedWhenAllWaypointsAreComplete(self):
+        path = np.array([[0.0, 0.0, 90.0]])
+        self.assertTrue(CheckRemainingRoute(
+            [0, 0, 0], path[0], path, len(path), 1.5, [65, 11, 0], 6, 3.5))
+        self.assertFalse(CheckRemainingRoute(
+            [0, 0, 0], path[0], path, len(path), 1.5, [65, 11, 0], 6, 3.50001))
+
+    def test_ClearWaypointsStillRejectAnUnsafeShaftSweep(self):
+        path = np.array([[-0.3, 0.0, 100.0], [0.3, 0.0, 100.0]])
+        for configuration in path:
+            self.assertGreater(shaft_clearance(
+                [0, 0, 0], tip_position([0, 0, 0], *configuration), 1, [50, 0, 0], 3), 2.0)
+        self.assertFalse(CheckRemainingRoute(
+            [0, 0, 0], path[0], path, 1, 1, [50, 0, 0], 3, 2.0))
 
 
 if __name__ == "__main__":

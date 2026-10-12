@@ -1,15 +1,84 @@
 import unittest
+from multiprocessing import get_context
+from queue import Empty
 from threading import Event
 from unittest.mock import patch
 
 import numpy as np
 
 from astar import find_path
-from experiments import CompareMethods, GetUncertaintyCoverage, RunSensitivityStudy, RunTrial
+from experiments import CompareMethods, GetUncertaintyCoverage, RunSensitivityStudy, RunStudyWorker, RunTrial
 from geometry import movement_is_clear, shaft_clearance, tip_position
 from motion import GetRespiratoryMotion
 from scenarios import SCENARIOS
 from sensors import ApplyDropout, ApplyOutlier
+
+
+class StudyWorkerTests(unittest.TestCase):
+    def RunWorker(self, settings, *, cancelled=False):
+        context = get_context("spawn")
+        cancel_event = context.Event()
+        progress, results = context.Queue(), context.Queue()
+        process = context.Process(target=RunStudyWorker,
+                                  args=("Direct insertion", [4], settings,
+                                        cancel_event, progress, results))
+        if cancelled:
+            cancel_event.set()
+        process.start()
+        try:
+            result = results.get(timeout=20)
+            process.join(timeout=10)
+            self.assertEqual(process.exitcode, 0)
+            updates = []
+            while True:
+                try:
+                    updates.append(progress.get_nowait())
+                except Empty:
+                    break
+            return result, updates
+        finally:
+            cancel_event.set()
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5)
+            process.close()
+            progress.close()
+            results.close()
+
+    def test_SpawnedComparisonPreservesProgressAndSeededResults(self):
+        settings = dict(tracking="ideal", tool_noise=0.0, target_noise=0.0,
+                        duration=1.2, proximity_weight=0.0, uncertainty_scale=0.0)
+        (ok, result), updates = self.RunWorker(settings)
+        self.assertTrue(ok)
+        expected = CompareMethods("Direct insertion", [4], **settings)
+        self.assertEqual(updates, [(index + 1, 3, mode, 4) for index, mode in enumerate(
+            ("conventional", "prox_aware", "uncert_aware"))])
+        self.assertFalse(result["cancelled"])
+        self.assertEqual(result["seeds"], [4])
+        self.assertEqual(len(result["trials"]), 3)
+        for received, direct in zip(result["trials"], expected["trials"]):
+            self.assertEqual(received["status"], "timeout")
+            self.assertEqual(received["seed"], 4)
+            for metric in ("travel", "actual_error", "elapsed_time", "pause_count", "paused_time"):
+                self.assertEqual(received[metric], direct[metric])
+            np.testing.assert_array_equal(received["plan"]["path"], direct["plan"]["path"])
+            self.assertAlmostEqual(received["plan"]["cost"], 55.0)
+            self.assertAlmostEqual(received["travel"], 3.0)
+            self.assertAlmostEqual(received["actual_error"], 52.0)
+
+    def test_PreCancelledStudyReturnsWithoutCompletingTrials(self):
+        (ok, result), updates = self.RunWorker(
+            dict(parameter="tool_noise", levels=[0.0, 1.0]), cancelled=True)
+        self.assertTrue(ok)
+        self.assertTrue(result["cancelled"])
+        self.assertEqual(result["comparisons"], [])
+        self.assertEqual(updates, [])
+
+    def test_WorkerErrorReachesTheParentProcess(self):
+        (ok, error), updates = self.RunWorker(dict(parameter="unsupported"))
+        self.assertFalse(ok)
+        self.assertEqual(error, "Invalid study parameter.")
+        self.assertEqual(updates, [])
 
 
 class UncertaintyCoverageTests(unittest.TestCase):
@@ -872,7 +941,7 @@ class TrackingRecoveryTests(unittest.TestCase):
             np.testing.assert_array_equal(trial["true_target"], [90.0, 0.0, 0.0])
             self.assertFalse(trial["reported_arrival"])
 
-    def test_LargerLiveUncertaintyAllowancePreventsResumingTheFrozenPlan(self):
+    def test_SpareClearanceAllowsRecoveryWithALargerLiveUncertaintyAllowance(self):
         def OffsetTool(position, bias, drift, elapsed):
             shifted = position.copy()
             if position[0] < 80 and elapsed >= 1.2:
@@ -881,13 +950,16 @@ class TrackingRecoveryTests(unittest.TestCase):
 
         with patch("experiments.ApplyBias", side_effect=OffsetTool):
             trial, _ = self.RunDropoutTrial({(11, 0)}, tracking="ideal", mode="uncert_aware")
-        before_loss = RunTrial(tracking="ideal", mode="uncert_aware", tool_noise=0.0,
-                               target_noise=0.0, duration=1.08)
-        self.assertEqual(trial["status"], "replan_required")
+        baseline = RunTrial(tracking="ideal", mode="uncert_aware", tool_noise=0.0,
+                            target_noise=0.0)
+        self.assertTrue(trial["success"])
         self.assertEqual(trial["plan"]["extra_clearance"], 0.0)
-        self.assertAlmostEqual(trial["elapsed_time"], 1.3)
-        self.assertAlmostEqual(trial["travel"], before_loss["travel"])
-        np.testing.assert_allclose(trial["configuration"], before_loss["configuration"], atol=1e-12)
+        self.assertEqual(trial["pause_count"], 1)
+        self.assertAlmostEqual(trial["paused_time"], 0.2)
+        self.assertAlmostEqual(trial["completion_time"] - baseline["completion_time"], 0.2)
+        self.assertAlmostEqual(trial["travel"], baseline["travel"])
+        np.testing.assert_array_equal(trial["plan"]["path"], baseline["plan"]["path"])
+        np.testing.assert_array_equal(trial["planned_target"], baseline["planned_target"])
 
     def test_CurrentClearanceAndTheRemainingEdgeMustStillBeUsable(self):
         sample_time = 0.0
@@ -906,7 +978,7 @@ class TrackingRecoveryTests(unittest.TestCase):
         for name, check in (("shaft_clearance", CheckClearance), ("movement_is_clear", CheckEdge)):
             sample_time = 0.0
             with self.subTest(check=name), patch("experiments.ApplyBias", side_effect=RecordTime), patch(
-                    "experiments." + name, side_effect=check):
+                    "geometry." + name, side_effect=check):
                 trial, _ = self.RunDropoutTrial({(11, 0)})
             self.assertEqual(trial["status"], "replan_required")
             self.assertAlmostEqual(trial["elapsed_time"], 1.3)
@@ -1063,7 +1135,7 @@ class RouteValidityTests(unittest.TestCase):
         self.assertAlmostEqual(trial["paused_time"], 0.6)
         self.assertFalse(trial["reported_arrival"])
 
-    def test_LargerAllowanceStopsOnlyUncertaintyPlanning(self):
+    def test_SpareClearanceAllowsALargerAllowanceWithoutChangingTheFrozenPlan(self):
         def OffsetTool(position, bias, drift, elapsed):
             measured = position.copy()
             if position[0] < 80 and elapsed >= 1.1 - 1e-9:
@@ -1071,19 +1143,103 @@ class RouteValidityTests(unittest.TestCase):
             return measured
 
         for mode in ("conventional", "prox_aware", "uncert_aware"):
+            baseline = RunTrial(tracking="ideal", mode=mode, tool_noise=0.0,
+                                target_noise=0.0, duration=2.0)
             with self.subTest(mode=mode), patch("experiments.ApplyBias", side_effect=OffsetTool):
                 trial = RunTrial(tracking="ideal", mode=mode, tool_noise=0.0,
                                  target_noise=0.0, duration=2.0)
-            self.assertEqual(trial["status"], "replan_required" if mode == "uncert_aware" else "timeout")
-            self.assertAlmostEqual(trial["elapsed_time"], 1.6 if mode == "uncert_aware" else 2.0)
+            self.assertEqual(trial["status"], "timeout")
+            self.assertAlmostEqual(trial["elapsed_time"], 2.0)
+            self.assertAlmostEqual(trial["travel"], baseline["travel"])
             self.assertEqual(trial["plan"]["extra_clearance"], 0.0)
+            self.assertEqual(trial["plan"]["required_clearance"], 2.0)
+            np.testing.assert_array_equal(trial["plan"]["path"], baseline["plan"]["path"])
+            np.testing.assert_array_equal(trial["planned_target"], baseline["planned_target"])
             self.assertFalse(trial["reported_arrival"])
+
+    def test_UnsafeFutureAllowanceHoldsMovementImmediatelyBeforeReplanning(self):
+        positions = {}
+
+        def OffsetTool(position, bias, drift, elapsed):
+            measured = position.copy()
+            if position[0] < 80:
+                positions[round(elapsed, 8)] = position.copy()
+                if elapsed >= 1.1 - 1e-9:
+                    measured[0] += 2.0
+            return measured
+
+        before_change = RunTrial(tracking="ideal", mode="uncert_aware", tool_noise=0.0,
+                                 target_noise=0.0, duration=1.08)
+        with patch("experiments.ApplyBias", side_effect=OffsetTool):
+            trial = RunTrial(tracking="ideal", mode="uncert_aware", tool_noise=0.0,
+                             target_noise=0.0)
+        self.assertEqual(trial["status"], "replan_required")
+        self.assertAlmostEqual(trial["elapsed_time"], 1.6)
+        self.assertAlmostEqual(trial["travel"], before_change["travel"])
+        self.assertGreater(trial["minimum_clearance"], 4.0)
+        for sample in (1.2, 1.3, 1.4, 1.5, 1.6):
+            np.testing.assert_array_equal(positions[sample], positions[1.1])
+        np.testing.assert_array_equal(trial["configuration"], before_change["configuration"])
+        np.testing.assert_array_equal(trial["plan"]["path"], before_change["plan"]["path"])
+        np.testing.assert_array_equal(trial["planned_target"], before_change["planned_target"])
+        self.assertEqual(trial["plan"]["required_clearance"], 2.0)
+        self.assertFalse(trial["reported_arrival"])
+
+    def test_ARecoveredUncertaintySpikeResumesTheSameRoute(self):
+        positions = {}
+
+        def OffsetTool(position, bias, drift, elapsed):
+            measured = position.copy()
+            if position[0] < 80:
+                positions[round(elapsed, 8)] = position.copy()
+                if 1.1 - 1e-9 <= elapsed < 1.3 - 1e-9:
+                    measured[0] += 2.0
+            return measured
+
+        baseline = RunTrial(tracking="ideal", mode="uncert_aware", tool_noise=0.0,
+                            target_noise=0.0, duration=2.0)
+        with patch("experiments.ApplyBias", side_effect=OffsetTool):
+            trial = RunTrial(tracking="ideal", mode="uncert_aware", tool_noise=0.0,
+                             target_noise=0.0, duration=2.0)
+        self.assertEqual(trial["status"], "timeout")
+        self.assertGreater(trial["travel"], 0.0)
+        self.assertLess(trial["travel"], baseline["travel"])
+        for sample in (1.2, 1.3):
+            np.testing.assert_array_equal(positions[sample], positions[1.1])
+        self.assertGreater(np.linalg.norm(positions[1.4] - positions[1.3]), 0.0)
+        np.testing.assert_array_equal(trial["plan"]["path"], baseline["plan"]["path"])
+        np.testing.assert_array_equal(trial["planned_target"], baseline["planned_target"])
+        self.assertFalse(trial["reported_arrival"])
+
+    def test_AnUnsafeCurrentAllowancePreventsArrivalAfterTheRouteEnds(self):
+        scene = dict(SCENARIOS["Direct insertion"], start=np.array([0.0, 0.0, 90.0]))
+
+        def OffsetReading(position, bias, drift, elapsed):
+            measured = position.copy()
+            if elapsed >= 1.1 - 1e-9:
+                measured[0] += 2.0
+            return measured
+
+        with patch.dict(SCENARIOS, {"Direct insertion": scene}):
+            baseline = RunTrial(tracking="ideal", mode="uncert_aware", tool_noise=0.0,
+                                target_noise=0.0)
+            with patch("experiments.ApplyBias", side_effect=OffsetReading):
+                trial = RunTrial(tracking="ideal", mode="uncert_aware", tool_noise=0.0,
+                                 target_noise=0.0)
+        self.assertTrue(baseline["success"])
+        self.assertEqual(len(trial["plan"]["path"]), 1)
+        self.assertEqual(trial["status"], "replan_required")
+        self.assertAlmostEqual(trial["elapsed_time"], 1.6)
+        self.assertEqual(trial["travel"], 0.0)
+        self.assertTrue(trial["actual_arrived"])
+        self.assertFalse(trial["reported_arrival"])
+        self.assertIsNone(trial["completion_time"])
 
     def test_TargetPriorityAndAChangedReasonStartSeparateHolds(self):
         def OffsetTool(position, bias, drift, elapsed):
             measured = position.copy()
             if position[0] < 80 and elapsed >= 1.3 - 1e-9:
-                measured[0] += 0.2
+                measured[0] += 2.0
             return measured
 
         with patch("experiments.ApplyBias", side_effect=OffsetTool), patch(

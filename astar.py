@@ -7,7 +7,6 @@ from geometry import instrument_direction, movement_is_clear, shaft_clearance, t
 
 
 def get_uncertainty_margin(tool_offset, tool_covariance, uncertainty_scale=1.0):
-    # expands a frozen tip-error envelope
     tool_offset = np.asarray(tool_offset, dtype=float)
     tool_covariance = np.asarray(tool_covariance, dtype=float)
     if (tool_offset.shape != (3,) or tool_covariance.shape != (3, 3)

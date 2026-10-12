@@ -2,11 +2,22 @@ import numpy as np
 
 from astar import find_path, get_uncertainty_margin
 from feedback import get_target_feedback
-from geometry import movement_is_clear, shaft_clearance, tip_position
+from geometry import CheckRemainingRoute, movement_is_clear, shaft_clearance, tip_position
 from kalman import CheckMeasurement, KalmanFilter
 from motion import GetRespiratoryMotion
 from scenarios import SCENARIOS
 from sensors import ApplyBias, ApplyDropout, ApplyOutlier, measure_position
+
+
+def RunStudyWorker(scenario, seeds, settings, cancel_event, progress, results):
+    # sends progress + results from the study process back to the UI
+    try:
+        method = RunSensitivityStudy if "parameter" in settings else CompareMethods
+        result = method(scenario, seeds=seeds, cancel_event=cancel_event,
+                        progress=progress.put, **settings)
+        results.put((True, result))
+    except Exception as error:
+        results.put((False, str(error)))
 
 
 def GetUncertaintyCoverage(error, position_covariance):
@@ -117,6 +128,8 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
     elapsed_time, previous_time, travel = 0.0, 0.0, 0.0
     minimum_clearance = shaft_clearance(port, tip_position(port, *configuration),
                                         tool_radius, structure_centre, structure_radius)
+    execution_clearance = required_clearance
+    route_clearance_valid = True
     status, reported_arrival = "timeout", False
 
     for frame in range(int(np.ceil(duration / timestep)) + 1):
@@ -205,6 +218,7 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
                     if plan["status"] != "found":
                         status = plan["status"]
                         break
+                    execution_clearance = plan["required_clearance"]
                     if len(plan["path"]) == 1:
                         route_finished_at = elapsed_time
 
@@ -216,11 +230,17 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
             if sampled and available:
                 if np.linalg.norm(selected_target - planned_target) > target_tolerance + 1e-9:
                     route_reason = "target"
-                elif mode == "uncert_aware":
+                if mode == "uncert_aware":
                     margin = get_uncertainty_margin(filters[0].state[:3] - tool_position,
                                                     filters[0].covariance[:3, :3],
                                                     uncertainty_scale)
-                    if margin > plan["extra_clearance"] + 1e-9:
+                    execution_clearance = max(plan["required_clearance"], required_clearance + margin)
+                    route_clearance_valid = (execution_clearance <= plan["required_clearance"]
+                                             or CheckRemainingRoute(
+                                                 port, configuration, plan["path"], route_index,
+                                                 tool_radius, structure_centre, structure_radius,
+                                                 execution_clearance))
+                    if not route_clearance_valid and route_reason is None:
                         route_reason = "uncertainty"
             if paused_since is not None and elapsed_time - paused_since > 1.0 + 1e-9:
                 status = "tracking_lost"
@@ -235,13 +255,9 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
             elif paused_since is not None and sampled:
                 recovery_samples += 1
                 if recovery_samples >= 2:
-                    clearance = shaft_clearance(port, tool_position, tool_radius,
-                                                structure_centre, structure_radius)
-                    usable = (route_reason is None and clearance >= plan["required_clearance"])
-                    if usable and route_index < len(plan["path"]):
-                        usable = movement_is_clear(port, configuration, plan["path"][route_index],
-                                                   tool_radius, structure_centre, structure_radius,
-                                                   plan["required_clearance"])
+                    usable = route_reason is None and CheckRemainingRoute(
+                        port, configuration, plan["path"], route_index, tool_radius,
+                        structure_centre, structure_radius, execution_clearance)
                     if not usable:
                         status = "replan_required"
                         break
@@ -263,22 +279,25 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
                     arrival_since = None
                     status = "replan_required"
                     break
-                feedback = get_target_feedback(selected_tool, selected_target, target_tolerance)
-                if feedback["arrived"] and (tracking != "filtered" or all(accepted)):
-                    if arrival_since is None:
-                        arrival_since = elapsed_time
-                    if elapsed_time - arrival_since >= 0.5 - 1e-9:
-                        reported_arrival = True
-                        break
+                if route_clearance_valid:
+                    feedback = get_target_feedback(selected_tool, selected_target, target_tolerance)
+                    if feedback["arrived"] and (tracking != "filtered" or all(accepted)):
+                        if arrival_since is None:
+                            arrival_since = elapsed_time
+                        if elapsed_time - arrival_since >= 0.5 - 1e-9:
+                            reported_arrival = True
+                            break
+                    else:
+                        arrival_since = None
                 else:
                     arrival_since = None
 
-            if (sampled and paused_since is None and route_finished_at is not None
+            if (sampled and paused_since is None and route_clearance_valid and route_finished_at is not None
                     and elapsed_time - route_finished_at >= 3.0 - 1e-9):
                 status = "not_confirmed"
                 break
 
-        if (plan is not None and paused_since is None and not resumed
+        if (plan is not None and paused_since is None and route_clearance_valid and not resumed
                 and elapsed_time > planned_at + 1e-9 and route_index < len(plan["path"])):
             remaining = plan["path"][route_index] - configuration
             movement_time = float(np.max(np.abs(remaining) / speeds))
@@ -287,7 +306,7 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
             clearances = []
             if not movement_is_clear(port, configuration, proposed, tool_radius,
                                      structure_centre, structure_radius,
-                                     plan["required_clearance"], clearance_samples=clearances):
+                                     execution_clearance, clearance_samples=clearances):
                 status = "movement_blocked"
                 break
             change = np.abs(proposed - configuration)

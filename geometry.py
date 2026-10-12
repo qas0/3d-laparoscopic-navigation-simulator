@@ -67,14 +67,42 @@ def movement_is_clear(port, start, end, tool_radius, structure_centre,
     # covers unsampled motion because clearance loss is bounded by shaft displacement
     guard = movement_bound / (2 * intervals) if rotating else 0.0
 
-    for index in range(intervals):
-        fraction = (index + 0.5) / intervals
-        yaw, pitch, depth = start + fraction * change
-        tip = tip_position(port, yaw, pitch, depth)
-        clearance = shaft_clearance(port, tip, tool_radius,
-                                    structure_centre, structure_radius)
-        if clearance < required_clearance + guard:
+    # checks midpoint shafts together instead of repeating small NumPy operations
+    fractions = (np.arange(intervals) + 0.5) / intervals
+    configurations = start + fractions[:, None] * change
+    directions = instrument_direction(configurations[:, 0], configurations[:, 1]).T
+    tips = port + configurations[:, 2, None] * directions
+    shafts = tips - port
+    squared_lengths = np.sum(shafts * shafts, axis=1)
+    projections = np.divide(
+        np.sum(shafts * (structure_centre - port), axis=1), squared_lengths,
+        out=np.zeros(intervals), where=squared_lengths != 0)
+    closest_points = port + np.clip(projections, 0.0, 1.0)[:, None] * shafts
+    clearances = np.linalg.norm(structure_centre - closest_points, axis=1)
+    clearances = clearances - structure_radius - tool_radius
+    blocked = np.flatnonzero(clearances < required_clearance + guard)
+    if clearance_samples is not None:
+        clearance_samples.extend(clearances[:blocked[0] if blocked.size else intervals].tolist())
+    return not blocked.size
+
+
+def CheckRemainingRoute(port, configuration, path, waypoint, tool_radius,
+                        structure_centre, structure_radius, required_clearance=0.0):
+    path = np.asarray(path, dtype=float)
+    if (path.ndim != 2 or path.shape[0] == 0 or path.shape[1] != 3
+            or not np.all(np.isfinite(path)) or np.any(path[:, 2] < 0)):
+        raise ValueError("Invalid route configurations.")
+    if (isinstance(waypoint, (bool, np.bool_))
+            or not isinstance(waypoint, (int, np.integer))
+            or not 0 <= waypoint <= len(path)):
+        raise ValueError("Invalid waypoint.")
+    # checks the current shaft even when all waypoints have been reached
+    if not movement_is_clear(port, configuration, configuration, tool_radius,
+                             structure_centre, structure_radius, required_clearance):
+        return False
+    for next_configuration in path[waypoint:]:
+        if not movement_is_clear(port, configuration, next_configuration, tool_radius,
+                                 structure_centre, structure_radius, required_clearance):
             return False
-        if clearance_samples is not None:
-            clearance_samples.append(clearance)
+        configuration = next_configuration
     return True

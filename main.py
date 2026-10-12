@@ -5,12 +5,10 @@ import sys
 sys.dont_write_bytecode = True
 os.environ["QT_API"] = "pyside6"
 
-from PySide6.QtWidgets import QApplication
-
-from ui import SimulatorWindow
-
-
 if __name__ == "__main__":
+    from PySide6.QtWidgets import QApplication
+    from ui import SimulatorWindow
+
     application = QApplication(sys.argv)
     application.setStyle("Fusion")
     window = SimulatorWindow()
