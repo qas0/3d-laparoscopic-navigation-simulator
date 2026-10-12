@@ -6,7 +6,7 @@ import numpy as np
 
 from astar import find_path
 from experiments import CompareMethods, GetUncertaintyCoverage, RunSensitivityStudy, RunTrial
-from geometry import tip_position
+from geometry import movement_is_clear, shaft_clearance, tip_position
 from motion import GetRespiratoryMotion
 from scenarios import SCENARIOS
 from sensors import ApplyDropout, ApplyOutlier
@@ -696,9 +696,10 @@ class OutlierExperimentTests(unittest.TestCase):
         self.assertLess(checked["rmse"]["target_filtered"],
                         accepted["rmse"]["target_filtered"])
 
-    def test_ConsecutiveRejectionsStopFilteredAndUncertaintyGuidanceWhenAcceptanceExpires(self):
+    def test_ConsecutiveRejectionsPauseRequiredFiltersThenExceedTheRecoveryWindow(self):
         for tracking, mode, status in (("filtered", "conventional", "tracking_lost"),
                                        ("ideal", "uncert_aware", "tracking_lost"),
+                                       ("raw", "uncert_aware", "tracking_lost"),
                                        ("raw", "conventional", "not_confirmed"),
                                        ("ideal", "conventional", "confirmed_arrival")):
             calls = 0
@@ -718,12 +719,16 @@ class OutlierExperimentTests(unittest.TestCase):
             self.assertEqual(trial["dropped"]["tool"], 0)
             self.assertEqual(trial["samples"]["tool_raw"], trial["sensor_samples"])
             if status == "tracking_lost":
-                self.assertAlmostEqual(trial["elapsed_time"], 1.26)
-                self.assertEqual(trial["rejected"]["tool"], 2)
+                self.assertAlmostEqual(trial["elapsed_time"], 2.12)
+                self.assertEqual(trial["rejected"]["tool"], 11)
+                self.assertEqual(trial["pause_count"], 1)
+                self.assertAlmostEqual(trial["paused_time"], 1.02)
                 self.assertGreater(trial["travel"], 0.0)
-                self.assertLess(trial["travel"], 4.0)
+                self.assertLessEqual(trial["travel"], 1.2 + 1e-9)
                 self.assertFalse(trial["reported_arrival"])
             else:
+                self.assertEqual(trial["pause_count"], 0)
+                self.assertEqual(trial["paused_time"], 0.0)
                 self.assertAlmostEqual(trial["travel"], 55.0)
                 self.assertGreater(trial["rejected"]["tool"], 2)
 
@@ -744,6 +749,8 @@ class OutlierExperimentTests(unittest.TestCase):
         self.assertTrue(baseline["success"])
         self.assertTrue(trial["success"])
         self.assertEqual(trial["rejected"]["target"], 1)
+        self.assertEqual(trial["pause_count"], 1)
+        self.assertAlmostEqual(trial["paused_time"], 0.2)
         self.assertGreaterEqual(trial["elapsed_time"] - baseline["elapsed_time"], 0.4 - 1e-9)
         self.assertEqual(trial["dropped"]["target"], 0)
 
@@ -778,6 +785,180 @@ class OutlierExperimentTests(unittest.TestCase):
         for levels in ([0.0, 0.5], [2.0], [-1.0]):
             with self.subTest(levels=levels), self.assertRaises(ValueError):
                 RunSensitivityStudy(parameter="reject_outliers", levels=levels, seeds=[0])
+
+
+class TrackingRecoveryTests(unittest.TestCase):
+    def RunDropoutTrial(self, missing, **settings):
+        calls, positions = 0, [[], []]
+
+        def DropReading(position, probability, generator):
+            nonlocal calls
+            sample, sensor = divmod(calls, 2)
+            calls += 1
+            positions[sensor].append(position.copy())
+            measured = ApplyDropout(position, probability, generator)
+            return None if (sample, sensor) in missing else measured
+
+        settings.setdefault("tool_noise", 0.0)
+        settings.setdefault("target_noise", 0.0)
+        with patch("experiments.ApplyDropout", side_effect=DropReading):
+            trial = RunTrial(**settings)
+        return trial, positions
+
+    def test_OneMissingSampleHoldsMovementUntilTwoNewSamplesAndKeepsTheRoute(self):
+        baseline = RunTrial(tool_noise=0.0, target_noise=0.0)
+        trial, positions = self.RunDropoutTrial({(11, 0)})
+        self.assertTrue(trial["success"])
+        self.assertEqual(trial["pause_count"], 1)
+        self.assertAlmostEqual(trial["paused_time"], 0.2)
+        self.assertEqual(trial["dropped"]["tool"], 1)
+        self.assertAlmostEqual(trial["travel"], baseline["travel"])
+        self.assertAlmostEqual(trial["completion_time"] - baseline["completion_time"], 0.2)
+        np.testing.assert_array_equal(trial["planned_target"], baseline["planned_target"])
+        np.testing.assert_array_equal(trial["plan"]["path"], baseline["plan"]["path"])
+        for sample in (12, 13):
+            np.testing.assert_array_equal(positions[0][sample], positions[0][11])
+        self.assertGreater(positions[0][14][0], positions[0][13][0])
+
+    def test_AnInterposedMissingSampleRestartsTheConsecutiveRecoveryCount(self):
+        trial, positions = self.RunDropoutTrial({(11, 0), (13, 1)})
+        self.assertTrue(trial["success"])
+        self.assertEqual(trial["pause_count"], 1)
+        self.assertAlmostEqual(trial["paused_time"], 0.4)
+        for sample in range(12, 16):
+            np.testing.assert_array_equal(positions[0][sample], positions[0][11])
+        self.assertGreater(positions[0][16][0], positions[0][15][0])
+
+    def test_RecoveryAtOneSecondIsAllowedButAFirstGoodSampleDoesNotExtendTheDeadline(self):
+        recovered, _ = self.RunDropoutTrial({(sample, 0) for sample in range(11, 20)})
+        lost, positions = self.RunDropoutTrial({(sample, 0) for sample in range(11, 21)})
+        self.assertTrue(recovered["success"])
+        self.assertAlmostEqual(recovered["paused_time"], 1.0)
+        self.assertEqual(lost["status"], "tracking_lost")
+        self.assertAlmostEqual(lost["elapsed_time"], 2.12)
+        self.assertAlmostEqual(lost["paused_time"], 1.02)
+        self.assertEqual(lost["pause_count"], 1)
+        self.assertAlmostEqual(lost["travel"], 1.2)
+        np.testing.assert_array_equal(lost["configuration"], [0.0, 0.0, positions[0][11][0]])
+        self.assertFalse(lost["reported_arrival"])
+
+    def test_OnlyTheSourcesRequiredByTheSelectedGuidancePauseMovement(self):
+        for tracking, mode, sensor, pauses in (
+                ("raw", "conventional", 1, 1), ("filtered", "conventional", 1, 1),
+                ("ideal", "conventional", 0, 0), ("ideal", "prox_aware", 1, 0),
+                ("ideal", "uncert_aware", 0, 1), ("ideal", "uncert_aware", 1, 0),
+                ("raw", "uncert_aware", 1, 1)):
+            with self.subTest(tracking=tracking, mode=mode, sensor=sensor):
+                trial, _ = self.RunDropoutTrial({(11, sensor)}, tracking=tracking,
+                                               mode=mode, duration=1.5)
+                self.assertEqual(trial["status"], "timeout")
+                self.assertEqual(trial["pause_count"], pauses)
+                self.assertAlmostEqual(trial["paused_time"], pauses * 0.2)
+
+    def test_ShiftedSelectedTargetRequiresANewPlanAfterRecovery(self):
+        def MoveTarget(position, bias, drift, elapsed):
+            shifted = position.copy()
+            if position[0] > 80 and elapsed >= 1.2:
+                shifted[2] += 3.0
+            return shifted
+
+        for tracking in ("raw", "filtered"):
+            with self.subTest(tracking=tracking), patch("experiments.ApplyBias", side_effect=MoveTarget):
+                trial, _ = self.RunDropoutTrial({(11, 0)}, tracking=tracking)
+            self.assertEqual(trial["status"], "replan_required")
+            self.assertAlmostEqual(trial["elapsed_time"], 1.3)
+            self.assertAlmostEqual(trial["travel"], 1.2)
+            np.testing.assert_array_equal(trial["planned_target"], [90.0, 0.0, 0.0])
+            np.testing.assert_array_equal(trial["true_target"], [90.0, 0.0, 0.0])
+            self.assertFalse(trial["reported_arrival"])
+
+    def test_LargerLiveUncertaintyAllowancePreventsResumingTheFrozenPlan(self):
+        def OffsetTool(position, bias, drift, elapsed):
+            shifted = position.copy()
+            if position[0] < 80 and elapsed >= 1.2:
+                shifted[0] += 0.2
+            return shifted
+
+        with patch("experiments.ApplyBias", side_effect=OffsetTool):
+            trial, _ = self.RunDropoutTrial({(11, 0)}, tracking="ideal", mode="uncert_aware")
+        before_loss = RunTrial(tracking="ideal", mode="uncert_aware", tool_noise=0.0,
+                               target_noise=0.0, duration=1.08)
+        self.assertEqual(trial["status"], "replan_required")
+        self.assertEqual(trial["plan"]["extra_clearance"], 0.0)
+        self.assertAlmostEqual(trial["elapsed_time"], 1.3)
+        self.assertAlmostEqual(trial["travel"], before_loss["travel"])
+        np.testing.assert_allclose(trial["configuration"], before_loss["configuration"], atol=1e-12)
+
+    def test_CurrentClearanceAndTheRemainingEdgeMustStillBeUsable(self):
+        sample_time = 0.0
+
+        def RecordTime(position, bias, drift, elapsed):
+            nonlocal sample_time
+            sample_time = elapsed
+            return position.copy()
+
+        def CheckClearance(*args):
+            return 1.0 if sample_time >= 1.3 else shaft_clearance(*args)
+
+        def CheckEdge(*args, **settings):
+            return movement_is_clear(*args, **settings) if "clearance_samples" in settings else False
+
+        for name, check in (("shaft_clearance", CheckClearance), ("movement_is_clear", CheckEdge)):
+            sample_time = 0.0
+            with self.subTest(check=name), patch("experiments.ApplyBias", side_effect=RecordTime), patch(
+                    "experiments." + name, side_effect=check):
+                trial, _ = self.RunDropoutTrial({(11, 0)})
+            self.assertEqual(trial["status"], "replan_required")
+            self.assertAlmostEqual(trial["elapsed_time"], 1.3)
+            self.assertAlmostEqual(trial["travel"], 1.2)
+            self.assertFalse(trial["reported_arrival"])
+
+    def test_PausedArrivalVerificationKeepsItsRemainingTimeAfterRecovery(self):
+        settings = dict(tracking="raw", tool_bias=(3.0, 0.0, 0.0))
+        baseline, _ = self.RunDropoutTrial(set(), **settings)
+        interrupted, _ = self.RunDropoutTrial({(76, 0)}, **settings)
+        self.assertEqual(baseline["status"], "not_confirmed")
+        self.assertEqual(interrupted["status"], "not_confirmed")
+        self.assertAlmostEqual(interrupted["elapsed_time"] - baseline["elapsed_time"], 0.2)
+        self.assertAlmostEqual(interrupted["paused_time"], 0.2)
+        self.assertAlmostEqual(interrupted["travel"], 55.0)
+        self.assertFalse(interrupted["reported_arrival"])
+
+    def test_TrialDeadlineAndCancellationRemainActiveDuringAPause(self):
+        missing = {(sample, 0) for sample in range(11, 30)}
+        trial, _ = self.RunDropoutTrial(missing, duration=1.3)
+        self.assertEqual(trial["status"], "timeout")
+        self.assertAlmostEqual(trial["elapsed_time"], 1.3)
+        self.assertAlmostEqual(trial["paused_time"], 0.2)
+        cancelled = Event()
+
+        def StopTrial(position, bias, drift, elapsed):
+            if elapsed >= 1.2:
+                cancelled.set()
+            return position.copy()
+
+        with patch("experiments.ApplyBias", side_effect=StopTrial):
+            trial, _ = self.RunDropoutTrial(missing, cancel_event=cancelled)
+        self.assertEqual(trial["status"], "cancelled")
+        self.assertAlmostEqual(trial["elapsed_time"], 1.2)
+        self.assertAlmostEqual(trial["paused_time"], 0.1)
+        self.assertAlmostEqual(trial["travel"], 1.2)
+
+    def test_PauseSummariesUseIndependentTrialsIncludingZeroPauses(self):
+        template = RunTrial(tool_noise=0.0, target_noise=0.0, warmup=0.0, duration=0.02)
+
+        def PausedTrial(scenario, mode, seed, **settings):
+            return dict(template, scenario=scenario, mode=mode, seed=seed,
+                        pause_count=seed * 2, paused_time=seed * 0.4)
+
+        with patch("experiments.RunTrial", side_effect=PausedTrial):
+            comparison = CompareMethods(seeds=[0, 1])
+        for summary in comparison["summary"].values():
+            for name, mean in (("tracking_pauses", 1.0), ("paused_time", 0.2)):
+                metric = summary["metrics"][name]
+                self.assertEqual(metric["count"], 2)
+                self.assertAlmostEqual(metric["mean"], mean)
+                self.assertAlmostEqual(metric["sd"], mean * np.sqrt(2))
 
 
 if __name__ == "__main__":

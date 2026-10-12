@@ -1,6 +1,6 @@
 import numpy as np
 
-from astar import find_path
+from astar import find_path, get_uncertainty_margin
 from feedback import get_target_feedback
 from geometry import movement_is_clear, shaft_clearance, tip_position
 from kalman import CheckMeasurement, KalmanFilter
@@ -97,6 +97,8 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
     dropout = [tool_dropout, target_dropout]
     outlier = [tool_outlier, target_outlier]
     accepted_times = [None, None]
+    required_observations = (0, 1) if tracking != "ideal" else (
+        (0,) if mode == "uncert_aware" else ())
     required_filters = (0, 1) if tracking == "filtered" else (
         (0,) if mode == "uncert_aware" else ())
     biases, drift_rates = [tool_bias, target_bias], [tool_drift, target_drift]
@@ -110,6 +112,7 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
     sensor_samples = 0
     plan, planned_target, planned_at = None, None, None
     route_index, route_finished_at, arrival_since = 1, None, None
+    paused_since, paused_time, pause_count, recovery_samples = None, 0.0, 0, 0
     elapsed_time, previous_time, travel = 0.0, 0.0, 0.0
     minimum_clearance = shaft_clearance(port, tip_position(port, *configuration),
                                         tool_radius, structure_centre, structure_radius)
@@ -123,48 +126,14 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
         step = elapsed_time - previous_time
         previous_time = elapsed_time
 
-        if plan is not None:
-            if any(accepted_times[index] is None or elapsed_time - accepted_times[index] > 0.25 + 1e-9
-                   for index in required_filters):
-                status = "tracking_lost"
-                break
-
-        if plan is not None and route_index < len(plan["path"]):
-            remaining = plan["path"][route_index] - configuration
-            movement_time = float(np.max(np.abs(remaining) / speeds))
-            fraction = min(1.0, step / max(movement_time, 1e-12))
-            proposed = configuration + fraction * remaining
-            clearances = []
-            if not movement_is_clear(port, configuration, proposed, tool_radius,
-                                     structure_centre, structure_radius,
-                                     plan["required_clearance"], clearance_samples=clearances):
-                status = "movement_blocked"
-                break
-            change = np.abs(proposed - configuration)
-            # sums exact tip travel along each single-axis A* movement
-            travel += float(change[2] + configuration[2] * (
-                change[1] + np.cos(configuration[1]) * change[0]))
-            if np.any(change[:2]):
-                bound = change[2] + max(configuration[2], proposed[2]) * sum(change[:2])
-                edge_clearance = min(clearances) - bound / (2 * len(clearances))
-            else:
-                longest_tip = tip_position(port, proposed[0], proposed[1],
-                                           max(configuration[2], proposed[2]))
-                edge_clearance = shaft_clearance(port, longest_tip, tool_radius,
-                                                  structure_centre, structure_radius)
-            minimum_clearance = min(minimum_clearance, edge_clearance)
-            configuration = proposed
-            if fraction == 1.0:
-                route_index += 1
-                if route_index == len(plan["path"]):
-                    route_finished_at = elapsed_time
-
         tool_position = tip_position(port, *configuration)
         displacement, _ = GetRespiratoryMotion(motion_amplitude, motion_frequency, elapsed_time)
         target_position = target_origin + np.array([0.0, 0.0, displacement])
-        # samples at fixed 10 Hz ticks, including the initial observation
-        if frame % sample_frames == 0 and np.isclose(
-                elapsed_time, frame * timestep, rtol=0, atol=1e-12):
+        sampled = frame % sample_frames == 0 and np.isclose(
+            elapsed_time, frame * timestep, rtol=0, atol=1e-12)
+        resumed = False
+        # samples before movement so a missing reading pauses the same frame
+        if sampled:
             observations = []
             accepted = [False, False]
             for index, (name, position) in enumerate(zip(("tool", "target"),
@@ -201,20 +170,20 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
                     covered[name] += GetUncertaintyCoverage(error, covariance)
             sensor_samples += 1
 
-            available = (tracking == "ideal" and mode != "uncert_aware") or (
-                observations[0] is not None and (tracking == "ideal" or observations[1] is not None))
+            available = all(observations[index] is not None for index in required_observations)
             available = available and all(accepted_times[index] is not None
                                          and elapsed_time - accepted_times[index] <= 0.25 + 1e-9
+                                         and accepted[index]
                                          for index in required_filters)
             if elapsed_time >= warmup - 1e-9:
-                if not available:
-                    status = "tracking_unavailable" if plan is None else "tracking_lost"
+                if plan is None and not available:
+                    status = "tracking_unavailable"
                     break
                 if tracking == "ideal":
                     selected_tool, selected_target = tool_position, target_position
-                elif tracking == "raw":
+                elif available and tracking == "raw":
                     selected_tool, selected_target = observations
-                else:
+                elif available:
                     selected_tool, selected_target = [tracker.state[:3] for tracker in filters]
 
                 if plan is None:
@@ -238,6 +207,48 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
                     if len(plan["path"]) == 1:
                         route_finished_at = elapsed_time
 
+        if plan is not None:
+            available = available and all(accepted_times[index] is not None
+                                         and elapsed_time - accepted_times[index] <= 0.25 + 1e-9
+                                         for index in required_filters)
+            if paused_since is not None and elapsed_time - paused_since > 1.0 + 1e-9:
+                status = "tracking_lost"
+                break
+            if not available:
+                if paused_since is None:
+                    paused_since = elapsed_time
+                    pause_count += 1
+                recovery_samples = 0
+                arrival_since = None
+            elif paused_since is not None and sampled:
+                recovery_samples += 1
+                if recovery_samples >= 2:
+                    clearance = shaft_clearance(port, tool_position, tool_radius,
+                                                structure_centre, structure_radius)
+                    usable = (np.linalg.norm(selected_target - planned_target)
+                              <= target_tolerance + 1e-9
+                              and clearance >= plan["required_clearance"])
+                    if mode == "uncert_aware":
+                        margin = get_uncertainty_margin(filters[0].state[:3] - tool_position,
+                                                        filters[0].covariance[:3, :3],
+                                                        uncertainty_scale)
+                        usable = usable and margin <= plan["extra_clearance"] + 1e-9
+                    if usable and route_index < len(plan["path"]):
+                        usable = movement_is_clear(port, configuration, plan["path"][route_index],
+                                                   tool_radius, structure_centre, structure_radius,
+                                                   plan["required_clearance"])
+                    if not usable:
+                        status = "replan_required"
+                        break
+                    pause_duration = elapsed_time - paused_since
+                    paused_time += pause_duration
+                    if route_finished_at is not None:
+                        route_finished_at += pause_duration
+                    paused_since, recovery_samples = None, 0
+                    arrival_since = None
+                    resumed = True
+
+            if sampled and paused_since is None:
                 feedback = get_target_feedback(selected_tool, selected_target, target_tolerance)
                 if feedback["arrived"] and (tracking != "filtered" or all(accepted)):
                     if arrival_since is None:
@@ -248,10 +259,43 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
                 else:
                     arrival_since = None
 
-            if route_finished_at is not None and elapsed_time - route_finished_at >= 3.0 - 1e-9:
+            if (sampled and paused_since is None and route_finished_at is not None
+                    and elapsed_time - route_finished_at >= 3.0 - 1e-9):
                 status = "not_confirmed"
                 break
 
+        if (plan is not None and paused_since is None and not resumed
+                and elapsed_time > planned_at + 1e-9 and route_index < len(plan["path"])):
+            remaining = plan["path"][route_index] - configuration
+            movement_time = float(np.max(np.abs(remaining) / speeds))
+            fraction = min(1.0, step / max(movement_time, 1e-12))
+            proposed = configuration + fraction * remaining
+            clearances = []
+            if not movement_is_clear(port, configuration, proposed, tool_radius,
+                                     structure_centre, structure_radius,
+                                     plan["required_clearance"], clearance_samples=clearances):
+                status = "movement_blocked"
+                break
+            change = np.abs(proposed - configuration)
+            travel += float(change[2] + configuration[2] * (
+                change[1] + np.cos(configuration[1]) * change[0]))
+            if np.any(change[:2]):
+                bound = change[2] + max(configuration[2], proposed[2]) * sum(change[:2])
+                edge_clearance = min(clearances) - bound / (2 * len(clearances))
+            else:
+                longest_tip = tip_position(port, proposed[0], proposed[1],
+                                           max(configuration[2], proposed[2]))
+                edge_clearance = shaft_clearance(port, longest_tip, tool_radius,
+                                                  structure_centre, structure_radius)
+            minimum_clearance = min(minimum_clearance, edge_clearance)
+            configuration = proposed
+            if fraction == 1.0:
+                route_index += 1
+                if route_index == len(plan["path"]):
+                    route_finished_at = elapsed_time
+
+    if paused_since is not None:
+        paused_time += elapsed_time - paused_since
     # evaluates the final true position independently of the selected feedback
     tool_position = tip_position(port, *configuration)
     displacement, _ = GetRespiratoryMotion(motion_amplitude, motion_frequency, elapsed_time)
@@ -278,6 +322,7 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
         "travel": travel, "minimum_clearance": float(minimum_clearance),
         "plan": plan, "planned_target": planned_target, "true_target": target_position,
         "configuration": configuration, "sensor_samples": sensor_samples,
+        "pause_count": pause_count, "paused_time": paused_time,
         "dropped": dropped, "rejected": rejected, "rmse": rmse, "samples": counts,
         "predicted_rms": predicted_rms, "coverage": coverage,
     }
@@ -322,6 +367,8 @@ def CompareMethods(scenario="Direct insertion", seeds=range(10), *,
             "planning_time": [run["plan"]["time"] for run in runs if run["plan"] is not None],
             "successful_travel": [run["travel"] for run in runs if run["success"]],
             "successful_completion_time": [run["completion_time"] for run in runs if run["success"]],
+            "tracking_pauses": [run["pause_count"] for run in runs],
+            "paused_time": [run["paused_time"] for run in runs],
         }
         for name in ("tool_raw", "target_raw", "tool_filtered", "target_filtered"):
             values[name + "_rmse"] = [run["rmse"][name] for run in runs

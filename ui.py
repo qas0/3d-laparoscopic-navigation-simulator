@@ -50,6 +50,9 @@ class SimulatorWindow(QMainWindow):
         self.target_tolerance = 2.0
         self.arrival_dwell = 0.5
         self.tracking_timeout = 0.25
+        self.tracking_paused_time = None
+        self.tracking_recovery_samples = 0
+        self.tracking_recovery_sample = None
         self.route_feedback_active = False
         self.route_finished_time = None
         self.route_result = None
@@ -432,6 +435,8 @@ class SimulatorWindow(QMainWindow):
             ("Travel · successful runs (mm)", "successful_travel"),
             ("Completion · successful runs (s)", "successful_completion_time"),
             ("Planning time (s)", "planning_time"),
+            ("Tracking pauses", "tracking_pauses"),
+            ("Time paused for tracking (s)", "paused_time"),
             ("Tool raw RMSE (mm)", "tool_raw_rmse"),
             ("Tool filtered RMSE (mm)", "tool_filtered_rmse"),
             ("Tool predicted RMS uncertainty (mm)", "tool_predicted_rms"),
@@ -947,7 +952,7 @@ class SimulatorWindow(QMainWindow):
             return
         source = self.navigation_mode_combo.currentIndex()
         mode = self.planning_mode_combo.currentData()
-        if not self.TrackingAvailable(source, mode):
+        if not self.TrackingAvailable(source, mode, accepted=True):
             self.message_label.setText("Required tracking is unavailable. Wait for fresh readings before planning.")
             return
         self.stop_path()
@@ -1092,6 +1097,9 @@ class SimulatorWindow(QMainWindow):
         self.route_feedback_active = False
         self.route_finished_time = None
         self.route_result = None
+        self.tracking_paused_time = None
+        self.tracking_recovery_samples = 0
+        self.tracking_recovery_sample = None
         self.command = self.configuration.copy()
         self.plan_button.setEnabled(self.comparison_future is None)
         self.follow_button.setEnabled(False)
@@ -1150,7 +1158,9 @@ class SimulatorWindow(QMainWindow):
     def set_paused(self, paused):
         self.pressed_keys.clear()
         self.pause_button.setText("Resume movement" if paused else "Pause movement")
-        if self.following:
+        if self.tracking_paused_time is not None:
+            self.message_label.setText("Tracking recovery pending. Movement stays paused.")
+        elif self.following:
             self.message_label.setText("Route paused." if paused else "Resuming the planned route.")
         else:
             self.message_label.setText("Movement paused." if paused else "Ready for manual movement.")
@@ -1312,8 +1322,10 @@ class SimulatorWindow(QMainWindow):
                 else {"distance": np.nan, "arrived": False, "uncertainty": np.nan})
         self.distance_history.append((sample_time - self.distance_started_time,
                                       *(feedback["distance"] for feedback in self.target_feedbacks)))
+        self.CheckRouteTracking()
         for index, feedback in enumerate(self.target_feedbacks):
             if (not feedback["arrived"] or not self.TrackingAvailable(index)
+                    or self.tracking_paused_time is not None
                     or index == 2 and any(self.rejected_observations)):
                 self.arrival_started[index] = None
             elif self.arrival_started[index] is None:
@@ -1321,8 +1333,7 @@ class SimulatorWindow(QMainWindow):
             self.arrival_confirmed[index] = (self.arrival_started[index] is not None
                                              and sample_time - self.arrival_started[index] >= self.arrival_dwell - 1e-9)
 
-        self.CheckRouteTracking()
-        if self.route_feedback_active:
+        if self.route_feedback_active and self.tracking_paused_time is None:
             reported = self.arrival_confirmed[self.plan_source_index]
             expired = (self.route_finished_time is not None
                        and sample_time - self.route_finished_time >= 3.0)
@@ -1378,6 +1389,9 @@ class SimulatorWindow(QMainWindow):
         selected = self.target_feedbacks[mode]
         if self.route_result is not None:
             self.feedback_status_label.setText(self.route_result_label.text())
+        elif self.tracking_paused_time is not None:
+            self.feedback_status_label.setText(
+                f"Tracking paused · recovery {self.tracking_recovery_samples} / 2.\nArrival confirmation restarts after recovery.")
         elif not self.TrackingAvailable(mode):
             self.feedback_status_label.setText("Tracking unavailable. Arrival confirmation requires fresh tool + target readings.")
         elif mode == 2 and any(self.rejected_observations):
@@ -1463,29 +1477,91 @@ class SimulatorWindow(QMainWindow):
                         if self.path is not None and not self.following else "")
         self.clearance_label.setText(f"SHAFT CLEARANCE\n{self.sampled_clearance:.2f} mm  ·  Movement minimum {minimum:.2f} mm{guide_margin}")
 
-    def TrackingAvailable(self, source, mode="conventional"):
+    def TrackingAvailable(self, source, mode="conventional", *, accepted=False):
         required = (0, 1) if source != 0 else (0,) if mode == "uncert_aware" else ()
         now = perf_counter()
         for index in required:
             filtered = source == 2 or mode == "uncert_aware" and index == 0
             received = (self.filter_observation_times if filtered else self.observation_times)[index]
             if (self.observations[index] is None or received is None
-                    or now - received > self.tracking_timeout):
+                    or now - received > self.tracking_timeout
+                    or accepted and filtered and self.rejected_observations[index]):
                 return False
+        return True
+
+    def PauseForTrackingLoss(self, now):
+        if self.tracking_paused_time is None:
+            self.tracking_paused_time = now
+            self.message_label.setText("Tracking lost. Movement paused for up to 1 s; waiting for two fresh samples.")
+        self.tracking_recovery_samples = 0
+        self.tracking_recovery_sample = self.measurement_count
+        self.arrival_started = [None, None, None]
+        self.arrival_confirmed = [False, False, False]
+
+    def ResumeAfterTrackingRecovery(self, now):
+        # counts sensor samples once even when several frame updates check tracking
+        if self.measurement_count == self.tracking_recovery_sample:
+            return False
+        self.tracking_recovery_sample = self.measurement_count
+        self.tracking_recovery_samples += 1
+        if self.tracking_recovery_samples < 2:
+            self.message_label.setText("Tracking recovering · 1 / 2 fresh samples. Movement stays paused.")
+            return False
+        target = (self.sampled_target, self.target_measurement,
+                  self.target_estimate)[self.plan_source_index]
+        reason = None
+        if np.linalg.norm(target - self.planned_target) > self.target_tolerance + 1e-9:
+            reason = "Target tracking differs from the snapshot."
+        elif self.plan_mode == "uncert_aware":
+            offset = self.tool_estimate - tip_position(self.port, *self.sampled_configuration)
+            margin = get_uncertainty_margin(offset, self.tool_filter.covariance[:3, :3],
+                                            self.plan_uncertainty_scale)
+            if margin > self.route_clearance - self.required_clearance + 1e-9:
+                reason = "Tool tracking exceeds the planned margin."
+        clearance = shaft_clearance(self.port, tip_position(self.port, *self.configuration),
+                                    self.tool_radius, self.structure_centre, self.structure_radius)
+        if reason is None and (clearance < self.route_clearance or (
+                self.path_index < len(self.path) and not movement_is_clear(
+                    self.port, self.configuration, self.path[self.path_index], self.tool_radius,
+                    self.structure_centre, self.structure_radius, self.route_clearance))):
+            reason = "Remaining route lacks the planned clearance."
+        if reason is not None:
+            self.guidance_warning = reason
+            self.stop_path(keep_route=True)
+            self.message_label.setText(f"Tracking returned. {reason} Plan a fresh route; the guide stays visible.")
+            return False
+        # excludes the interruption from arrival checking time after movement ends
+        if self.route_finished_time is not None:
+            self.route_finished_time += now - self.tracking_paused_time
+        self.tracking_paused_time = None
+        self.tracking_recovery_samples = 0
+        self.tracking_recovery_sample = None
+        self.message_label.setText(
+            "Tracking recovered. Movement remains paused." if self.pause_button.isChecked() else
+            "Tracking recovered. Following the route." if self.following else
+            "Tracking recovered. Checking arrival feedback.")
         return True
 
     def CheckRouteTracking(self):
         if self.path is None or self.route_result is not None:
             return True
-        if self.TrackingAvailable(self.plan_source_index, self.plan_mode):
-            return True
-        self.guidance_warning = "Required tracking is unavailable; a fresh plan is needed."
-        self.arrival_started = [None, None, None]
-        self.arrival_confirmed = [False, False, False]
-        if not self.manual_guidance:
+        available = self.TrackingAvailable(self.plan_source_index, self.plan_mode, accepted=True)
+        if not self.route_feedback_active:
+            if not self.manual_guidance:
+                self.follow_button.setEnabled(available and self.guidance_warning is None)
+            return available
+        now = perf_counter()
+        if self.tracking_paused_time is not None and now - self.tracking_paused_time > 1.0 + 1e-9:
+            self.guidance_warning = "Tracking did not recover within 1 s."
             self.stop_path(keep_route=True)
-            self.message_label.setText("Automatic execution unavailable: tracking lost. The guide stays visible; plan again after tracking returns.")
-        return False
+            self.message_label.setText("Tracking did not recover within 1 s. Plan a fresh route after tracking returns; the guide stays visible.")
+            return False
+        if not available:
+            self.PauseForTrackingLoss(now)
+            return False
+        if self.tracking_paused_time is not None:
+            return self.ResumeAfterTrackingRecovery(now)
+        return True
 
     def update_route_guidance(self, refresh=True):
         if self.route_points is None:
@@ -1530,7 +1606,9 @@ class SimulatorWindow(QMainWindow):
         status = ("Manual reference; replan for automatic execution." if self.manual_guidance
                   else "Automatic execution uses the frozen route." if self.route_feedback_active
                   else "Manual guide or automatic execution available.")
-        if self.guidance_warning is not None:
+        if self.tracking_paused_time is not None:
+            status = f"Tracking paused · recovery {self.tracking_recovery_samples} / 2 samples."
+        elif self.guidance_warning is not None:
             status = f"Replan advised: {self.guidance_warning}"
         if self.plan_source_index == 2 and not available:
             status += " Tip-to-guide uses prediction."
