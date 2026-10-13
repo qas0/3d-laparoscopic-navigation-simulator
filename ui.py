@@ -42,6 +42,8 @@ class SimulatorWindow(QMainWindow):
         self.port = np.zeros(3)
         self.tool_radius = 1.5
         self.shaft_length = 135.0
+        self.jaw_length = 13.0
+        self.tip_length = self.jaw_length + 2.0
         self.render_pending = False
         self.required_clearance = 2.0
         self.route_clearance = self.required_clearance
@@ -547,7 +549,7 @@ class SimulatorWindow(QMainWindow):
         self.viewport.set_background("#edf2f6", top="#fafcfd")
         self.viewport.enable_anti_aliasing("fxaa")
         scene_key = QLabel('<span style="color:#d59420">●</span> Tool tip &nbsp; '
-                           '<span style="color:#199a78">●</span> Target &nbsp; '
+                           '<span style="color:#925c53">●</span> Target &nbsp; '
                            '<span style="color:#bc4046">●</span> Protected structure &nbsp; '
                            '<span style="color:#7757b5">━</span> Route', wordWrap=True)
         scene_key.setStyleSheet("background: white; padding: 8px 12px; font-size: 9pt;")
@@ -678,9 +680,13 @@ class SimulatorWindow(QMainWindow):
         self.organ_centre = self.rest_organ_centre.copy()
         motion_bounds = np.array([0.0, 0.0, self.motion_amplitude.value()])
         direction = (tip_position(self.port, *self.configuration) - self.port) / self.configuration[2]
-        handle_end = self.port - (self.shaft_length - self.configuration[2] + 34) * direction
+        handle_start = self.port - (self.shaft_length - self.configuration[2]) * direction
+        handle_end = handle_start - 34 * direction
+        handle_width = 27 * np.sqrt(np.maximum(0, 1 - direction ** 2))
         reference_points = np.array([
-            handle_end, self.port, tip_position(self.port, *self.configuration),
+            handle_end - handle_width, handle_end + handle_width,
+            handle_start - handle_width, handle_start + handle_width,
+            self.port, tip_position(self.port, *self.configuration),
             self.organ_centre - [20, 26, 22] - motion_bounds,
             self.organ_centre + [20, 26, 22] + motion_bounds,
             self.structure_centre - self.structure_radius,
@@ -703,10 +709,18 @@ class SimulatorWindow(QMainWindow):
     def build_scene(self):
         self.viewport.enable_lightkit()
         self.viewport.add_light(pv.Light(light_type="headlight", intensity=0.3))
-        organ = pv.Sphere(radius=1, theta_resolution=64, phi_resolution=48)
-        organ.points = organ.points * np.array([20, 26, 22]) + self.organ_centre
+        organ = pv.Sphere(radius=1, theta_resolution=96, phi_resolution=73)
+        organ.points = organ.points * np.array([20, 26, 22]) + self.organ_centr
+        offset = organ.points - self.target
+        angle = np.arctan2(offset[:, 2], offset[:, 1])
+        radius = 4 * (1 + 0.1 * np.sin(3 * angle) + 0.06 * np.cos(5 * angle))
+        blend = np.exp(-2 * (np.linalg.norm(offset, axis=1) / radius) ** 2)
+        tissue_colour = np.array([217, 165, 155])
+        target_colour = np.array([146, 92, 83])
+        organ.point_data["colour"] = np.rint(
+            tissue_colour + blend[:, None] * (target_colour - tissue_colour)).astype(np.uint8)
         self.organ_actor = self.viewport.add_mesh(
-            organ, color="#d9a59b", opacity=0.85,
+            organ, scalars="colour", rgb=True, show_scalar_bar=False,
             smooth_shading=True, ambient=0.15, specular=0.12, specular_power=20)
         self.viewport.add_mesh(pv.Sphere(radius=self.structure_radius, center=self.structure_centre),
                                color="#bc4046", smooth_shading=True, ambient=0.15, specular=0.15)
@@ -715,9 +729,6 @@ class SimulatorWindow(QMainWindow):
         self.margin_actor = self.viewport.add_mesh(
             margin, color="#ce7a7e", opacity=0.12, smooth_shading=True)
         self.margin_actor.SetOrigin(*self.structure_centre)
-        self.target_actor = self.viewport.add_mesh(
-            pv.Sphere(radius=2.2, center=self.target),
-            color="#199a78", smooth_shading=True, ambient=0.25)
         # builds a hollow housing that pivots around the fixed entry point
         port = pv.Disc(normal=(1, 0, 0), inner=1.9, outer=3.1, c_res=48).extrude(
             (-12, 0, 0), capping=True)
@@ -731,29 +742,63 @@ class SimulatorWindow(QMainWindow):
         self.shaft_actor = self.viewport.add_mesh(
             pv.Cylinder(center=(0.5, 0, 0), direction=(1, 0, 0),
                         radius=self.tool_radius, height=1, resolution=32),
-            color="#9aa8b2", smooth_shading=True, ambient=0.15, specular=0.65, specular_power=40)
+            color="#343a40", smooth_shading=True, ambient=0.25, specular=0.45, specular_power=35)
         self.external_shaft_actor = self.viewport.add_mesh(
             pv.Cylinder(center=(-0.5, 0, 0), direction=(1, 0, 0),
                         radius=self.tool_radius, height=1, resolution=32),
-            color="#9aa8b2", smooth_shading=True, ambient=0.15, specular=0.65, specular_power=40)
-        grip = pv.Cylinder(center=(-17, 0, 0), direction=(1, 0, 0),
-                           radius=6, height=26, resolution=48)
-        cap = pv.Sphere(radius=1, theta_resolution=32, phi_resolution=24)
-        cap.points = cap.points * [4, 6, 6] + [-30, 0, 0]
+            color="#343a40", smooth_shading=True, ambient=0.25, specular=0.45, specular_power=35)
+        grip = pv.Sphere(radius=1, theta_resolution=24, phi_resolution=16)
+        grip.points = grip.points * [4, 2.3, 3.2] + [-5.5, 0, 0]
+        handle_parts = [grip]
+        angles = np.linspace(0, 2 * np.pi, 48, endpoint=False)
+        for centre, radius in (((-7.5, -17), (5, 7.5)), ((-25, -12), (6, 6.8))):
+            points = np.column_stack((centre[0] + radius[0] * np.cos(angles), np.zeros_like(angles),
+                                      centre[1] + radius[1] * np.sin(angles)))
+            ring = pv.PolyData(points, lines=np.r_[len(points) + 1, np.arange(len(points)), 0])
+            handle_parts.append(ring.tube(radius=1.2, n_sides=12))
+        for points in (
+                [(-4.5, 0, -1.5), (-3, 0, -4), (-2.8, 0, -7), (-4, 0, -11.6)],
+                [(-6, 0, -1), (-10, 0, -3), (-14, 0, -7), (-19.8, 0, -8.6)]):
+            handle_parts.append(pv.Spline(points, n_points=32).tube(radius=1.5, n_sides=12, capping=True))
         self.handle_actor = self.viewport.add_mesh(
-            grip.merge(cap), color="#286e9f", smooth_shading=True,
-            ambient=0.15, specular=0.25, specular_power=25)
-        bands = [pv.Cylinder(center=(position, 0, 0), direction=(1, 0, 0),
-                             radius=6.15, height=0.6, resolution=48)
-                 for position in (-24, -16, -8)]
-        self.grip_bands_actor = self.viewport.add_mesh(
-            bands[0].merge(bands[1:]), color="#1c506b", smooth_shading=True, ambient=0.2)
+            handle_parts[0].merge(handle_parts[1:]), color="#282e34", smooth_shading=True,
+            ambient=0.25, specular=0.2, specular_power=25)
+        collar_parts = [pv.Cylinder(center=(-2, 0, 0), direction=(1, 0, 0), radius=2.8,
+                                    height=4, resolution=32),
+                        pv.Cylinder(center=(-5.5, 0, 0), direction=(0, 1, 0), radius=1.25,
+                                    height=5, resolution=24)]
+        collar_parts.extend(pv.Cylinder(center=(position, 0, 0), direction=(1, 0, 0),
+                                       radius=3.3, height=0.4, resolution=32)
+                            for position in (-2.8, -1.8, -0.8))
+        collar = collar_parts[0].merge(collar_parts[1:])
+        collar.cell_data["colour"] = np.tile([52, 61, 70], (collar.n_cells, 1)).astype(np.uint8)
+        collar.cell_data["colour"][collar.cell_centers().points[:, 0] < -4] = [135, 144, 153]
         self.collar_actor = self.viewport.add_mesh(
-            pv.Cylinder(center=(-2, 0, 0), direction=(1, 0, 0), radius=2.8,
-                        height=4, resolution=32), color="#647c8c", smooth_shading=True,
-            ambient=0.15, specular=0.5)
-        self.tip_actor = self.viewport.add_mesh(pv.Sphere(radius=self.tool_radius),
-                                                color="#d59420", smooth_shading=True, ambient=0.2)
+            collar, scalars="colour", rgb=True, show_scalar_bar=False, smooth_shading=True,
+            ambient=0.25, specular=0.35, specular_power=30)
+        # keeps closed jaws inside the existing shaft clearance envelope
+        sleeve = pv.Cylinder(center=(-self.tip_length + 1, 0, 0), direction=(1, 0, 0),
+                             radius=self.tool_radius, height=2, resolution=32)
+        sleeve.cell_data["colour"] = np.tile([154, 168, 178], (sleeve.n_cells, 1)).astype(np.uint8)
+        hinge = pv.Cylinder(center=(-self.jaw_length + 0.7, 0, 0), direction=(0, 1, 0),
+                            radius=0.55, height=2.55, resolution=20)
+        hinge.cell_data["colour"] = np.tile([100, 115, 125], (hinge.n_cells, 1)).astype(np.uint8)
+        jaw_parts = [sleeve, hinge]
+        face_length = self.jaw_length
+        shape = pv.Capsule(center=(-(face_length + 1.2) / 2, 0, 0), direction=(1, 0, 0),
+                           radius=1.2, cylinder_length=face_length - 1.2, resolution=24)
+        shape = shape.clean(tolerance=1e-5, absolute=True).clip_closed_surface(
+            normal=(1, 0, 0), origin=(-face_length, 0, 0))
+        for side in (-1, 1):
+            jaw = shape.clip_closed_surface(normal=(0, 0, side), origin=(0, 0, side * 0.04))
+            back, front = jaw.bounds[:2]
+            jaw.points[:, 0] = (jaw.points[:, 0] - front) * face_length / (front - back)
+            jaw.cell_data["colour"] = np.tile([154, 168, 178], (jaw.n_cells, 1)).astype(np.uint8)
+            jaw.cell_data["colour"][jaw.cell_centers().points[:, 0] > -0.3] = [213, 148, 32]
+            jaw_parts.append(jaw)
+        self.tip_actor = self.viewport.add_mesh(
+            jaw_parts[0].merge(jaw_parts[1:]), scalars="colour", rgb=True, show_scalar_bar=False,
+            smooth_shading=True, ambient=0.15, specular=0.65, specular_power=40)
 
         # keeps sensor overlays distinct from the physical instrument
         marker = pv.PolyData(
@@ -794,7 +839,6 @@ class SimulatorWindow(QMainWindow):
         self.organ_centre = self.rest_organ_centre + offset
         # translates persistent meshes and labels without changing camera framing
         self.organ_actor.SetPosition(*offset)
-        self.target_actor.SetPosition(*offset)
         self.label_points.points[1] = self.target
         self.label_points.points[3] = self.organ_centre + [0.0, 0.0, 22.0]
         self.render_pending = True
@@ -803,7 +847,7 @@ class SimulatorWindow(QMainWindow):
         # fits fixed scenario bounds so noise + instrument resets cannot shift the view
         focal = (0, 0, 0)
         cameras = {
-            "Perspective": [(-55, -260, 125), focal, (0, 0, 1)],
+            "Perspective": [(-140, -260, 125), focal, (0, 0, 1)],
             "Top": [(0, 0, 300), focal, (0, 1, 0)],
             "Front": [(0, -300, 0), focal, (0, 0, 1)],
             "Overview": [(-90, -260, 170), focal, (0, 0, 1)],
@@ -811,8 +855,8 @@ class SimulatorWindow(QMainWindow):
         self.viewport.camera_position = cameras[self.view_combo.currentText()]
         self.viewport.camera.parallel_projection = self.view_combo.currentText() in ("Top", "Front")
         self.viewport.camera.view_angle = 30.0
-        low = np.minimum([-170, -125, -105], self.organ_centre - [20, 26, 22])
-        high = np.maximum([135, 125, 105], self.organ_centre + [20, 26, 22])
+        low = np.minimum([-170, -135, -120], self.organ_centre - [20, 26, 22])
+        high = np.maximum([135, 135, 120], self.organ_centre + [20, 26, 22])
         bounds = (tuple(value for pair in zip(low, high) for value in pair)
                   if self.view_combo.currentText() == "Overview" else self.scene_bounds)
         self.viewport.reset_camera(bounds=bounds)
@@ -1926,19 +1970,25 @@ class SimulatorWindow(QMainWindow):
             [np.sin(pitch), 0, np.cos(pitch)],
         ])
         matrix = np.eye(4)
-        matrix[:3, :3] = rotation @ np.diag([depth, 1, 1])
+        internal_length = max(depth - self.tip_length, 0)
+        matrix[:3, :3] = rotation @ np.diag([internal_length, 1, 1])
         matrix[:3, 3] = self.port
         self.shaft_actor.user_matrix = matrix
+        self.shaft_actor.SetVisibility(bool(internal_length > 0))
         # moves the external handle towards the port as insertion increases
         external_length = self.shaft_length - depth
-        matrix[:3, :3] = rotation @ np.diag([external_length, 1, 1])
+        external_front = min(depth - self.tip_length, 0)
+        matrix[:3, :3] = rotation @ np.diag([external_length + external_front, 1, 1])
+        matrix[:3, 3] = self.port + external_front * rotation[:, 0]
         self.external_shaft_actor.user_matrix = matrix
         matrix[:3, :3] = rotation
+        matrix[:3, 3] = self.port
         self.port_actor.user_matrix = matrix
         matrix[:3, 3] = self.port - external_length * rotation[:, 0]
-        for actor in (self.handle_actor, self.grip_bands_actor, self.collar_actor):
+        for actor in (self.handle_actor, self.collar_actor):
             actor.user_matrix = matrix
-        self.tip_actor.SetPosition(*tip_position(self.port, *self.configuration))
+        matrix[:3, 3] = tip_position(self.port, *self.configuration)
+        self.tip_actor.user_matrix = matrix
         self.render_pending = True
 
     def eventFilter(self, watched, event):
