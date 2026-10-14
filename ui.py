@@ -171,9 +171,9 @@ class SimulatorWindow(QMainWindow):
         self.motion_frequency = QDoubleSpinBox(minimum=0.0, maximum=0.5, decimals=2,
                                               singleStep=0.05, value=0.2, suffix=" Hz",
                                               keyboardTracking=False)
-        self.motion_amplitude.setToolTip("Maximum Z displacement from the resting position. Zero keeps anatomy still.")
+        self.motion_amplitude.setToolTip("Maximum world Y displacement from the resting position. Zero keeps anatomy still.")
         self.motion_frequency.setToolTip("Cycles per second: 0.2 Hz gives one cycle every 5 seconds.")
-        self.motion_group.setToolTip("Moves organ + target together along Z. Changing settings restarts the selected scenario.")
+        self.motion_group.setToolTip("Moves organ + target together along world Y. Changing settings restarts the selected scenario.")
         motion_settings.addRow("Amplitude", self.motion_amplitude)
         motion_settings.addRow("Frequency", self.motion_frequency)
         self.motion_label = QLabel(wordWrap=True)
@@ -303,7 +303,7 @@ class SimulatorWindow(QMainWindow):
         bias_settings = QFormLayout(bias_group)
         self.sensor_axis = QComboBox()
         self.sensor_axis.addItems(["X", "Y", "Z"])
-        self.sensor_axis.setToolTip("World axis for fixed bias + subsequent drift increments.")
+        self.sensor_axis.setToolTip("World axis shown in the viewport for fixed bias + subsequent drift increments.")
         bias_settings.addRow("Direction", self.sensor_axis)
         self.tool_bias = QDoubleSpinBox(minimum=-20.0, maximum=20.0, decimals=1,
                                        singleStep=0.5, suffix=" mm", keyboardTracking=False)
@@ -352,7 +352,7 @@ class SimulatorWindow(QMainWindow):
         sensor_layout.addWidget(self.estimates_checkbox)
         sensor_note = QLabel("Sensors: 10 Hz  ·  Readouts: 2 Hz", wordWrap=True)
         sensor_layout.addWidget(sensor_note)
-        measurements_group = QGroupBox("Raw position readings · mm")
+        measurements_group = QGroupBox("Raw world positions · mm")
         measurements_layout = QVBoxLayout(measurements_group)
         self.tool_measurement_label = QLabel(wordWrap=True)
         self.target_measurement_label = QLabel(wordWrap=True)
@@ -397,7 +397,7 @@ class SimulatorWindow(QMainWindow):
 
         details_button = QPushButton("Position + filter details", checkable=True)
         estimate_layout.addWidget(details_button)
-        filter_group = QGroupBox("Filtered position readings · mm", visible=False)
+        filter_group = QGroupBox("Filtered world positions · mm", visible=False)
         filter_layout = QVBoxLayout(filter_group)
         self.tool_estimate_label = QLabel(wordWrap=True)
         self.target_estimate_label = QLabel(wordWrap=True)
@@ -1071,7 +1071,7 @@ class SimulatorWindow(QMainWindow):
             return
         self.UpdateComparison()
         # captures widget values before sending plain settings to the worker
-        axis = np.eye(3)[self.sensor_axis.currentIndex()]
+        axis = self.scene_rotation.T @ np.eye(3)[self.sensor_axis.currentIndex()]
         settings = {
             "tracking": ("ideal", "raw", "filtered")[self.navigation_mode_combo.currentIndex()],
             "tool_noise": self.tool_noise.value(), "target_noise": self.target_noise.value(),
@@ -1234,6 +1234,8 @@ class SimulatorWindow(QMainWindow):
                 return
             result = result["comparisons"][index]
         settings = result["settings"]
+        world_offsets = {name: tuple(map(float, self.scene_rotation @ settings[name]))
+                         for name in ("tool_bias", "target_bias", "tool_drift", "target_drift")}
         noise_label = f"Noise σ: tool {settings['tool_noise']:g} / target {settings['target_noise']:g} mm"
         uncertainty_label = f"Uncertainty k {settings['uncertainty_scale']:g}"
         rejection_label = f"Rejection {'on' if settings['reject_outliers'] else 'off'}"
@@ -1250,8 +1252,8 @@ class SimulatorWindow(QMainWindow):
             f"Dropout: tool {100 * settings['tool_dropout']:g} / target {100 * settings['target_dropout']:g}%\n"
             f"Outliers: tool {100 * settings['tool_outlier']:g} / target {100 * settings['target_outlier']:g}%"
             f" · Spike {settings['outlier_size']:g} mm · {rejection_label}\n"
-            f"Bias XYZ (mm): tool {tuple(map(float, settings['tool_bias']))} / target {tuple(map(float, settings['target_bias']))}\n"
-            f"Drift XYZ (mm/s): tool {tuple(map(float, settings['tool_drift']))} / target {tuple(map(float, settings['target_drift']))}\n"
+            f"World bias XYZ (mm): tool {world_offsets['tool_bias']} / target {world_offsets['target_bias']}\n"
+            f"World drift XYZ (mm/s): tool {world_offsets['tool_drift']} / target {world_offsets['target_drift']}\n"
             f"Breathing: {settings['motion_amplitude']:g} mm / {settings['motion_frequency']:g} Hz · "
             f"Proximity weight {settings['proximity_weight']:g} · {uncertainty_label}")
         metrics = self.comparison_metrics
@@ -1616,6 +1618,9 @@ class SimulatorWindow(QMainWindow):
         self.measurement_count = 0
         self.tool_filter = None
         self.target_filter = None
+        # allows the constant-velocity model to follow peak breathing acceleration
+        self.target_acceleration = max(1.0, self.motion_amplitude.value()
+                                      * (2 * np.pi * self.motion_frequency.value()) ** 2)
         self.tool_measurement = None
         self.target_measurement = None
         self.tool_estimate = None
@@ -1665,12 +1670,13 @@ class SimulatorWindow(QMainWindow):
         filters = [self.tool_filter, self.target_filter]
         readings = [self.tool_measurement, self.target_measurement]
         estimates = [None, None]
-        direction = np.eye(3)[self.sensor_axis.currentIndex()]
+        # maps the displayed world direction back into simulation coordinates
+        direction = self.scene_rotation.T @ np.eye(3)[self.sensor_axis.currentIndex()]
         for index, (position, noise, dropout, bias, drift, acceleration) in enumerate((
                 (tool_tip, self.tool_noise.value(), self.tool_dropout.value(),
                  self.tool_bias.value(), self.tool_drift.value(), 20.0),
                 (self.sampled_target, self.target_noise.value(), self.target_dropout.value(),
-                 self.target_bias.value(), self.target_drift.value(), 1.0))):
+                 self.target_bias.value(), self.target_drift.value(), self.target_acceleration))):
             # accumulates drift while preserving previous offsets when its rate changes
             drift_rate = direction * drift
             biased_position = ApplyBias(position, direction * bias + self.sensor_drift[index],
@@ -1779,8 +1785,8 @@ class SimulatorWindow(QMainWindow):
 
     def update_sensor_readouts(self):
         # refreshes one snapshot while sampling + filtering continue at 10 Hz
-        self.motion_label.setText(f"Actual Z offset {self.sampled_motion[0]:.2f} mm\n"
-                                  f"Actual Z velocity {self.sampled_motion[1]:.2f} mm/s")
+        self.motion_label.setText(f"Actual world Y offset {-self.sampled_motion[0]:.2f} mm\n"
+                                  f"Actual world Y velocity {-self.sampled_motion[1]:.2f} mm/s")
         self.toggle_measurements(None, render=False)
         if self.measurements_checkbox.isChecked():
             self.render_pending = True
@@ -1848,8 +1854,8 @@ class SimulatorWindow(QMainWindow):
             if self.rejected_observations[index]:
                 status = (f"Prediction · accepted age {now - received:.1f} s" if filtered
                           else f"{'Fresh' if fresh else 'Last reading'} · rejected by filter")
-            values = "".join(f'<td align="right">{FormatReading(value)}</td>'
-                             for value in (position if position is not None else (None,) * 3))
+            position = self.scene_rotation @ position if position is not None else (None,) * 3
+            values = "".join(f'<td align="right">{FormatReading(value)}</td>' for value in position)
             label.setText(f'<b>{name}</b><br>{status}<table width="100%" cellspacing="4">'
                           f'<tr style="color:#62788c">{headings}</tr>'
                           f'<tr style="font-family:Consolas">{values}</tr></table>')

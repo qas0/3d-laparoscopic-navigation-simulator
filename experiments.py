@@ -113,7 +113,8 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
     required_filters = (0, 1) if tracking == "filtered" else (
         (0,) if mode == "uncert_aware" else ())
     biases, drift_rates = [tool_bias, target_bias], [tool_drift, target_drift]
-    acceleration = [20.0, 1.0]
+    # allows the constant-velocity model to follow peak breathing acceleration
+    acceleration = [20.0, max(1.0, motion_amplitude * (2 * np.pi * motion_frequency) ** 2)]
     error_sums = dict.fromkeys(("tool_raw", "target_raw", "tool_filtered", "target_filtered"), 0.0)
     counts = dict.fromkeys(error_sums, 0)
     covariance_sums = {"tool": 0.0, "target": 0.0}

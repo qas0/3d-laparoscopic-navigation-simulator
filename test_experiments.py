@@ -47,7 +47,8 @@ class StudyWorkerTests(unittest.TestCase):
 
     def test_SpawnedComparisonPreservesProgressAndSeededResults(self):
         settings = dict(tracking="ideal", tool_noise=0.0, target_noise=0.0,
-                        duration=1.2, proximity_weight=0.0, uncertainty_scale=0.0)
+                        duration=1.2, proximity_weight=0.0, uncertainty_scale=0.0,
+                        planning_time_limit=30.0)
         (ok, result), updates = self.RunWorker(settings)
         self.assertTrue(ok)
         expected = CompareMethods("Direct insertion", [4], **settings)
@@ -148,7 +149,7 @@ class UncertaintyCoverageTests(unittest.TestCase):
 
 class ExperimentTests(unittest.TestCase):
     def test_ZeroNoiseReachesTheTrueTargetWithExpectedTravel(self):
-        trial = RunTrial(tool_noise=0.0, target_noise=0.0)
+        trial = RunTrial(tool_noise=0.0, target_noise=0.0, planning_time_limit=30.0)
         self.assertEqual(trial["status"], "confirmed_arrival")
         self.assertTrue(trial["success"])
         self.assertTrue(trial["reported_arrival"])
@@ -166,7 +167,7 @@ class ExperimentTests(unittest.TestCase):
 
     def test_BiasedRawTargetCanReportArrivalAwayFromTheTrueTarget(self):
         trial = RunTrial(tracking="raw", tool_noise=0.0, target_noise=0.0,
-                         target_bias=(8.0, 0.0, 0.0))
+                         target_bias=(8.0, 0.0, 0.0), planning_time_limit=30.0)
         self.assertEqual(trial["status"], "false_arrival")
         self.assertTrue(trial["reported_arrival"])
         self.assertTrue(trial["false_arrival"])
@@ -181,7 +182,8 @@ class ExperimentTests(unittest.TestCase):
         np.testing.assert_array_equal(trial["planned_target"], [98.0, 0.0, 0.0])
 
     def test_MissingTrackingPreventsFilteredPlanningButIdealCanMove(self):
-        settings = dict(tool_noise=0.0, target_noise=0.0, tool_dropout=1.0)
+        settings = dict(tool_noise=0.0, target_noise=0.0, tool_dropout=1.0,
+                        planning_time_limit=30.0)
         unavailable = RunTrial(**settings)
         self.assertEqual(unavailable["status"], "tracking_unavailable")
         self.assertIsNone(unavailable["plan"])
@@ -202,7 +204,7 @@ class ExperimentTests(unittest.TestCase):
 
     def test_UncertaintyCanRejectAPathThatConventionalPlanningAccepts(self):
         settings = dict(tracking="ideal", tool_noise=0.0, target_noise=0.0,
-                        tool_bias=(5.0, 0.0, 0.0))
+                        tool_bias=(5.0, 0.0, 0.0), planning_time_limit=30.0)
         conventional = RunTrial(**settings)
         cautious = RunTrial(mode="uncert_aware", **settings)
         self.assertTrue(conventional["success"])
@@ -215,7 +217,7 @@ class ExperimentTests(unittest.TestCase):
     def test_MovingTargetKeepsThePlanningSnapshotAndRepeatsWithTheSeed(self):
         original = SCENARIOS["Direct insertion"]["start"].copy()
         settings = dict(seed=19, tracking="ideal", tool_noise=0.5, target_noise=0.5,
-                        motion_amplitude=6.0, motion_frequency=0.2)
+                        motion_amplitude=6.0, motion_frequency=0.2, planning_time_limit=30.0)
         first = RunTrial(**settings)
         repeated = RunTrial(**settings)
         planned_motion, _ = GetRespiratoryMotion(6.0, 0.2, 1.0)
@@ -240,8 +242,22 @@ class ExperimentTests(unittest.TestCase):
         np.testing.assert_array_equal(first["plan"]["path"], repeated["plan"]["path"])
         np.testing.assert_array_equal(SCENARIOS["Direct insertion"]["start"], original)
 
+        # checks rejection over complete breathing cycles before planning starts
+        for amplitude, frequency in ((6.0, 0.2), (10.0, 0.5)):
+            for noise in (0.0, 0.1, 2.0):
+                with self.subTest(amplitude=amplitude, frequency=frequency, noise=noise):
+                    trial = RunTrial(seed=19, tracking="ideal", tool_noise=0.0,
+                                     target_noise=noise, motion_amplitude=amplitude,
+                                     motion_frequency=frequency, reject_outliers=True,
+                                     warmup=20.0, duration=20.1, planning_time_limit=30.0)
+                    self.assertEqual(trial["status"], "timeout")
+                    self.assertEqual(trial["sensor_samples"], 202)
+                    self.assertLess(trial["rejected"]["target"], 0.05 * trial["sensor_samples"])
+                    self.assertLess(trial["rmse"]["target_filtered"], max(0.25, 2 * noise))
+
     def test_ExecutionDeadlineRetainsAnUnfinishedTrial(self):
-        trial = RunTrial(tool_noise=0.0, target_noise=0.0, warmup=0.0, duration=0.2)
+        trial = RunTrial(tool_noise=0.0, target_noise=0.0, warmup=0.0, duration=0.2,
+                         planning_time_limit=30.0)
         self.assertEqual(trial["status"], "timeout")
         self.assertFalse(trial["success"])
         self.assertIsNone(trial["completion_time"])
@@ -269,7 +285,8 @@ class ExperimentTests(unittest.TestCase):
                 self.assertIsNone(summary["metrics"][name]["sd"])
 
     def test_OneTrialDoesNotInventASampleStandardDeviation(self):
-        comparison = CompareMethods(seeds=[23], tool_noise=0.0, target_noise=0.0)
+        comparison = CompareMethods(seeds=[23], tool_noise=0.0, target_noise=0.0,
+                                    planning_time_limit=30.0)
         self.assertEqual(comparison["settings"]["tool_noise"], 0.0)
         for summary in comparison["summary"].values():
             self.assertEqual(summary["successes"], 1)
@@ -294,7 +311,8 @@ class ExperimentTests(unittest.TestCase):
 
     def test_TwoIndependentTrialsUseTheSampleStandardDeviation(self):
         comparison = CompareMethods(seeds=[0, 1], tracking="ideal", tool_noise=0.5,
-                                    target_noise=0.5, warmup=0.0, duration=0.5)
+                                    target_noise=0.5, warmup=0.0, duration=0.5,
+                                    planning_time_limit=30.0)
         for mode, summary in comparison["summary"].items():
             errors = [trial["rmse"]["tool_raw"] for trial in comparison["trials"]
                       if trial["mode"] == mode]
@@ -316,7 +334,8 @@ class ExperimentTests(unittest.TestCase):
 
         with patch("experiments.GetUncertaintyCoverage", side_effect=RecordCoverage):
             trial = RunTrial(seed=22, tracking="ideal", tool_noise=0.5, target_noise=0.5,
-                             tool_dropout=0.35, target_dropout=0.2, warmup=0.5, duration=0.8)
+                             tool_dropout=0.35, target_dropout=0.2, warmup=0.5, duration=0.8,
+                             planning_time_limit=30.0)
         self.assertEqual(trial["status"], "timeout")
         self.assertEqual(trial["sensor_samples"], 9)
         for sensor in ("tool", "target"):
@@ -340,7 +359,8 @@ class ExperimentTests(unittest.TestCase):
             self.assertGreater(error, 0.0)
 
     def test_CalibrationSummaryWeightsTrialsEquallyDespiteDifferentSampleCounts(self):
-        template = RunTrial(tool_noise=0.0, target_noise=0.0, warmup=0.0, duration=0.2)
+        template = RunTrial(tool_noise=0.0, target_noise=0.0, warmup=0.0, duration=0.2,
+                            planning_time_limit=30.0)
 
         def UnequalTrial(scenario, mode, seed, **settings):
             trial = dict(template, scenario=scenario, mode=mode, seed=seed)
@@ -364,8 +384,10 @@ class ExperimentTests(unittest.TestCase):
                 self.assertAlmostEqual(predicted["sd"], np.sqrt(2))
 
     def test_SmallerTimestepsKeepArrivalAndCommonSensorSequences(self):
-        coarse = RunTrial(tool_noise=0.0, target_noise=0.0, timestep=0.02)
-        fine = RunTrial(tool_noise=0.0, target_noise=0.0, timestep=0.01)
+        coarse = RunTrial(tool_noise=0.0, target_noise=0.0, timestep=0.02,
+                          planning_time_limit=30.0)
+        fine = RunTrial(tool_noise=0.0, target_noise=0.0, timestep=0.01,
+                        planning_time_limit=30.0)
         self.assertTrue(coarse["success"])
         self.assertTrue(fine["success"])
         self.assertAlmostEqual(coarse["travel"], fine["travel"])
@@ -373,7 +395,7 @@ class ExperimentTests(unittest.TestCase):
         self.assertLessEqual(abs(coarse["completion_time"] - fine["completion_time"]), 0.1)
 
         settings = dict(seeds=[0], tracking="ideal", tool_noise=0.5, target_noise=0.5,
-                        warmup=0.0, duration=0.5)
+                        warmup=0.0, duration=0.5, planning_time_limit=30.0)
         comparisons = [CompareMethods(timestep=step, **settings) for step in (0.02, 0.01)]
         expected = comparisons[0]["trials"][0]["rmse"]
         for comparison in comparisons:
@@ -456,7 +478,7 @@ class ExperimentTests(unittest.TestCase):
         with patch("experiments.ApplyDropout", side_effect=CancelDuringMovement):
             comparison = CompareMethods(seeds=[2], cancel_event=cancelled,
                                         progress=progress.append, tool_noise=0.0,
-                                        target_noise=0.0)
+                                        target_noise=0.0, planning_time_limit=30.0)
         self.assertTrue(cancelled.is_set())
         self.assertTrue(comparison["cancelled"])
         self.assertEqual(comparison["trials"], [])
@@ -474,7 +496,8 @@ class ExperimentTests(unittest.TestCase):
             cancelled.set()
 
         comparison = CompareMethods(seeds=[7, 8], cancel_event=cancelled,
-                                    progress=StopComparison, tool_noise=0.0, target_noise=0.0)
+                                    progress=StopComparison, tool_noise=0.0, target_noise=0.0,
+                                    planning_time_limit=30.0)
         self.assertTrue(comparison["cancelled"])
         self.assertEqual(progress, [(1, 6, "conventional", 7)])
         self.assertEqual(len(comparison["trials"]), 1)
@@ -632,7 +655,8 @@ class SensitivityStudyTests(unittest.TestCase):
 
         with patch("experiments.ApplyDropout", side_effect=StopMovement):
             study = RunSensitivityStudy(levels=[0.0, 1.0], seeds=[4],
-                                        cancel_event=cancelled, target_noise=0.0)
+                                        cancel_event=cancelled, target_noise=0.0,
+                                        planning_time_limit=30.0)
         self.assertTrue(cancelled.is_set())
         self.assertTrue(study["cancelled"])
         self.assertEqual(study["comparisons"], [])
@@ -647,7 +671,8 @@ class SensitivityStudyTests(unittest.TestCase):
             return find_path(*args, **settings)
 
         settings = dict(tracking="filtered", tool_noise=1.0, target_noise=0.5,
-                        tool_bias=(0.2, 0.0, 0.0), warmup=0.5, duration=0.6)
+                        tool_bias=(0.2, 0.0, 0.0), warmup=0.5, duration=0.6,
+                        planning_time_limit=30.0)
         with patch("experiments.find_path", side_effect=RecordPlanning):
             study = RunSensitivityStudy(levels=[0.0, 0.5, 1.0, 2.0], seeds=[5],
                                         parameter="uncertainty_scale", **settings)
@@ -747,7 +772,8 @@ class OutlierExperimentTests(unittest.TestCase):
 
     def test_RejectedSpikesStayInRawErrorsAndImproveTheStaticTargetEstimate(self):
         settings = dict(tracking="ideal", tool_noise=1.0, target_noise=1.0,
-                        tool_outlier=0.2, target_outlier=0.2, seed=0)
+                        tool_outlier=0.2, target_outlier=0.2, seed=0,
+                        planning_time_limit=30.0)
         with patch("experiments.measure_position",
                    side_effect=lambda position, noise, generator: position.copy()):
             accepted = RunTrial(reject_outliers=False, **settings)
@@ -783,7 +809,8 @@ class OutlierExperimentTests(unittest.TestCase):
                     "experiments.measure_position",
                     side_effect=lambda position, noise, generator: position.copy()):
                 trial = RunTrial(tracking=tracking, mode=mode, tool_noise=1.0,
-                                 target_noise=1.0, reject_outliers=True)
+                                 target_noise=1.0, reject_outliers=True,
+                                 planning_time_limit=30.0)
             self.assertEqual(trial["status"], status)
             self.assertEqual(trial["dropped"]["tool"], 0)
             self.assertEqual(trial["samples"]["tool_raw"], trial["sensor_samples"])
@@ -812,9 +839,11 @@ class OutlierExperimentTests(unittest.TestCase):
 
         with patch("experiments.measure_position",
                    side_effect=lambda position, noise, generator: position.copy()):
-            baseline = RunTrial(tool_noise=1.0, target_noise=1.0, reject_outliers=True)
+            baseline = RunTrial(tool_noise=1.0, target_noise=1.0, reject_outliers=True,
+                                planning_time_limit=30.0)
             with patch("experiments.ApplyOutlier", side_effect=SpikeTarget):
-                trial = RunTrial(tool_noise=1.0, target_noise=1.0, reject_outliers=True)
+                trial = RunTrial(tool_noise=1.0, target_noise=1.0, reject_outliers=True,
+                                 planning_time_limit=30.0)
         self.assertTrue(baseline["success"])
         self.assertTrue(trial["success"])
         self.assertEqual(trial["rejected"]["target"], 1)
@@ -826,7 +855,7 @@ class OutlierExperimentTests(unittest.TestCase):
     def test_AnInitialSpikeIsAcceptedBecauseNoPredictionExistsYet(self):
         trial = RunTrial(tracking="ideal", warmup=0.0, duration=0.02,
                          tool_noise=0.0, target_noise=0.0, tool_outlier=1.0,
-                         target_outlier=1.0, reject_outliers=True)
+                         target_outlier=1.0, reject_outliers=True, planning_time_limit=30.0)
         self.assertEqual(trial["sensor_samples"], 1)
         self.assertEqual(trial["rejected"], {"tool": 0, "target": 0})
         self.assertAlmostEqual(trial["rmse"]["tool_raw"], 20.0)
@@ -870,12 +899,14 @@ class TrackingRecoveryTests(unittest.TestCase):
 
         settings.setdefault("tool_noise", 0.0)
         settings.setdefault("target_noise", 0.0)
+        # leaves planning headroom so machine load does not mask sensor behaviour
+        settings.setdefault("planning_time_limit", 30.0)
         with patch("experiments.ApplyDropout", side_effect=DropReading):
             trial = RunTrial(**settings)
         return trial, positions
 
     def test_OneMissingSampleHoldsMovementUntilTwoNewSamplesAndKeepsTheRoute(self):
-        baseline = RunTrial(tool_noise=0.0, target_noise=0.0)
+        baseline = RunTrial(tool_noise=0.0, target_noise=0.0, planning_time_limit=30.0)
         trial, positions = self.RunDropoutTrial({(11, 0)})
         self.assertTrue(trial["success"])
         self.assertEqual(trial["pause_count"], 1)
@@ -951,7 +982,7 @@ class TrackingRecoveryTests(unittest.TestCase):
         with patch("experiments.ApplyBias", side_effect=OffsetTool):
             trial, _ = self.RunDropoutTrial({(11, 0)}, tracking="ideal", mode="uncert_aware")
         baseline = RunTrial(tracking="ideal", mode="uncert_aware", tool_noise=0.0,
-                            target_noise=0.0)
+                            target_noise=0.0, planning_time_limit=30.0)
         self.assertTrue(trial["success"])
         self.assertEqual(trial["plan"]["extra_clearance"], 0.0)
         self.assertEqual(trial["pause_count"], 1)
@@ -1017,7 +1048,8 @@ class TrackingRecoveryTests(unittest.TestCase):
         self.assertAlmostEqual(trial["travel"], 1.2)
 
     def test_PauseSummariesUseIndependentTrialsIncludingZeroPauses(self):
-        template = RunTrial(tool_noise=0.0, target_noise=0.0, warmup=0.0, duration=0.02)
+        template = RunTrial(tool_noise=0.0, target_noise=0.0, warmup=0.0, duration=0.02,
+                            planning_time_limit=30.0)
 
         def PausedTrial(scenario, mode, seed, **settings):
             return dict(template, scenario=scenario, mode=mode, seed=seed,
@@ -1046,13 +1078,15 @@ class RouteValidityTests(unittest.TestCase):
 
         settings.setdefault("tool_noise", 0.0)
         settings.setdefault("target_noise", 0.0)
+        settings.setdefault("planning_time_limit", 30.0)
         with patch("experiments.ApplyBias", side_effect=RecordPosition), patch(
                 "experiments.GetRespiratoryMotion", side_effect=MoveTarget):
             trial = RunTrial(**settings)
         return trial, positions
 
     def test_SustainedTargetChangeStopsEachSourceBeforeMovingTheSameSample(self):
-        baseline = RunTrial(tool_noise=0.0, target_noise=0.0, duration=1.6)
+        baseline = RunTrial(tool_noise=0.0, target_noise=0.0, duration=1.6,
+                            planning_time_limit=30.0)
         for tracking in ("ideal", "raw", "filtered"):
             with self.subTest(tracking=tracking):
                 trial, positions = self.RunTargetChange(
@@ -1101,7 +1135,7 @@ class RouteValidityTests(unittest.TestCase):
             with self.subTest(tracking=tracking), patch(
                     "experiments.ApplyBias", side_effect=ShiftReading):
                 trial = RunTrial(tracking=tracking, tool_noise=0.0,
-                                 target_noise=0.0, duration=2.0)
+                                 target_noise=0.0, duration=2.0, planning_time_limit=30.0)
             self.assertEqual(trial["status"], status)
             np.testing.assert_array_equal(trial["true_target"], [90.0, 0.0, 0.0])
 
@@ -1110,7 +1144,8 @@ class RouteValidityTests(unittest.TestCase):
             return np.array([93.0, 0.0, 0.0]) if elapsed >= 1.1 - 1e-9 else position.copy()
 
         with patch("experiments.ApplyBias", side_effect=ReportArrival):
-            trial = RunTrial(tracking="raw", tool_noise=0.0, target_noise=0.0)
+            trial = RunTrial(tracking="raw", tool_noise=0.0, target_noise=0.0,
+                             planning_time_limit=30.0)
         self.assertEqual(trial["status"], "replan_required")
         self.assertAlmostEqual(trial["elapsed_time"], 1.6)
         self.assertFalse(trial["reported_arrival"])
@@ -1144,10 +1179,10 @@ class RouteValidityTests(unittest.TestCase):
 
         for mode in ("conventional", "prox_aware", "uncert_aware"):
             baseline = RunTrial(tracking="ideal", mode=mode, tool_noise=0.0,
-                                target_noise=0.0, duration=2.0)
+                                target_noise=0.0, duration=2.0, planning_time_limit=30.0)
             with self.subTest(mode=mode), patch("experiments.ApplyBias", side_effect=OffsetTool):
                 trial = RunTrial(tracking="ideal", mode=mode, tool_noise=0.0,
-                                 target_noise=0.0, duration=2.0)
+                                 target_noise=0.0, duration=2.0, planning_time_limit=30.0)
             self.assertEqual(trial["status"], "timeout")
             self.assertAlmostEqual(trial["elapsed_time"], 2.0)
             self.assertAlmostEqual(trial["travel"], baseline["travel"])
@@ -1169,10 +1204,10 @@ class RouteValidityTests(unittest.TestCase):
             return measured
 
         before_change = RunTrial(tracking="ideal", mode="uncert_aware", tool_noise=0.0,
-                                 target_noise=0.0, duration=1.08)
+                                 target_noise=0.0, duration=1.08, planning_time_limit=30.0)
         with patch("experiments.ApplyBias", side_effect=OffsetTool):
             trial = RunTrial(tracking="ideal", mode="uncert_aware", tool_noise=0.0,
-                             target_noise=0.0)
+                             target_noise=0.0, planning_time_limit=30.0)
         self.assertEqual(trial["status"], "replan_required")
         self.assertAlmostEqual(trial["elapsed_time"], 1.6)
         self.assertAlmostEqual(trial["travel"], before_change["travel"])
@@ -1197,10 +1232,10 @@ class RouteValidityTests(unittest.TestCase):
             return measured
 
         baseline = RunTrial(tracking="ideal", mode="uncert_aware", tool_noise=0.0,
-                            target_noise=0.0, duration=2.0)
+                            target_noise=0.0, duration=2.0, planning_time_limit=30.0)
         with patch("experiments.ApplyBias", side_effect=OffsetTool):
             trial = RunTrial(tracking="ideal", mode="uncert_aware", tool_noise=0.0,
-                             target_noise=0.0, duration=2.0)
+                             target_noise=0.0, duration=2.0, planning_time_limit=30.0)
         self.assertEqual(trial["status"], "timeout")
         self.assertGreater(trial["travel"], 0.0)
         self.assertLess(trial["travel"], baseline["travel"])
@@ -1222,10 +1257,10 @@ class RouteValidityTests(unittest.TestCase):
 
         with patch.dict(SCENARIOS, {"Direct insertion": scene}):
             baseline = RunTrial(tracking="ideal", mode="uncert_aware", tool_noise=0.0,
-                                target_noise=0.0)
+                                target_noise=0.0, planning_time_limit=30.0)
             with patch("experiments.ApplyBias", side_effect=OffsetReading):
                 trial = RunTrial(tracking="ideal", mode="uncert_aware", tool_noise=0.0,
-                                 target_noise=0.0)
+                                 target_noise=0.0, planning_time_limit=30.0)
         self.assertTrue(baseline["success"])
         self.assertEqual(len(trial["plan"]["path"]), 1)
         self.assertEqual(trial["status"], "replan_required")
@@ -1247,7 +1282,7 @@ class RouteValidityTests(unittest.TestCase):
                 side_effect=lambda amplitude, frequency, elapsed:
                     (3.0 if 1.1 - 1e-9 <= elapsed < 1.6 - 1e-9 else 0.0, 0.0)):
             trial = RunTrial(tracking="ideal", mode="uncert_aware",
-                             tool_noise=0.0, target_noise=0.0)
+                             tool_noise=0.0, target_noise=0.0, planning_time_limit=30.0)
         self.assertEqual(trial["status"], "replan_required")
         self.assertAlmostEqual(trial["elapsed_time"], 2.1)
         self.assertFalse(trial["reported_arrival"])
