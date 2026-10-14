@@ -93,7 +93,7 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
     configuration = scene["start"].copy()
     port = np.zeros(3)
     target_origin = tip_position(port, *scene["target_configuration"])
-    structure_centre, structure_radius = scene["structure_centre"], scene["structure_radius"]
+    structure_points, structure_radius = scene["structure_points"], scene["structure_radius"]
     tool_radius, required_clearance, target_tolerance = 1.5, 2.0, 2.0
     lower_limits = np.array([np.deg2rad(-45), np.deg2rad(-35), 10.0])
     upper_limits = np.array([np.deg2rad(45), np.deg2rad(35), 110.0])
@@ -127,7 +127,7 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
     pending_reason, pending_since = None, None
     elapsed_time, previous_time, travel = 0.0, 0.0, 0.0
     minimum_clearance = shaft_clearance(port, tip_position(port, *configuration),
-                                        tool_radius, structure_centre, structure_radius)
+                                        tool_radius, structure_points, structure_radius)
     execution_clearance = required_clearance
     route_clearance_valid = True
     status, reported_arrival = "timeout", False
@@ -208,7 +208,7 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
                         tool_covariance = filters[0].covariance[:3, :3].copy()
                     # pauses the simulation clock during planning + keeps the route frozen
                     plan = find_path(configuration, planned_target, port, tool_radius,
-                                     structure_centre, structure_radius, lower_limits, upper_limits,
+                                     structure_points, structure_radius, lower_limits, upper_limits,
                                      required_clearance, target_tolerance,
                                      max_expansions=max_expansions, time_limit=planning_time_limit,
                                      cancel_event=cancel_event,
@@ -238,7 +238,7 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
                     route_clearance_valid = (execution_clearance <= plan["required_clearance"]
                                              or CheckRemainingRoute(
                                                  port, configuration, plan["path"], route_index,
-                                                 tool_radius, structure_centre, structure_radius,
+                                                 tool_radius, structure_points, structure_radius,
                                                  execution_clearance))
                     if not route_clearance_valid and route_reason is None:
                         route_reason = "uncertainty"
@@ -257,7 +257,7 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
                 if recovery_samples >= 2:
                     usable = route_reason is None and CheckRemainingRoute(
                         port, configuration, plan["path"], route_index, tool_radius,
-                        structure_centre, structure_radius, execution_clearance)
+                        structure_points, structure_radius, execution_clearance)
                     if not usable:
                         status = "replan_required"
                         break
@@ -305,7 +305,7 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
             proposed = configuration + fraction * remaining
             clearances = []
             if not movement_is_clear(port, configuration, proposed, tool_radius,
-                                     structure_centre, structure_radius,
+                                     structure_points, structure_radius,
                                      execution_clearance, clearance_samples=clearances):
                 status = "movement_blocked"
                 break
@@ -319,7 +319,7 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
                 longest_tip = tip_position(port, proposed[0], proposed[1],
                                            max(configuration[2], proposed[2]))
                 edge_clearance = shaft_clearance(port, longest_tip, tool_radius,
-                                                  structure_centre, structure_radius)
+                                                  structure_points, structure_radius)
             minimum_clearance = min(minimum_clearance, edge_clearance)
             configuration = proposed
             if fraction == 1.0:

@@ -50,7 +50,7 @@ def reconstruct(parents, node):
     return path[::-1]
 
 
-def find_path(start, target, port, tool_radius, structure_centre, structure_radius,
+def find_path(start, target, port, tool_radius, structure_points, structure_radius,
               lower_limits, upper_limits, required_clearance=2.0, target_tolerance=2.0,
               grid_step=None, max_expansions=10000, time_limit=5.0, cancel_event=None,
               include_target=False, mode="conventional", proximity_weight=1.0,
@@ -59,15 +59,19 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
     # searches yaw, pitch + insertion; angles use radians, distances use mm
     started = perf_counter()
     expanded = 0
-    start, target, port, structure_centre, lower_limits, upper_limits = (
+    start, target, port, structure_points, lower_limits, upper_limits = (
         np.asarray(value, dtype=float) for value in
-        (start, target, port, structure_centre, lower_limits, upper_limits))
+        (start, target, port, structure_points, lower_limits, upper_limits))
     if grid_step is None:
         grid_step = [np.deg2rad(5), np.deg2rad(5), 5.0]
     grid_step = np.asarray(grid_step, dtype=float)
-    vectors = (start, target, port, structure_centre, lower_limits, upper_limits, grid_step)
+    vectors = (start, target, port, lower_limits, upper_limits, grid_step)
     if any(value.shape != (3,) or not np.all(np.isfinite(value)) for value in vectors):
         raise ValueError("Expected three finite values.")
+    if (not np.all(np.isfinite(structure_points))
+            or (structure_points.shape != (3,) and (structure_points.ndim != 2
+                or structure_points.shape[1] != 3 or len(structure_points) < 2))):
+        raise ValueError("Invalid structure points.")
     scalars = [tool_radius, structure_radius, required_clearance, target_tolerance, time_limit,
                proximity_weight, clearance_scale, uncertainty_scale]
     if (not np.all(np.isfinite(scalars)) or min(scalars) < 0
@@ -98,7 +102,7 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
             length, penalty, minimum_clearance = float(np.sum(edge_lengths)), 0.0, start_clearance
             for first, second, travel in zip(path, path[1:], edge_lengths):
                 clearances = []
-                movement_is_clear(port, first, second, tool_radius, structure_centre,
+                movement_is_clear(port, first, second, tool_radius, structure_points,
                                   structure_radius, required_clearance,
                                   clearance_samples=clearances)
                 penalty += get_clearance_penalty(clearances, travel, base_clearance,
@@ -111,9 +115,9 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
                 else:
                     tip = tip_position(port, first[0], first[1], max(first[2], second[2]))
                     edge_clearance = shaft_clearance(port, tip, tool_radius,
-                                                      structure_centre, structure_radius)
+                                                      structure_points, structure_radius)
                 endpoint_clearance = shaft_clearance(port, tip_position(port, *second),
-                                                     tool_radius, structure_centre,
+                                                     tool_radius, structure_points,
                                                      structure_radius)
                 minimum_clearance = min(minimum_clearance, edge_clearance, endpoint_clearance)
         return {"status": status, "path": path, "cost": cost,
@@ -128,7 +132,7 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
     if np.any(start < lower_limits) or np.any(start > upper_limits):
         return finish("invalid_start")
     start_tip = tip_position(port, *start)
-    start_clearance = shaft_clearance(port, start_tip, tool_radius, structure_centre,
+    start_clearance = shaft_clearance(port, start_tip, tool_radius, structure_points,
                                       structure_radius)
     if start_clearance < base_clearance:
         return finish("invalid_start")
@@ -155,7 +159,7 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
     closest_configuration = np.array([best_yaw, best_pitch, depth])
     closest_distance = np.linalg.norm(tip_position(port, *closest_configuration) - target)
     target_clearance = shaft_clearance(port, target, tool_radius,
-                                       structure_centre, structure_radius)
+                                       structure_points, structure_radius)
     # rejects a target only when its entire tolerance region is infeasible
     if (closest_distance > target_tolerance + 1e-9
             or target_clearance + target_tolerance < required_clearance):
@@ -190,14 +194,19 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
     distances = np.linalg.norm(tips - target, axis=-1)
     # uses straight-line distance to the target region as a lower bound on travel
     heuristic = np.maximum(0.0, distances - target_tolerance - 1e-9)
-    valid_nodes = {}
-    goals = set()
-    for indices in np.argwhere(distances <= target_tolerance + 1e-9):
-        node = tuple(indices)
-        valid_nodes[node] = shaft_clearance(port, tips[node], tool_radius,
-                                            structure_centre, structure_radius) >= required_clearance
-        if valid_nodes[node]:
-            goals.add(node)
+    # checks grid shafts in batches so vessel checks reuse NumPy operations
+    valid_nodes = np.empty(distances.shape, dtype=bool)
+    flat_tips, flat_valid = tips.reshape(-1, 3), valid_nodes.ravel()
+    for first in range(0, len(flat_tips), 2048):
+        if cancel_event is not None and cancel_event.is_set():
+            return finish("cancelled")
+        if perf_counter() - started >= time_limit:
+            return finish("budget_exceeded")
+        flat_valid[first:first + 2048] = shaft_clearance(
+            port, flat_tips[first:first + 2048], tool_radius,
+            structure_points, structure_radius) >= required_clearance
+    goals = {tuple(indices) for indices in np.argwhere(
+        valid_nodes & (distances <= target_tolerance + 1e-9))}
     if not goals:
         return finish("no_grid_goal")
 
@@ -224,10 +233,6 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
         for neighbour in get_neighbours(node, distances.shape):
             if neighbour in visited:
                 continue
-            if neighbour not in valid_nodes:
-                valid_nodes[neighbour] = shaft_clearance(
-                    port, tips[neighbour], tool_radius,
-                    structure_centre, structure_radius) >= required_clearance
             if not valid_nodes[neighbour]:
                 continue
             proposed = configurations[neighbour]
@@ -242,7 +247,7 @@ def find_path(start, target, port, tool_radius, structure_centre, structure_radi
                 continue
             clearances = [] if mode != "conventional" and proximity_weight > 0 else None
             if not movement_is_clear(port, configuration, proposed, tool_radius,
-                                     structure_centre, structure_radius, required_clearance,
+                                     structure_points, structure_radius, required_clearance,
                                      clearance_samples=clearances):
                 continue
             candidate_cost = cost + travel

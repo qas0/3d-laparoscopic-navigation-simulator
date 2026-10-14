@@ -12,7 +12,7 @@ class PlanningTests(unittest.TestCase):
     def setUp(self):
         self.settings = {
             "target": np.array([90.0, 0.0, 0.0]), "port": np.zeros(3),
-            "tool_radius": 1.5, "structure_centre": np.array([65.0, 11.0, 0.0]),
+            "tool_radius": 1.5, "structure_points": np.array([65.0, 11.0, 0.0]),
             "structure_radius": 6.0,
             "lower_limits": np.array([np.deg2rad(-45), np.deg2rad(-35), 10.0]),
             "upper_limits": np.array([np.deg2rad(45), np.deg2rad(35), 110.0]),
@@ -27,19 +27,19 @@ class PlanningTests(unittest.TestCase):
                               settings.get("target_tolerance", 2.0) + 1e-9)
         sampled_clearance = shaft_clearance(
             settings["port"], tip_position(settings["port"], *path[0]),
-            settings["tool_radius"], settings["structure_centre"], settings["structure_radius"])
+            settings["tool_radius"], settings["structure_points"], settings["structure_radius"])
         required_clearance = result["required_clearance"]
         for first, second in zip(path, path[1:]):
             self.assertEqual(np.count_nonzero(abs(second - first) > 1e-12), 1)
             self.assertTrue(movement_is_clear(
                 settings["port"], first, second, settings["tool_radius"],
-                settings["structure_centre"], settings["structure_radius"],
+                settings["structure_points"], settings["structure_radius"],
                 required_clearance))
             for fraction in np.linspace(0, 1, 41):
                 tip = tip_position(settings["port"], *(first + fraction * (second - first)))
                 clearance = shaft_clearance(
                     settings["port"], tip, settings["tool_radius"],
-                    settings["structure_centre"], settings["structure_radius"])
+                    settings["structure_points"], settings["structure_radius"])
                 sampled_clearance = min(sampled_clearance, clearance)
                 self.assertGreaterEqual(clearance, required_clearance - 1e-9)
         self.assertGreaterEqual(result["minimum_clearance"], required_clearance - 1e-9)
@@ -50,7 +50,7 @@ class PlanningTests(unittest.TestCase):
         scenario = SCENARIOS[name]
         settings = dict(self.settings,
                         target=tip_position(self.settings["port"], *scenario["target_configuration"]),
-                        structure_centre=scenario["structure_centre"].copy(),
+                        structure_points=scenario["structure_points"].copy(),
                         structure_radius=scenario["structure_radius"])
         return scenario["start"].copy(), settings
 
@@ -69,7 +69,7 @@ class PlanningTests(unittest.TestCase):
 
     def test_retraction_route_matches_shortest_discrete_cost(self):
         settings = dict(self.settings, tool_radius=1.0, structure_radius=3.0,
-                        structure_centre=np.array([30.0, 0.0, 0.0]),
+                        structure_points=np.array([30.0, 0.0, 0.0]),
                         lower_limits=np.array([np.deg2rad(-20), 0, 10.0]),
                         upper_limits=np.array([np.deg2rad(20), 0, 40.0]),
                         grid_step=np.array([np.deg2rad(10), np.deg2rad(5), 10.0]),
@@ -84,7 +84,7 @@ class PlanningTests(unittest.TestCase):
 
     def test_clear_endpoints_do_not_allow_a_shaft_sweep_through_an_obstacle(self):
         settings = dict(self.settings, tool_radius=1.0, structure_radius=3.0,
-                        structure_centre=np.array([50.0, 0.0, 0.0]),
+                        structure_points=np.array([50.0, 0.0, 0.0]),
                         lower_limits=np.array([-0.3, 0, 100.0]),
                         upper_limits=np.array([0.3, 0, 100.0]),
                         grid_step=np.array([0.6, 0.1, 5.0]), required_clearance=0.0)
@@ -99,7 +99,7 @@ class PlanningTests(unittest.TestCase):
         goal = SCENARIOS["3D detour"]["target_configuration"]
         self.assertFalse(movement_is_clear(
             settings["port"], start, goal, settings["tool_radius"],
-            settings["structure_centre"], settings["structure_radius"], 2.0))
+            settings["structure_points"], settings["structure_radius"], 2.0))
         result = find_path(start=start, **settings)
         self.check_route(result, start, settings)
         self.assertTrue(np.any(abs(result["path"][:, 1]) > 1e-9))
@@ -156,7 +156,7 @@ class PlanningTests(unittest.TestCase):
 
     def test_proximity_cost_never_allows_a_blocked_shaft_sweep(self):
         settings = dict(self.settings, tool_radius=1.0, structure_radius=3.0,
-                        structure_centre=np.array([50.0, 0.0, 0.0]),
+                        structure_points=np.array([50.0, 0.0, 0.0]),
                         lower_limits=np.array([-0.3, 0, 100.0]),
                         upper_limits=np.array([0.3, 0, 100.0]),
                         grid_step=np.array([0.6, 0.1, 5.0]))
@@ -205,7 +205,7 @@ class PlanningTests(unittest.TestCase):
 
     def test_uncertainty_margin_is_enforced_throughout_the_shaft_sweep(self):
         settings = dict(self.settings, tool_radius=1.0, structure_radius=3.0,
-                        structure_centre=np.array([30.0, 0.0, 0.0]),
+                        structure_points=np.array([30.0, 0.0, 0.0]),
                         lower_limits=np.array([np.deg2rad(-20), 0, 10.0]),
                         upper_limits=np.array([np.deg2rad(20), 0, 40.0]),
                         grid_step=np.array([np.deg2rad(10), np.deg2rad(5), 10.0]),
@@ -266,31 +266,59 @@ class PlanningTests(unittest.TestCase):
                 self.assertTrue(np.all(start <= settings["upper_limits"]))
                 self.assertGreaterEqual(shaft_clearance(
                     settings["port"], tip_position(settings["port"], *start),
-                    settings["tool_radius"], settings["structure_centre"],
+                    settings["tool_radius"], settings["structure_points"],
                     settings["structure_radius"]), 2.0)
 
     def test_retraction_preset_requires_depth_change_with_full_pitch_range(self):
         start, settings = self.scenario_settings("Retraction required")
-        maximum_pitch = max(abs(settings["lower_limits"][1]), abs(settings["upper_limits"][1]))
         # checks that every allowed pitch remains blocked at yaw zero while fully inserted
-        maximum_clearance = (settings["structure_centre"][0] * np.sin(maximum_pitch)
-                             - settings["structure_radius"] - settings["tool_radius"])
-        self.assertLess(maximum_clearance, 2.0)
+        pitches = np.linspace(settings["lower_limits"][1], settings["upper_limits"][1], 141)
+        tips = np.array([tip_position(settings["port"], 0.0, pitch, start[2])
+                         for pitch in pitches])
+        clearances = shaft_clearance(settings["port"], tips, settings["tool_radius"],
+                                    settings["structure_points"], settings["structure_radius"])
+        self.assertLess(np.max(clearances), 2.0)
         result = find_path(start=start, **settings)
         self.check_route(result, start, settings)
-        self.assertLessEqual(min(result["path"][:, 2]), 20.0)
+        self.assertLessEqual(min(result["path"][:, 2]), 55.0)
 
     def test_inaccessible_preset_has_a_clear_tip_but_an_obstructed_final_shaft(self):
         start, settings = self.scenario_settings("Inaccessible target")
-        tip_clearance = (np.linalg.norm(settings["target"] - settings["structure_centre"])
-                         - settings["structure_radius"] - settings["tool_radius"])
+        tip_clearance = shaft_clearance(settings["target"], settings["target"],
+                                       settings["tool_radius"], settings["structure_points"],
+                                       settings["structure_radius"])
         self.assertGreater(tip_clearance, 2.0)
         result = find_path(start=start, **settings)
         self.assertEqual(result["status"], "invalid_target")
         self.assertIsNone(result["path"])
 
+    def test_VesselScenariosRetainClearSweptRoutesForEveryMethod(self):
+        for name in ("3D detour", "Direct insertion", "Retraction required"):
+            start, settings = self.scenario_settings(name)
+            for mode in ("conventional", "prox_aware", "uncert_aware"):
+                with self.subTest(scenario=name, mode=mode):
+                    result = find_path(start=start, mode=mode, tool_offset=np.zeros(3),
+                                       tool_covariance=np.eye(3) * 0.25, **settings)
+                    self.check_route(result, start, settings)
+                    if name == "3D detour":
+                        self.assertTrue(np.any(abs(result["path"][:, 1]) > 1e-9))
+                    elif name == "Direct insertion" and mode == "conventional":
+                        np.testing.assert_array_equal(result["path"][:, :2],
+                                                      np.zeros((len(result["path"]), 2)))
+                    elif name == "Retraction required":
+                        self.assertLessEqual(np.min(result["path"][:, 2]), 55.0)
+
+    def test_VesselAcrossTheFinalShaftBlocksEveryMethodDespiteAClearTarget(self):
+        start, settings = self.scenario_settings("Inaccessible target")
+        for mode in ("conventional", "prox_aware", "uncert_aware"):
+            with self.subTest(mode=mode):
+                result = find_path(start=start, mode=mode, tool_offset=np.zeros(3),
+                                   tool_covariance=np.eye(3) * 0.25, **settings)
+                self.assertEqual(result["status"], "invalid_target")
+                self.assertIsNone(result["path"])
+
     def test_coarse_grid_failure_is_distinct_from_an_invalid_target(self):
-        settings = dict(self.settings, structure_centre=np.array([500.0, 500.0, 500.0]),
+        settings = dict(self.settings, structure_points=np.array([500.0, 500.0, 500.0]),
                         target_tolerance=0.2)
         settings["target"] = tip_position(settings["port"], np.deg2rad(2.5), 0, 90.0)
         result = find_path(start=[0, 0, 35], **settings)
@@ -315,7 +343,7 @@ class PlanningTests(unittest.TestCase):
 
     def test_optional_target_insertion_handles_an_exact_off_grid_goal(self):
         settings = dict(self.settings, target_tolerance=0.0,
-                        structure_centre=np.array([500.0, 500.0, 500.0]))
+                        structure_points=np.array([500.0, 500.0, 500.0]))
         configuration = np.array([np.deg2rad(-1.3), np.deg2rad(0.7), 91.4])
         settings["target"] = tip_position(settings["port"], *configuration)
         start = np.array([0.0, 0.0, 35.0])
@@ -339,7 +367,7 @@ class PlanningTests(unittest.TestCase):
     def test_optional_target_insertion_still_rejects_infeasible_goals(self):
         start = np.array([0.0, 0.0, 35.0])
         for changes in [{"target": np.array([200.0, 0.0, 0.0])},
-                        {"structure_centre": np.array([65.0, 0.0, 0.0])}]:
+                        {"structure_points": np.array([65.0, 0.0, 0.0])}]:
             with self.subTest(changes=changes):
                 result = find_path(start=start, include_target=True,
                                    **dict(self.settings, **changes))
@@ -348,14 +376,14 @@ class PlanningTests(unittest.TestCase):
 
     def test_optional_target_insertion_does_not_skip_a_blocked_sweep(self):
         settings = dict(self.settings, tool_radius=1.0, structure_radius=3.0,
-                        structure_centre=np.array([50.0, 0.0, 0.0]),
+                        structure_points=np.array([50.0, 0.0, 0.0]),
                         lower_limits=np.array([-0.3, 0, 100.0]),
                         upper_limits=np.array([0.3, 0, 100.0]),
                         grid_step=np.array([0.6, 0.1, 5.0]), required_clearance=0.0)
         start = np.array([-0.3, 0, 100.0])
         settings["target"] = tip_position(settings["port"], 0.27, 0, 100.0)
         self.assertGreater(shaft_clearance(settings["port"], settings["target"],
-                                          settings["tool_radius"], settings["structure_centre"],
+                                          settings["tool_radius"], settings["structure_points"],
                                           settings["structure_radius"]), 0)
         result = find_path(start=start, include_target=True, **settings)
         self.assertEqual(result["status"], "no_path")
@@ -372,7 +400,7 @@ class PlanningTests(unittest.TestCase):
         result = find_path(start=[np.deg2rad(10), 0, 90], **self.settings)
         self.assertEqual(result["status"], "invalid_start")
         result = find_path(start=[0, 0, 35],
-                           **dict(self.settings, structure_centre=np.array([65.0, 0, 0])))
+                           **dict(self.settings, structure_points=np.array([65.0, 0, 0])))
         self.assertEqual(result["status"], "invalid_target")
 
     def test_budget_and_cancellation_are_not_reported_as_no_path(self):

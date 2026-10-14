@@ -17,11 +17,12 @@ from PySide6.QtWidgets import (
     QTabWidget, QVBoxLayout, QWidget,
 )
 from pyvistaqt import QtInteractor
+from vtkmodules.vtkInteractionStyle import vtkInteractorStyleUser
 
 from astar import find_path, get_uncertainty_margin
 from experiments import RunStudyWorker
 from feedback import GetRouteGuidance, get_target_feedback
-from geometry import CheckRemainingRoute, movement_is_clear, shaft_clearance, tip_position
+from geometry import CheckRemainingRoute, InstrumentRotation, movement_is_clear, shaft_clearance, tip_position
 from kalman import KalmanFilter
 from motion import GetRespiratoryMotion
 from scenarios import SCENARIOS
@@ -40,6 +41,19 @@ class SimulatorWindow(QMainWindow):
         self.setMinimumSize(1000, 650)
 
         self.port = np.zeros(3)
+        # places the wall horizontally + maps insertion down into the body
+        self.scene_rotation = np.array([[0.0, 1.0, 0.0],
+                                        [0.0, 0.0, -1.0],
+                                        [-1.0, 0.0, 0.0]])
+        self.scene_matrix = np.eye(4)
+        self.scene_matrix[:3, :3] = self.scene_rotation
+        self.wall_bounds = (0.0, 2.0, -86.0, 30.0, -25.0, 45.0)
+        self.wall_opening_radius = 6.0
+        self.scope_port = self.port + np.array([0.0, -70.0, 30.0])
+        self.scope_radius = 2.5
+        self.scope_depth = 20.0
+        self.scope_length = 135.0
+        self.scope_opening_radius = 4.5
         self.tool_radius = 1.5
         self.shaft_length = 135.0
         self.jaw_length = 13.0
@@ -52,7 +66,12 @@ class SimulatorWindow(QMainWindow):
         self.route_clearance_valid = True
         self.lower_limits = np.array([np.deg2rad(-45), np.deg2rad(-35), 10.0])
         self.upper_limits = np.array([np.deg2rad(45), np.deg2rad(35), 110.0])
+        # keeps the scope inside its opening + clear of the grasper's movement envelope
+        self.camera_lower_limits = np.array([np.deg2rad(-3), np.deg2rad(-3), self.scope_depth])
+        self.camera_upper_limits = np.array([np.deg2rad(3), np.deg2rad(3), 40.0])
         self.speed_limits = np.array([np.deg2rad(20), np.deg2rad(20), 15.0])
+        self.camera_speed_limits = self.speed_limits.copy()
+        self.camera_speed_limits[:2] = np.deg2rad(3)
         self.target_tolerance = 2.0
         self.arrival_dwell = 0.5
         self.tracking_timeout = 0.25
@@ -166,9 +185,9 @@ class SimulatorWindow(QMainWindow):
         selectors.addRow("Guidance", self.navigation_mode_combo)
         control_layout.addLayout(selectors)
 
-        instrument_group = QGroupBox("Instrument commands")
-        instrument_group.setMinimumHeight(150)
-        instrument_layout = QVBoxLayout(instrument_group)
+        self.instrument_group = QGroupBox("Instrument commands")
+        self.instrument_group.setMinimumHeight(150)
+        instrument_layout = QVBoxLayout(self.instrument_group)
         instrument_layout.setSpacing(4)
         self.sliders = []
         self.command_labels = []
@@ -180,16 +199,15 @@ class SimulatorWindow(QMainWindow):
             label = QLabel(f"{name}: {value:.1f} {unit}")
             slider = QSlider(Qt.Orientation.Horizontal, minimum=minimum * 10,
                              maximum=maximum * 10, value=value * 10)
-            slider.setToolTip(f"Command {name.lower()}; actual position appears below.")
             slider.valueChanged.connect(lambda _, axis=index: self.set_command(axis))
             instrument_layout.addWidget(label)
             instrument_layout.addWidget(slider)
             self.command_labels.append(label)
             self.sliders.append(slider)
-        keyboard_help = QLabel("W / S  Insert / retract\nA / D  Yaw · Q / E  Pitch", wordWrap=True)
-        keyboard_help.setStyleSheet("font-size: 9pt; color: #62788c;")
-        instrument_layout.addWidget(keyboard_help)
-        control_layout.addWidget(instrument_group)
+        self.keyboard_help = QLabel("W / S  Insert / retract\nA / D  Yaw · Q / E  Pitch", wordWrap=True)
+        self.keyboard_help.setStyleSheet("font-size: 9pt; color: #62788c;")
+        instrument_layout.addWidget(self.keyboard_help)
+        control_layout.addWidget(self.instrument_group)
 
         planning_group = QGroupBox("A* navigation")
         planning_layout = QVBoxLayout(planning_group)
@@ -239,7 +257,7 @@ class SimulatorWindow(QMainWindow):
         self.route_result_label.setToolTip("Tip-to-guide distance uses the selected tracking source + the displayed tip polyline. It does not check shaft clearance or prove that the instrument follows the planned configurations. Tracking changes must persist for 0.5 s before a replan warning stays visible.")
 
         self.pause_button = QPushButton("Pause movement", checkable=True)
-        self.pause_button.setToolTip("Pauses the instrument; anatomy + sensors continue.")
+        self.pause_button.setToolTip("Pauses movement; anatomy + sensors continue.")
         self.pause_button.toggled.connect(self.set_paused)
         self.reset_button = QPushButton("Reset instrument")
         self.reset_button.setToolTip("Places the instrument at a different random starting position.")
@@ -516,12 +534,12 @@ class SimulatorWindow(QMainWindow):
         self.labels_checkbox.toggled.connect(self.toggle_labels)
         scene_toolbar.addWidget(self.labels_checkbox)
         self.view_combo = QComboBox()
-        self.view_combo.setToolTip("Perspective for the task; Overview includes the full instrument movement range.")
-        self.view_combo.addItems(["Perspective", "Top", "Front", "Overview"])
+        self.view_combo.setToolTip("Camera view moves the laparoscope with the movement keys + sliders.")
+        self.view_combo.addItems(["Perspective", "Camera view", "Top", "Front", "Overview"])
         self.view_combo.currentIndexChanged.connect(self.reset_camera)
         scene_toolbar.addWidget(self.view_combo)
-        view_button = QPushButton("Fit view")
-        view_button.clicked.connect(self.reset_camera)
+        view_button = QPushButton("Reset view")
+        view_button.clicked.connect(lambda: self.reset_camera())
         scene_toolbar.addWidget(view_button)
         scene_layout.addLayout(scene_toolbar)
         self.guidance_card = QFrame()
@@ -549,8 +567,10 @@ class SimulatorWindow(QMainWindow):
         self.viewport.set_background("#edf2f6", top="#fafcfd")
         self.viewport.enable_anti_aliasing("fxaa")
         scene_key = QLabel('<span style="color:#d59420">●</span> Tool tip &nbsp; '
+                           '<span style="color:#9eadb7">━</span> Laparoscope &nbsp; '
                            '<span style="color:#925c53">●</span> Target &nbsp; '
-                           '<span style="color:#bc4046">●</span> Protected structure &nbsp; '
+                           '<span style="color:#bc4046">━</span> Blood vessel &nbsp; '
+                           '<span style="color:#dbad98">●</span> Body wall &nbsp; '
                            '<span style="color:#7757b5">━</span> Route', wordWrap=True)
         scene_key.setStyleSheet("background: white; padding: 8px 12px; font-size: 9pt;")
         scene_layout.addWidget(scene_key)
@@ -592,6 +612,8 @@ class SimulatorWindow(QMainWindow):
         self.timer.timeout.connect(self.advance_movement)
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.start(16)
+        # refits once Qt has assigned the viewport dimensions
+        QTimer.singleShot(0, lambda: self.reset_camera(self.view_combo.currentIndex()))
 
     def create_control_tab(self, title):
         panel = QFrame(objectName="controls")
@@ -672,29 +694,25 @@ class SimulatorWindow(QMainWindow):
         self.configuration = scenario["start"].copy()
         self.rest_target = tip_position(self.port, *scenario["target_configuration"])
         self.target = self.rest_target.copy()
+        # sets the laparoscope's resting direction at its separate fixed port
+        self.scope_direction = self.rest_target + [8.0, 0.0, 0.0] - self.scope_port
+        self.scope_direction /= np.linalg.norm(self.scope_direction)
+        right = np.cross(self.scope_direction, [0.0, 0.0, 1.0])
+        right /= np.linalg.norm(right)
+        self.scope_matrix = np.eye(4)
+        self.scope_matrix[:3, :3] = np.column_stack((self.scope_direction, -right,
+                                                  np.cross(right, self.scope_direction)))
+        self.scope_matrix[:3, 3] = self.scope_port
+        self.camera_configuration = np.array([0.0, 0.0, self.scope_depth])
+        self.camera_command = self.camera_configuration.copy()
+        self.scope_tip = self.scene_rotation @ (
+            self.scope_port + self.scope_depth * self.scope_direction)
         self.motion_started_time = None
-        self.structure_centre = scenario["structure_centre"].copy()
+        self.structure_points = scenario["structure_points"].copy()
         self.structure_radius = scenario["structure_radius"]
         # places the target on the near surface of the reference ellipsoid
         self.rest_organ_centre = self.rest_target + np.array([20.0, 0.0, 0.0])
         self.organ_centre = self.rest_organ_centre.copy()
-        motion_bounds = np.array([0.0, 0.0, self.motion_amplitude.value()])
-        direction = (tip_position(self.port, *self.configuration) - self.port) / self.configuration[2]
-        handle_start = self.port - (self.shaft_length - self.configuration[2]) * direction
-        handle_end = handle_start - 34 * direction
-        handle_width = 27 * np.sqrt(np.maximum(0, 1 - direction ** 2))
-        reference_points = np.array([
-            handle_end - handle_width, handle_end + handle_width,
-            handle_start - handle_width, handle_start + handle_width,
-            self.port, tip_position(self.port, *self.configuration),
-            self.organ_centre - [20, 26, 22] - motion_bounds,
-            self.organ_centre + [20, 26, 22] + motion_bounds,
-            self.structure_centre - self.structure_radius,
-            self.structure_centre + self.structure_radius,
-        ])
-        self.scene_bounds = tuple(value for pair in zip(reference_points.min(axis=0) - 8,
-                                                       reference_points.max(axis=0) + 8)
-                                  for value in pair)
         self.stop_path()
         self.pressed_keys.clear()
         self.pause_button.setChecked(False)
@@ -702,6 +720,7 @@ class SimulatorWindow(QMainWindow):
         self.viewport.clear()
         self.build_scene()
         self.update_instrument()
+        self.reset_camera()
         self.reset_measurements()
         self.message_label.setText(f"{self.scenario_name} loaded. Plan a route or use manual controls.")
         self.UpdateGuidanceCard()
@@ -710,7 +729,7 @@ class SimulatorWindow(QMainWindow):
         self.viewport.enable_lightkit()
         self.viewport.add_light(pv.Light(light_type="headlight", intensity=0.3))
         organ = pv.Sphere(radius=1, theta_resolution=96, phi_resolution=73)
-        organ.points = organ.points * np.array([20, 26, 22]) + self.organ_centr
+        organ.points = organ.points * np.array([20, 26, 22]) + self.organ_centre
         offset = organ.points - self.target
         angle = np.arctan2(offset[:, 2], offset[:, 1])
         radius = 4 * (1 + 0.1 * np.sin(3 * angle) + 0.06 * np.cos(5 * angle))
@@ -722,13 +741,92 @@ class SimulatorWindow(QMainWindow):
         self.organ_actor = self.viewport.add_mesh(
             organ, scalars="colour", rgb=True, show_scalar_bar=False,
             smooth_shading=True, ambient=0.15, specular=0.12, specular_power=20)
-        self.viewport.add_mesh(pv.Sphere(radius=self.structure_radius, center=self.structure_centre),
-                               color="#bc4046", smooth_shading=True, ambient=0.15, specular=0.15)
-        margin = pv.Sphere(radius=self.structure_radius + self.required_clearance,
-                           center=self.structure_centre, theta_resolution=48, phi_resolution=32)
+        # matches each vessel section to the rounded segment used for clearance
+        vessel_parts = []
+        for first, second in zip(self.structure_points, self.structure_points[1:]):
+            direction = second - first
+            section = pv.Capsule(center=(first + second) / 2, direction=direction,
+                                 radius=1, cylinder_length=np.linalg.norm(direction), resolution=24)
+            projection = np.clip((section.points - first) @ direction / np.dot(direction, direction),
+                                 0.0, 1.0)
+            section.point_data["axis"] = first + projection[:, None] * direction
+            radial = section.points - section["axis"]
+            section.point_data["radial"] = radial / np.linalg.norm(radial, axis=1)[:, None]
+            vessel_parts.append(section)
+        vessel = vessel_parts[0].merge(vessel_parts[1:])
+        self.vessel_axis = vessel["axis"].copy()
+        self.vessel_radial = vessel["radial"].copy()
+        del vessel.point_data["axis"], vessel.point_data["radial"]
+        vessel.points = self.vessel_axis + self.structure_radius * self.vessel_radial
+        self.vessel_actor = self.viewport.add_mesh(
+            vessel, color="#bc4046", smooth_shading=True, ambient=0.15, specular=0.2)
+        self.margin_mesh = vessel.copy()
+        self.margin_mesh.points = self.vessel_axis + (
+            self.structure_radius + self.required_clearance) * self.vessel_radial
         self.margin_actor = self.viewport.add_mesh(
-            margin, color="#ce7a7e", opacity=0.12, smooth_shading=True)
-        self.margin_actor.SetOrigin(*self.structure_centre)
+            self.margin_mesh, color="#ce7a7e", opacity=0.045)
+        # anchors the exposed vessel in tissue inside its required clearance envelope
+        lengths = np.linalg.norm(np.diff(self.structure_points, axis=0), axis=1)
+        distances = np.r_[0.0, np.cumsum(lengths)]
+        samples = np.unique(np.r_[distances, np.linspace(
+            0.0, distances[-1], int(np.ceil(distances[-1] / 2)) + 1)])
+        centres = np.column_stack([np.interp(samples, distances, self.structure_points[:, axis])
+                                   for axis in range(3)])
+        tangents = np.gradient(centres, samples, axis=0)
+        tangents /= np.linalg.norm(tangents, axis=1)[:, None]
+        normals = centres - self.port
+        normals -= np.sum(normals * tangents, axis=1)[:, None] * tangents
+        normals /= np.linalg.norm(normals, axis=1)[:, None]
+        sides = np.cross(tangents, normals)
+        blend = np.sin(np.pi * samples / distances[-1]) ** 2
+        angles = np.linspace(0, 2 * np.pi, 24, endpoint=False)
+        fold_radius = self.structure_radius + self.required_clearance - 0.3
+        points = (centres[:, None, :] + 2 * blend[:, None, None] * normals[:, None, :]
+                  + (fold_radius - 2 * blend)[:, None, None]
+                  * np.cos(angles)[None, :, None] * normals[:, None, :]
+                  + (fold_radius - 0.8 * blend)[:, None, None]
+                  * np.sin(angles)[None, :, None] * sides[:, None, :])
+        indices = np.arange(len(centres) - 1)[:, None] * len(angles) + np.arange(len(angles))
+        next_indices = np.roll(indices, -1, axis=1)
+        faces = np.stack((np.full_like(indices, 4), indices, next_indices,
+                          next_indices + len(angles), indices + len(angles)), axis=-1)
+        fold = pv.PolyData(points.reshape(-1, 3), faces=faces.reshape(-1, 5))
+        caps = [pv.Sphere(radius=fold_radius, center=point, theta_resolution=24, phi_resolution=17)
+                for point in self.structure_points[[0, -1]]]
+        self.tissue_actor = self.viewport.add_mesh(
+            fold.merge(caps), color="#c58b82", smooth_shading=True,
+            ambient=0.2, specular=0.08, specular_power=15)
+        angles = np.linspace(0, 2 * np.pi, 64, endpoint=False)
+        points = [np.array([[self.wall_bounds[2], self.wall_bounds[4], 0.0],
+                            [self.wall_bounds[3], self.wall_bounds[4], 0.0],
+                            [self.wall_bounds[3], self.wall_bounds[5], 0.0],
+                            [self.wall_bounds[2], self.wall_bounds[5], 0.0]])]
+        faces = [np.r_[4, np.arange(4)]]
+        points.append(np.column_stack((self.wall_opening_radius * np.cos(angles),
+                                       self.wall_opening_radius * np.sin(angles),
+                                       np.zeros_like(angles))))
+        faces.append(np.r_[64, 4 + np.arange(64)[::-1]])
+        slope = self.scope_direction[1:] / self.scope_direction[0]
+        major = slope / np.linalg.norm(slope)
+        minor = np.array([-major[1], major[0]])
+        thickness = self.wall_bounds[1] - self.wall_bounds[0]
+        radius = self.scope_opening_radius + thickness / 2 * np.linalg.norm(self.scope_direction[1:])
+        centre = (self.scope_port - self.port)[1:] + np.mean(self.wall_bounds[:2]) * slope
+        opening = (centre + radius / self.scope_direction[0] * np.cos(angles)[:, None] * major
+                   + radius * np.sin(angles)[:, None] * minor)
+        points.append(np.column_stack((opening, np.zeros_like(angles))))
+        faces.append(np.r_[64, 68 + np.arange(64)[::-1]])
+        boundary = pv.PolyData(np.vstack(points), faces=np.hstack(faces))
+        wall = boundary.delaunay_2d(edge_source=boundary)
+        wall.points = wall.points[:, [2, 0, 1]] + self.port + [self.wall_bounds[0], 0, 0]
+        wall = wall.extrude((thickness, 0, 0), capping=True).compute_normals(
+            auto_orient_normals=True, consistent_normals=True, split_vertices=False)
+        face_x = wall.cell_centers().points[:, 0] - self.port[0]
+        wall.cell_data["colour"] = np.tile([161, 100, 93], (wall.n_cells, 1)).astype(np.uint8)
+        wall.cell_data["colour"][np.isclose(face_x, self.wall_bounds[0])] = [219, 173, 152]
+        wall.cell_data["colour"][np.isclose(face_x, self.wall_bounds[1])] = [189, 129, 120]
+        self.wall_actor = self.viewport.add_mesh(
+            wall, scalars="colour", rgb=True, show_scalar_bar=False, ambient=0.2, specular=0.05)
         # builds a hollow housing that pivots around the fixed entry point
         port = pv.Disc(normal=(1, 0, 0), inner=1.9, outer=3.1, c_res=48).extrude(
             (-12, 0, 0), capping=True)
@@ -737,6 +835,47 @@ class SimulatorWindow(QMainWindow):
         self.port_actor = self.viewport.add_mesh(
             port.merge(flange), color="#4c7585", smooth_shading=True,
             ambient=0.2, specular=0.3, specular_power=25)
+
+        # separates the anchored housing from sliding laparoscope
+        rear = self.scope_length - self.scope_depth
+        scope_port = pv.Disc(normal=(1, 0, 0), inner=self.scope_radius + 0.4,
+                             outer=3.9, c_res=48).extrude((-18, 0, 0), capping=True)
+        scope_flange = pv.Disc(center=(-18, 0, 0), normal=(1, 0, 0), inner=self.scope_radius + 0.4,
+                               outer=6.5, c_res=48).extrude((1.4, 0, 0), capping=True)
+        shaft = pv.Cylinder(center=((self.scope_depth - 1 - rear) / 2, 0, 0),
+                            direction=(1, 0, 0), radius=self.scope_radius,
+                            height=rear + self.scope_depth - 1, resolution=32)
+        head = pv.Capsule(center=(-rear - 6, 0, 0), direction=(1, 0, 0),
+                          radius=6.5, cylinder_length=5, resolution=24)
+        cable = pv.Spline([(-rear - 6, -6, 0), (-rear - 12, -14, -2),
+                           (-rear - 8, -30, -8), (-rear, -45, -12)], n_points=32).tube(
+                               radius=1.2, n_sides=12)
+        collar = pv.Cylinder(center=(self.scope_depth - 0.55, 0, 0), direction=(1, 0, 0),
+                             radius=self.scope_radius, height=0.9, resolution=32)
+        rim = pv.Disc(center=(self.scope_depth - 0.1, 0, 0), normal=(1, 0, 0),
+                      inner=1.65, outer=self.scope_radius, c_res=48).extrude((0.1, 0, 0), capping=True)
+        lens = pv.Disc(center=(self.scope_depth, 0, 0), normal=(1, 0, 0),
+                       inner=0, outer=1.65, c_res=48)
+        scope_port = scope_port.merge(scope_flange)
+        scope_port.cell_data["colour"] = np.tile([76, 117, 133], (scope_port.n_cells, 1)).astype(np.uint8)
+        self.scope_port_actor = self.viewport.add_mesh(
+            scope_port, scalars="colour", rgb=True, show_scalar_bar=False, smooth_shading=True,
+            ambient=0.2, specular=0.45, specular_power=35)
+        self.scope_port_actor.user_matrix = self.scene_matrix @ self.scope_matrix
+        scope_parts = []
+        for mesh, colour in ((shaft, [158, 173, 183]), (head, [42, 54, 65]),
+                             (cable, [36, 43, 50]), (collar.merge(rim), [190, 201, 210]),
+                             (lens, [24, 49, 65])):
+            mesh.cell_data["colour"] = np.tile(colour, (mesh.n_cells, 1)).astype(np.uint8)
+            scope_parts.append(mesh)
+        scope = scope_parts[0].merge(scope_parts[1:])
+        scope.points -= [self.scope_depth, 0.0, 0.0]
+        self.scope_actor = self.viewport.add_mesh(
+            scope, scalars="colour", rgb=True, show_scalar_bar=False, smooth_shading=True,
+            ambient=0.2, specular=0.45, specular_power=35)
+        matrix = self.scope_matrix.copy()
+        matrix[:3, 3] += self.scope_depth * self.scope_direction
+        self.scope_actor.user_matrix = self.scene_matrix @ matrix
 
         # builds each instrument part once
         self.shaft_actor = self.viewport.add_mesh(
@@ -813,17 +952,25 @@ class SimulatorWindow(QMainWindow):
             actor.SetVisibility(self.measurements_checkbox.isChecked())
         for actor in (self.tool_estimate_actor, self.target_estimate_actor):
             actor.SetVisibility(self.estimates_checkbox.isChecked())
+        # applies the shared layout to anatomy + tracking overlays
+        for actor in (self.organ_actor, self.vessel_actor, self.margin_actor,
+                      self.tissue_actor, self.wall_actor, self.tool_measurement_actor,
+                      self.target_measurement_actor, self.tool_estimate_actor,
+                      self.target_estimate_actor):
+            actor.user_matrix = self.scene_matrix
         self.label_points = pv.PolyData(np.array([
-            self.port, self.target, self.structure_centre,
-            self.organ_centre + np.array([0.0, 0.0, 22.0])]))
-        self.label_points["labels"] = ["Fixed port", "Target", "Protected structure", "Organ surface"]
+            self.port, self.target, self.structure_points[len(self.structure_points) // 2],
+            self.organ_centre + np.array([0.0, 0.0, 22.0]), self.port + [0.0, -22.0, 18.0],
+            self.scope_port - (rear + 6) * self.scope_direction]))
+        self.label_points.points = self.label_points.points @ self.scene_rotation.T
+        self.label_points["labels"] = ["Fixed port", "Target", "Blood vessel", "Organ surface", "Body wall",
+                                        "Laparoscope"]
         self.label_actor = self.viewport.add_point_labels(
             self.label_points, "labels",
             font_size=12, text_color="#25384b", point_size=0, shape_opacity=0.0,
             always_visible=True, show_points=False)
         self.label_actor.SetVisibility(self.labels_checkbox.isChecked())
         self.viewport.add_axes(color="#62788c")
-        self.reset_camera()
 
     def UpdateRespiratoryMotion(self, now=None):
         now = perf_counter() if now is None else now
@@ -839,29 +986,80 @@ class SimulatorWindow(QMainWindow):
         self.organ_centre = self.rest_organ_centre + offset
         # translates persistent meshes and labels without changing camera framing
         self.organ_actor.SetPosition(*offset)
-        self.label_points.points[1] = self.target
-        self.label_points.points[3] = self.organ_centre + [0.0, 0.0, 22.0]
+        self.label_points.points[1] = self.scene_rotation @ self.target
+        self.label_points.points[3] = self.scene_rotation @ (
+            self.organ_centre + [0.0, 0.0, 22.0])
         self.render_pending = True
 
-    def reset_camera(self):
-        # fits fixed scenario bounds so noise + instrument resets cannot shift the view
+    def reset_camera(self, view_index=None):
+        # preserves the scope on view changes; Reset view restores its resting pose
+        view = self.view_combo.currentText()
+        camera_view = view == "Camera view"
+        self.pressed_keys.clear()
+        if not self.following:
+            self.command = self.configuration.copy()
+        if camera_view and view_index is None:
+            self.camera_configuration = np.array([0.0, 0.0, self.scope_depth])
+        self.camera_command = self.camera_configuration.copy()
+        self.sync_controls()
+        self.viewport.camera.parallel_projection = view in ("Top", "Front")
+        self.wall_actor.prop.opacity = 1.0
+        if camera_view:
+            self.viewport.iren.style = vtkInteractorStyleUser()
+            self.viewport.camera.view_angle = 60.0
+            self.UpdateCameraPose()
+            self.viewport.render()
+            self.render_pending = False
+            return
+        self.viewport.enable_trackball_style()
         focal = (0, 0, 0)
         cameras = {
-            "Perspective": [(-140, -260, 125), focal, (0, 0, 1)],
+            "Perspective": [(180, -300, 120), focal, (0, 0, 1)],
             "Top": [(0, 0, 300), focal, (0, 1, 0)],
             "Front": [(0, -300, 0), focal, (0, 0, 1)],
-            "Overview": [(-90, -260, 170), focal, (0, 0, 1)],
+            "Overview": [(180, -300, 120), focal, (0, 0, 1)],
         }
-        self.viewport.camera_position = cameras[self.view_combo.currentText()]
-        self.viewport.camera.parallel_projection = self.view_combo.currentText() in ("Top", "Front")
+        self.viewport.camera_position = cameras[view]
         self.viewport.camera.view_angle = 30.0
-        low = np.minimum([-170, -135, -120], self.organ_centre - [20, 26, 22])
-        high = np.maximum([135, 135, 120], self.organ_centre + [20, 26, 22])
-        bounds = (tuple(value for pair in zip(low, high) for value in pair)
-                  if self.view_combo.currentText() == "Overview" else self.scene_bounds)
-        self.viewport.reset_camera(bounds=bounds)
-        if self.view_combo.currentText() == "Perspective":
-            self.viewport.camera.zoom(1.15)
+        # fits current physical models without letting sensor overlays shift the view
+        actors = (self.shaft_actor, self.external_shaft_actor, self.tip_actor,
+                  self.handle_actor, self.collar_actor, self.port_actor, self.wall_actor,
+                  self.scope_actor, self.scope_port_actor, self.organ_actor,
+                  self.vessel_actor, self.tissue_actor)
+        bounds = np.array([actor.GetBounds() for actor in actors
+                           if actor.GetVisibility()]).reshape(-1, 3, 2)
+        low = bounds[:, :, 0].min(axis=0)
+        high = bounds[:, :, 1].max(axis=0)
+        organ_centre = self.scene_rotation @ self.rest_organ_centre
+        organ_extent = abs(self.scene_rotation) @ np.array([20.0, 26.0, 22.0])
+        breathing = abs(self.scene_rotation) @ np.array([0.0, 0.0, self.motion_amplitude.value()])
+        low = np.minimum(low, organ_centre - organ_extent - breathing)
+        high = np.maximum(high, organ_centre + organ_extent + breathing)
+        if self.route_points is not None:
+            points = self.route_points @ self.scene_rotation.T
+            low = np.minimum(low, points.min(axis=0))
+            high = np.maximum(high, points.max(axis=0))
+        low -= 8
+        high += 8
+        focal = self.scene_rotation @ ((self.port + self.rest_target) / 2)
+        if view == "Overview":
+            low = np.minimum([-135, -120, -135], low)
+            high = np.maximum([135, 120, 170], high)
+        elif view in ("Top", "Front"):
+            extent = np.maximum(focal - low, high - focal)
+            low, high = focal - extent, focal + extent
+        bounds = np.column_stack((low, high)).ravel()
+        if all(self.viewport.renderer.GetSize()):
+            self.viewport.renderer.ResetCameraScreenSpace(bounds, 0.9)
+        else:
+            self.viewport.reset_camera(bounds=bounds, render=False)
+        if view == "Perspective":
+            # keeps the working-area focus + preserves the layout's orientation
+            offset = focal - self.viewport.camera.focal_point
+            self.viewport.camera.SetPosition(*(np.asarray(self.viewport.camera.position) + offset))
+            self.viewport.camera.SetFocalPoint(*focal)
+            self.viewport.camera.zoom(0.9)
+        self.viewport.renderer.ResetCameraClippingRange(bounds)
         self.viewport.render()
         self.render_pending = False
 
@@ -1160,7 +1358,7 @@ class SimulatorWindow(QMainWindow):
         # searches with copied scene values; only the UI thread updates widgets
         self.planning_future = self.executor.submit(
             find_path, self.configuration.copy(), self.planned_target.copy(), self.port.copy(),
-            self.tool_radius, self.structure_centre.copy(), self.structure_radius,
+            self.tool_radius, self.structure_points.copy(), self.structure_radius,
             self.lower_limits.copy(), self.upper_limits.copy(), self.required_clearance,
             self.target_tolerance, cancel_event=self.planning_cancel,
             include_target=True, mode=self.plan_mode, proximity_weight=self.proximity_weight.value(),
@@ -1217,9 +1415,8 @@ class SimulatorWindow(QMainWindow):
         self.execution_clearance = self.route_clearance
         self.route_check_key = None
         self.route_clearance_valid = True
-        radius_scale = ((self.structure_radius + self.route_clearance)
-                        / (self.structure_radius + self.required_clearance))
-        self.margin_actor.SetScale(radius_scale)
+        self.margin_mesh.points = self.vessel_axis + (
+            self.structure_radius + self.route_clearance) * self.vessel_radial
         self.render_pending = True
         score = (f"Weighted score: {result['cost']:.2f}\n"
                  if self.plan_mode != "conventional" else "")
@@ -1241,6 +1438,7 @@ class SimulatorWindow(QMainWindow):
         self.path_actor = self.viewport.add_mesh(
             mesh, color="#7757b5", line_width=3, render_lines_as_tubes=True,
             point_size=9, render_points_as_spheres=True)
+        self.path_actor.user_matrix = self.scene_matrix
         self.viewport.render()
         self.follow_button.setEnabled(True)
         self.update_route_guidance()
@@ -1305,7 +1503,8 @@ class SimulatorWindow(QMainWindow):
         self.execution_clearance = self.required_clearance
         self.route_clearance_valid = True
         if self.margin_actor is not None:
-            self.margin_actor.SetScale(1.0)
+            self.margin_mesh.points = self.vessel_axis + (
+                self.structure_radius + self.required_clearance) * self.vessel_radial
             self.render_pending = True
         self.planned_target = None
         self.path = None
@@ -1338,14 +1537,27 @@ class SimulatorWindow(QMainWindow):
 
     def set_command(self, axis):
         value = self.sliders[axis].value() / 10
-        self.start_manual_control()
-        self.command[axis] = np.deg2rad(value) if axis < 2 else value
+        camera_control = self.view_combo.currentText() == "Camera view"
+        if not camera_control:
+            self.start_manual_control()
+        command = self.camera_command if camera_control else self.command
+        command[axis] = np.deg2rad(value) if axis < 2 else value
         self.sync_controls()
 
     def sync_controls(self):
-        values = [np.rad2deg(self.command[0]), np.rad2deg(self.command[1]), self.command[2]]
-        for index, (name, unit) in enumerate([("Yaw", "°"), ("Pitch", "°"), ("Insertion", "mm")]):
+        camera_control = self.view_combo.currentText() == "Camera view"
+        self.instrument_group.setTitle("Camera controls" if camera_control else "Instrument commands")
+        self.keyboard_help.setText("W / S  Insert / retract\nA / D  Yaw · Q / E  Pitch")
+        command = self.camera_command if camera_control else self.command
+        values = np.r_[np.rad2deg(command[:2]), command[2]]
+        lower = self.camera_lower_limits if camera_control else self.lower_limits
+        lower = np.r_[np.rad2deg(lower[:2]), lower[2]]
+        upper = self.camera_upper_limits if camera_control else self.upper_limits
+        upper = np.r_[np.rad2deg(upper[:2]), upper[2]]
+        for index, (name, unit) in enumerate([("Yaw", "°"), ("Pitch", "°"),
+                                              ("Insertion", "mm")]):
             self.sliders[index].blockSignals(True)
+            self.sliders[index].setRange(round(lower[index] * 10), round(upper[index] * 10))
             self.sliders[index].setValue(round(values[index] * 10))
             self.sliders[index].blockSignals(False)
             self.command_labels[index].setText(f"{name}: {values[index]:.1f} {unit}")
@@ -1377,7 +1589,7 @@ class SimulatorWindow(QMainWindow):
                 continue
             if np.linalg.norm(tip - self.target) <= self.target_tolerance:
                 continue
-            if shaft_clearance(self.port, tip, self.tool_radius, self.structure_centre,
+            if shaft_clearance(self.port, tip, self.tool_radius, self.structure_points,
                                self.structure_radius) >= self.required_clearance:
                 self.configuration = candidate
                 break
@@ -1444,7 +1656,7 @@ class SimulatorWindow(QMainWindow):
         tool_tip = tip_position(self.port, *self.sampled_configuration)
         self.sampled_clearance = shaft_clearance(
             self.port, tool_tip, self.tool_radius,
-            self.structure_centre, self.structure_radius)
+            self.structure_points, self.structure_radius)
         timestep = (max(sample_time - self.last_measurement_time, 1e-6)
                     if self.last_measurement_time is not None else None)
         self.measurement_errors = np.full(2, np.nan)
@@ -1777,7 +1989,7 @@ class SimulatorWindow(QMainWindow):
             if immediate or key != self.route_check_key:
                 self.route_clearance_valid = CheckRemainingRoute(
                     self.port, self.configuration, self.path, self.path_index,
-                    self.tool_radius, self.structure_centre, self.structure_radius, clearance)
+                    self.tool_radius, self.structure_points, self.structure_radius, clearance)
                 self.route_check_key = key
         else:
             self.route_clearance_valid = True
@@ -1854,7 +2066,7 @@ class SimulatorWindow(QMainWindow):
                 status = "Waypoints reached; check target feedback."
             elif not movement_is_clear(
                     self.port, self.configuration, self.path[self.path_index], self.tool_radius,
-                    self.structure_centre, self.structure_radius, self.execution_clearance):
+                    self.structure_points, self.structure_radius, self.execution_clearance):
                 status = "Next waypoint blocked; plan a fresh route."
             else:
                 yaw, pitch = np.rad2deg(guidance["change"][:2])
@@ -1897,19 +2109,32 @@ class SimulatorWindow(QMainWindow):
             timestep = min(now - self.last_tick, 0.05)
             self.last_tick = now
             self.poll_planning()
+            camera_control = self.view_combo.currentText() == "Camera view"
+            speed = self.camera_speed_limits if camera_control else self.speed_limits
+            if self.pressed_keys and not self.pause_button.isChecked():
+                velocity = np.zeros(3)
+                for key in self.pressed_keys:
+                    axis, direction = self.key_directions[key]
+                    velocity[axis] += direction * speed[axis]
+                configuration = self.camera_configuration if camera_control else self.configuration
+                lower = self.camera_lower_limits if camera_control else self.lower_limits
+                upper = self.camera_upper_limits if camera_control else self.upper_limits
+                command = np.clip(configuration + velocity * timestep, lower, upper)
+                if camera_control:
+                    self.camera_command = command
+                else:
+                    self.command = command
+                self.sync_controls()
+            if camera_control and not self.pause_button.isChecked():
+                change = np.clip(self.camera_command - self.camera_configuration,
+                                 -speed * timestep, speed * timestep)
+                if np.any(change):
+                    self.camera_configuration += change
+                    self.UpdateCameraPose()
             if self.route_feedback_active and not self.CheckRouteTracking():
                 return
             if self.pause_button.isChecked() or self.planning_future is not None:
                 return
-
-            if self.pressed_keys:
-                velocity = np.zeros(3)
-                for key in self.pressed_keys:
-                    axis, direction = self.key_directions[key]
-                    velocity[axis] += direction * self.speed_limits[axis]
-                self.command = np.clip(self.configuration + velocity * timestep,
-                                       self.lower_limits, self.upper_limits)
-                self.sync_controls()
 
             if self.following:
                 remaining = self.path[self.path_index] - self.configuration
@@ -1926,7 +2151,7 @@ class SimulatorWindow(QMainWindow):
             proposed = self.configuration + change
             clearance = self.execution_clearance if self.following else self.required_clearance
             if movement_is_clear(self.port, self.configuration, proposed, self.tool_radius,
-                                 self.structure_centre, self.structure_radius,
+                                 self.structure_points, self.structure_radius,
                                  clearance):
                 self.configuration = proposed
                 self.update_instrument()
@@ -1964,40 +2189,59 @@ class SimulatorWindow(QMainWindow):
     def update_instrument(self):
         yaw, pitch, depth = self.configuration
         # rotates local +X onto the instrument direction
-        rotation = np.array([
-            [np.cos(pitch) * np.cos(yaw), -np.sin(yaw), -np.sin(pitch) * np.cos(yaw)],
-            [np.cos(pitch) * np.sin(yaw), np.cos(yaw), -np.sin(pitch) * np.sin(yaw)],
-            [np.sin(pitch), 0, np.cos(pitch)],
-        ])
+        rotation = InstrumentRotation(yaw, pitch)
         matrix = np.eye(4)
         internal_length = max(depth - self.tip_length, 0)
         matrix[:3, :3] = rotation @ np.diag([internal_length, 1, 1])
         matrix[:3, 3] = self.port
-        self.shaft_actor.user_matrix = matrix
+        self.shaft_actor.user_matrix = self.scene_matrix @ matrix
         self.shaft_actor.SetVisibility(bool(internal_length > 0))
         # moves the external handle towards the port as insertion increases
         external_length = self.shaft_length - depth
         external_front = min(depth - self.tip_length, 0)
         matrix[:3, :3] = rotation @ np.diag([external_length + external_front, 1, 1])
         matrix[:3, 3] = self.port + external_front * rotation[:, 0]
-        self.external_shaft_actor.user_matrix = matrix
+        self.external_shaft_actor.user_matrix = self.scene_matrix @ matrix
         matrix[:3, :3] = rotation
         matrix[:3, 3] = self.port
-        self.port_actor.user_matrix = matrix
+        self.port_actor.user_matrix = self.scene_matrix @ matrix
         matrix[:3, 3] = self.port - external_length * rotation[:, 0]
         for actor in (self.handle_actor, self.collar_actor):
-            actor.user_matrix = matrix
+            actor.user_matrix = self.scene_matrix @ matrix
         matrix[:3, 3] = tip_position(self.port, *self.configuration)
-        self.tip_actor.user_matrix = matrix
+        self.tip_actor.user_matrix = self.scene_matrix @ matrix
+        self.render_pending = True
+
+    def UpdateCameraPose(self):
+        # pivots at the fixed port + keeps the first-person eye on the lens
+        # maps positive camera yaw onto screen-right
+        yaw, pitch, depth = self.camera_configuration
+        rotation = self.scene_rotation @ self.scope_matrix[:3, :3] @ InstrumentRotation(-yaw, pitch)
+        self.scope_tip = self.scene_rotation @ self.scope_port + depth * rotation[:, 0]
+        matrix = self.scope_matrix.copy()
+        matrix[:3, :3] = rotation
+        matrix[:3, 3] = self.scene_rotation @ self.scope_port
+        self.scope_port_actor.user_matrix = matrix
+        matrix[:3, 3] = self.scope_tip
+        self.scope_actor.user_matrix = matrix
+        self.label_points.points[5] = self.scope_tip - (self.scope_length + 6) * rotation[:, 0]
+        if self.view_combo.currentText() == "Camera view":
+            camera = self.viewport.camera
+            camera.SetPosition(*self.scope_tip)
+            camera.SetFocalPoint(*(self.scope_tip + rotation[:, 0]))
+            camera.SetViewUp(*rotation[:, 2])
+            self.viewport.reset_camera_clipping_range()
+            near, far = camera.clipping_range
+            camera.SetClippingRange(min(0.5, near), far)
         self.render_pending = True
 
     def eventFilter(self, watched, event):
         if event.type() == QEvent.Type.ApplicationDeactivate or (
                 watched is self and event.type() == QEvent.Type.WindowDeactivate):
             self.pressed_keys.clear()
-        if isinstance(watched, QWidget) and watched.window() is self:
-            if event.type() in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress,
-                                QEvent.Type.KeyRelease) and event.key() in self.key_directions:
+        if isinstance(watched, QWidget) and watched.window() is self and event.type() in (
+                QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+            if event.key() in self.key_directions:
                 if event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier):
                     if event.type() == QEvent.Type.KeyRelease and not event.isAutoRepeat():
                         self.pressed_keys.discard(event.key())
@@ -2006,10 +2250,24 @@ class SimulatorWindow(QMainWindow):
                     event.accept()
                 elif not event.isAutoRepeat():
                     if event.type() == QEvent.Type.KeyPress and not self.pause_button.isChecked():
-                        self.start_manual_control()
+                        if self.view_combo.currentText() != "Camera view":
+                            self.start_manual_control()
                         self.pressed_keys.add(event.key())
                     else:
                         self.pressed_keys.discard(event.key())
+                return True
+            viewport_event = watched is self.viewport or self.viewport.isAncestorOf(watched)
+            if viewport_event and self.view_combo.currentText() != "Camera view" and (
+                    event.key() == Qt.Key.Key_R and not event.modifiers() & (
+                        Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier)):
+    
+                if event.type() == QEvent.Type.KeyPress and not event.isAutoRepeat():
+                    self.reset_camera()
+                event.accept()
+                return True
+            if self.view_combo.currentText() == "Camera view" and viewport_event:
+                # keeps movement on the shared keys + sliders
+                event.accept()
                 return True
         return super().eventFilter(watched, event)
 
