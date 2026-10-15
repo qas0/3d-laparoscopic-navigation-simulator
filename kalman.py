@@ -37,7 +37,8 @@ def CheckMeasurement(innovation, covariance, thresholds=(6.635, 9.210, 11.345)):
 
 
 class KalmanFilter:
-    def __init__(self, position, noise_std, acceleration_std=10.0, velocity_std=25.0):
+    def __init__(self, position, noise_std, acceleration_std=10.0, velocity_std=25.0,
+                 confirm_startup=False):
         try:
             position = np.asarray(position, dtype=float)
             deviations = np.asarray([noise_std, acceleration_std, velocity_std], dtype=float)
@@ -48,11 +49,16 @@ class KalmanFilter:
             raise ValueError("Expected three finite values.")
         if deviations.shape != (3,) or not np.all(np.isfinite(deviations)) or np.any(deviations < 0):
             raise ValueError("Invalid standard deviation.")
+        if not isinstance(confirm_startup, (bool, np.bool_)):
+            raise ValueError("Expected startup check on or off.")
 
         self.noise_std, self.acceleration_std, velocity_std = map(float, deviations)
         # initialises position from the first observation + assumes zero velocity
         self.state = np.concatenate((position, np.zeros(3)))
         self.covariance = np.diag([self.noise_std ** 2] * 3 + [velocity_std ** 2] * 3)
+        self.ready = not confirm_startup
+        self.startup_time = 0.0
+        self.startup_readings = [(0.0, position.copy())] if confirm_startup else []
 
     def predict(self, dt):
         try:
@@ -62,6 +68,13 @@ class KalmanFilter:
         if dt.shape != () or not np.isfinite(dt) or dt <= 0:
             raise ValueError("Invalid time step.")
         dt = float(dt)
+
+        if not self.ready:
+            self.startup_time += dt
+            # prevents old readings from confirming startup after a tracking gap
+            if self.startup_readings and self.startup_time - self.startup_readings[-1][0] > 0.25 + 1e-9:
+                self.startup_readings.clear()
+            return
 
         identity = np.eye(3)
         transition = np.block([[identity, dt * identity],
@@ -81,6 +94,32 @@ class KalmanFilter:
             raise ValueError("Invalid observation.") from None
         if position.shape != (3,) or not np.all(np.isfinite(position)):
             raise ValueError("Expected three finite values.")
+
+        if not self.ready:
+            # counts separate sample times rather than repeated updates of one reading
+            if self.startup_readings and self.startup_time == self.startup_readings[-1][0]:
+                self.startup_readings[-1] = (self.startup_time, position.copy())
+                return True
+            self.startup_readings.append((self.startup_time, position.copy()))
+            self.startup_readings = self.startup_readings[-3:]
+            if len(self.startup_readings) < 3:
+                return True
+            (first_time, first), (middle_time, middle), (last_time, last) = self.startup_readings
+            fraction = (middle_time - first_time) / (last_time - first_time)
+            # compares the middle reading with a straight motion between its neighbours
+            error = middle - ((1 - fraction) * first + fraction * last)
+            variance = self.noise_std ** 2 * (1 + (1 - fraction) ** 2 + fraction ** 2)
+            acceleration_error = (0.5 * self.acceleration_std
+                                  * (middle_time - first_time) * (last_time - middle_time))
+            covariance = (variance + acceleration_error ** 2) * np.eye(3)
+            if not CheckMeasurement(error, covariance, (3.841, 5.991, 7.815)):
+                return False
+            # starts from the latest consistent reading without inferring a spike-driven velocity
+            self.state[:3] = position
+            self.state[3:] = 0.0
+            self.ready = True
+            self.startup_readings.clear()
+            return True
 
         measurement_noise = self.noise_std ** 2 * np.eye(3)
         innovation = position - self.state[:3]

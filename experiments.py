@@ -166,16 +166,17 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
                         if not accepted[index]:
                             rejected[name] += 1
                 elif observed is not None:
-                    filters[index] = KalmanFilter(observed, noise[index], acceleration[index])
+                    filters[index] = KalmanFilter(observed, noise[index], acceleration[index],
+                                                  confirm_startup=True)
                     accepted[index] = True
-                if accepted[index]:
+                if accepted[index] and filters[index].ready:
                     accepted_times[index] = elapsed_time
                 if observed is None:
                     dropped[name] += 1
                 else:
                     error_sums[name + "_raw"] += float(np.sum((observed - position) ** 2))
                     counts[name + "_raw"] += 1
-                if filters[index] is not None:
+                if filters[index] is not None and filters[index].ready:
                     error = filters[index].state[:3] - position
                     covariance = filters[index].covariance[:3, :3]
                     error_sums[name + "_filtered"] += float(np.sum(error ** 2))
@@ -192,6 +193,11 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
                                          for index in required_filters)
             if elapsed_time >= warmup - 1e-9:
                 if plan is None and not available:
+                    # waits for startup while required sensors are still providing readings
+                    if (required_filters and all(observations[index] is not None for index in required_observations)
+                            and any(filters[index] is not None and not filters[index].ready
+                                    for index in required_filters)):
+                        continue
                     status = "tracking_unavailable"
                     break
                 if tracking == "ideal":

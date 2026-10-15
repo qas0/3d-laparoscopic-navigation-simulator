@@ -10,10 +10,52 @@ class KalmanTests(unittest.TestCase):
     def test_initial_state_uses_the_observation_once(self):
         position = np.array([90.0, -4.0, 3.0])
         tracker = KalmanFilter(position, 2.0, velocity_std=3.0)
+        self.assertTrue(tracker.ready)
         np.testing.assert_array_equal(tracker.state, [90, -4, 3, 0, 0, 0])
         np.testing.assert_array_equal(tracker.covariance, np.diag([4, 4, 4, 9, 9, 9]))
         position[0] = -100.0
         self.assertEqual(tracker.state[0], 90.0)
+
+        # confirms separate, irregularly timed readings of a moving target
+        origin = np.array([90.0, -4.0, 3.0])
+        velocity = np.array([4.0, -2.0, 1.0])
+        reading = origin.copy()
+        tracker = KalmanFilter(reading, 0.5, confirm_startup=True)
+        reading[0] = 1000.0
+        self.assertFalse(tracker.ready)
+        np.testing.assert_array_equal(tracker.state[:3], origin)
+        tracker.predict(0.07)
+        reading = origin + 0.07 * velocity
+        for _ in range(3):
+            self.assertTrue(tracker.update(reading))
+            self.assertFalse(tracker.ready)
+        reading[0] = 1000.0
+        tracker.predict(0.13)
+        latest = origin + 0.2 * velocity
+        self.assertTrue(tracker.update(latest))
+        self.assertTrue(tracker.ready)
+        latest[0] = 1000.0
+        np.testing.assert_allclose(tracker.state, np.concatenate((origin + 0.2 * velocity, np.zeros(3))))
+
+        tracker = KalmanFilter(origin + [30, 0, 0], 0.5, confirm_startup=True)
+        for sample in range(1, 4):
+            tracker.predict(0.1)
+            accepted = tracker.update(origin)
+            self.assertEqual(tracker.ready, sample == 3)
+            if sample == 2:
+                self.assertFalse(accepted)
+        # excludes the initial spike from the confirmed position + velocity
+        np.testing.assert_array_equal(tracker.state, np.concatenate((origin, np.zeros(3))))
+
+        tracker = KalmanFilter(origin, 0.5, confirm_startup=True)
+        tracker.predict(0.1)
+        tracker.update(origin)
+        tracker.predict(0.3)
+        for sample in range(3):
+            if sample:
+                tracker.predict(0.1)
+            tracker.update(origin)
+            self.assertEqual(tracker.ready, sample == 2)
 
     def test_prediction_matches_calculated_motion_and_covariance(self):
         tracker = KalmanFilter([10, -4, 2], 2.0, acceleration_std=2.0, velocity_std=3.0)
@@ -121,7 +163,8 @@ class KalmanTests(unittest.TestCase):
                         {"position": [np.nan, 0, 0]}, {"position": [np.inf, 0, 0]},
                         {"noise_std": -1}, {"noise_std": np.inf}, {"noise_std": [1]},
                         {"acceleration_std": -1}, {"acceleration_std": np.nan},
-                        {"velocity_std": -1}, {"velocity_std": np.inf}]:
+                        {"velocity_std": -1}, {"velocity_std": np.inf},
+                        {"confirm_startup": 1}, {"confirm_startup": "yes"}]:
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 KalmanFilter(**dict(settings, **changes))
 

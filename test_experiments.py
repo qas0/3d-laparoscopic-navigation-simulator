@@ -199,8 +199,9 @@ class ExperimentTests(unittest.TestCase):
         self.assertIsNone(ideal["predicted_rms"]["tool"])
         self.assertIsNone(ideal["coverage"]["tool"])
         for source in ("target_raw", "target_filtered"):
-            self.assertEqual(ideal["samples"][source], ideal["sensor_samples"])
             self.assertAlmostEqual(ideal["rmse"][source], 0.0)
+        self.assertEqual(ideal["samples"]["target_raw"], ideal["sensor_samples"])
+        self.assertEqual(ideal["samples"]["target_filtered"], ideal["sensor_samples"] - 2)
 
     def test_UncertaintyCanRejectAPathThatConventionalPlanningAccepts(self):
         settings = dict(tracking="ideal", tool_noise=0.0, target_noise=0.0,
@@ -256,12 +257,13 @@ class ExperimentTests(unittest.TestCase):
                     self.assertLess(trial["rmse"]["target_filtered"], max(0.25, 2 * noise))
 
     def test_ExecutionDeadlineRetainsAnUnfinishedTrial(self):
-        trial = RunTrial(tool_noise=0.0, target_noise=0.0, warmup=0.0, duration=0.2,
+        # leaves 0.2 s for startup + 0.2 s for unfinished movement
+        trial = RunTrial(tool_noise=0.0, target_noise=0.0, warmup=0.0, duration=0.4,
                          planning_time_limit=30.0)
         self.assertEqual(trial["status"], "timeout")
         self.assertFalse(trial["success"])
         self.assertIsNone(trial["completion_time"])
-        self.assertLessEqual(trial["elapsed_time"], 0.2 + 1e-9)
+        self.assertLessEqual(trial["elapsed_time"], 0.4 + 1e-9)
         self.assertGreater(trial["travel"], 0.0)
         self.assertLess(trial["travel"], 55.0)
         self.assertGreater(trial["actual_error"], 2.0)
@@ -311,7 +313,7 @@ class ExperimentTests(unittest.TestCase):
 
     def test_TwoIndependentTrialsUseTheSampleStandardDeviation(self):
         comparison = CompareMethods(seeds=[0, 1], tracking="ideal", tool_noise=0.5,
-                                    target_noise=0.5, warmup=0.0, duration=0.5,
+                                    target_noise=0.5, warmup=0.3, duration=0.5,
                                     planning_time_limit=30.0)
         for mode, summary in comparison["summary"].items():
             errors = [trial["rmse"]["tool_raw"] for trial in comparison["trials"]
@@ -341,12 +343,12 @@ class ExperimentTests(unittest.TestCase):
         for sensor in ("tool", "target"):
             self.assertEqual(trial["samples"][sensor + "_raw"],
                              trial["sensor_samples"] - trial["dropped"][sensor])
-        # leaves the first three missing tool readings out of filter error calculations
+        # excludes missing readings + the first two startup readings from filter errors
         self.assertEqual(trial["samples"]["tool_raw"], 3)
-        self.assertEqual(trial["samples"]["tool_filtered"], 6)
-        self.assertEqual(trial["samples"]["target_filtered"], 9)
-        self.assertEqual(len(readings), 15)
-        sensor_readings = {"tool": readings[3::2], "target": readings[:3] + readings[4::2]}
+        self.assertEqual(trial["samples"]["tool_filtered"], 4)
+        self.assertEqual(trial["samples"]["target_filtered"], 6)
+        self.assertEqual(len(readings), 10)
+        sensor_readings = {"tool": readings[2::2], "target": readings[:2] + readings[3::2]}
         for sensor, observations in sensor_readings.items():
             errors, covariances, covered = zip(*observations)
             self.assertEqual(len(observations), trial["samples"][sensor + "_filtered"])
@@ -395,7 +397,7 @@ class ExperimentTests(unittest.TestCase):
         self.assertLessEqual(abs(coarse["completion_time"] - fine["completion_time"]), 0.1)
 
         settings = dict(seeds=[0], tracking="ideal", tool_noise=0.5, target_noise=0.5,
-                        warmup=0.0, duration=0.5, planning_time_limit=30.0)
+                        warmup=0.3, duration=0.5, planning_time_limit=30.0)
         comparisons = [CompareMethods(timestep=step, **settings) for step in (0.02, 0.01)]
         expected = comparisons[0]["trials"][0]["rmse"]
         for comparison in comparisons:
@@ -786,8 +788,9 @@ class OutlierExperimentTests(unittest.TestCase):
             self.assertGreater(checked["rmse"][sensor + "_raw"], 0.0)
             self.assertEqual(checked["samples"][sensor + "_raw"], checked["sensor_samples"])
             self.assertEqual(checked["dropped"][sensor], 0)
-            self.assertEqual(accepted["rejected"][sensor], 0)
-            self.assertGreater(checked["rejected"][sensor], 0)
+            self.assertEqual(accepted["samples"][sensor + "_filtered"],
+                             checked["samples"][sensor + "_filtered"])
+            self.assertGreater(checked["rejected"][sensor], accepted["rejected"][sensor])
         self.assertLess(checked["rmse"]["target_filtered"],
                         accepted["rmse"]["target_filtered"])
 
@@ -853,13 +856,54 @@ class OutlierExperimentTests(unittest.TestCase):
         self.assertEqual(trial["dropped"]["target"], 0)
 
     def test_AnInitialSpikeIsAcceptedBecauseNoPredictionExistsYet(self):
-        trial = RunTrial(tracking="ideal", warmup=0.0, duration=0.02,
-                         tool_noise=0.0, target_noise=0.0, tool_outlier=1.0,
-                         target_outlier=1.0, reject_outliers=True, planning_time_limit=30.0)
-        self.assertEqual(trial["sensor_samples"], 1)
-        self.assertEqual(trial["rejected"], {"tool": 0, "target": 0})
-        self.assertAlmostEqual(trial["rmse"]["tool_raw"], 20.0)
-        self.assertAlmostEqual(trial["rmse"]["target_filtered"], 20.0)
+        for rejection in (False, True):
+            with self.subTest(rejection=rejection, duration=0.02):
+                trial = RunTrial(tracking="ideal", warmup=0.0, duration=0.02,
+                                 tool_noise=0.0, target_noise=0.0, tool_outlier=1.0,
+                                 target_outlier=1.0, reject_outliers=rejection,
+                                 planning_time_limit=30.0)
+                self.assertEqual(trial["sensor_samples"], 1)
+                self.assertEqual(trial["rejected"], {"tool": 0, "target": 0})
+                for sensor in ("tool", "target"):
+                    self.assertAlmostEqual(trial["rmse"][sensor + "_raw"], 20.0)
+                    self.assertEqual(trial["samples"][sensor + "_filtered"], 0)
+                    self.assertIsNone(trial["rmse"][sensor + "_filtered"])
+                    self.assertIsNone(trial["predicted_rms"][sensor])
+                    self.assertIsNone(trial["coverage"][sensor])
+
+            for tracking, mode in (("filtered", "conventional"), ("ideal", "uncert_aware")):
+                for duration in (0.2, 0.5):
+                    with self.subTest(rejection=rejection, tracking=tracking, duration=duration):
+                        # inserts a spike only in the first tool + target readings
+                        faults = iter([20.0, 20.0] + [0.0] * 10)
+                        with patch("experiments.ApplyOutlier", side_effect=lambda position, probability,
+                                   size, generator: position + np.array([next(faults), 0.0, 0.0])):
+                            trial = RunTrial(tracking=tracking, mode=mode, warmup=0.0,
+                                             duration=duration, tool_noise=0.0, target_noise=0.0,
+                                             reject_outliers=rejection, planning_time_limit=30.0)
+                        self.assertEqual(trial["status"], "timeout")
+                        self.assertFalse(trial["reported_arrival"])
+                        self.assertEqual(trial["rejected"], {"tool": 1, "target": 1})
+                        for sensor in ("tool", "target"):
+                            self.assertEqual(trial["samples"][sensor + "_raw"], trial["sensor_samples"])
+                            self.assertAlmostEqual(trial["rmse"][sensor + "_raw"],
+                                                   20.0 / np.sqrt(trial["sensor_samples"]))
+                        if duration == 0.2:
+                            self.assertIsNone(trial["plan"])
+                            self.assertEqual(trial["travel"], 0.0)
+                            for sensor in ("tool", "target"):
+                                self.assertEqual(trial["samples"][sensor + "_filtered"], 0)
+                                self.assertIsNone(trial["rmse"][sensor + "_filtered"])
+                                self.assertIsNone(trial["predicted_rms"][sensor])
+                                self.assertIsNone(trial["coverage"][sensor])
+                        else:
+                            self.assertEqual(trial["plan"]["status"], "found")
+                            np.testing.assert_array_equal(trial["planned_target"], [90.0, 0.0, 0.0])
+                            self.assertEqual(trial["plan"]["extra_clearance"], 0.0)
+                            self.assertGreater(trial["travel"], 0.0)
+                            for sensor in ("tool", "target"):
+                                self.assertEqual(trial["samples"][sensor + "_filtered"], 3)
+                                self.assertEqual(trial["rmse"][sensor + "_filtered"], 0.0)
 
     def test_RejectionMetricsCountIndependentTrialsIncludingZeroRejections(self):
         comparison = CompareMethods("Inaccessible target", seeds=[0, 1],

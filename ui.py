@@ -333,7 +333,7 @@ class SimulatorWindow(QMainWindow):
         self.outlier_size.setToolTip("3D spike distance in a random direction, added to ordinary sensor error.")
         outlier_settings.addRow("Spike size", self.outlier_size)
         self.reject_outliers = QCheckBox("Reject outliers", checked=False)
-        self.reject_outliers.setToolTip("Checks each reading against the prediction + covariance using a nominal 99% region. The first reading initializes the filter; valid motion can also be rejected.")
+        self.reject_outliers.setToolTip("After the three-reading startup check, rejects readings outside the prediction's nominal 99% region. Valid motion can also be rejected.")
         self.reject_outliers.toggled.connect(self.stop_path)
         outlier_settings.addRow(self.reject_outliers)
         self.rejected_label = QLabel(wordWrap=True)
@@ -1692,15 +1692,16 @@ class SimulatorWindow(QMainWindow):
             if estimator is not None:
                 estimator.predict(timestep)
             if observation is not None:
-                # initialises each filter once from its first received reading
+                # confirms startup before exposing a filtered estimate
                 if estimator is None:
-                    estimator = KalmanFilter(observation, noise, acceleration_std=acceleration)
+                    estimator = KalmanFilter(observation, noise, acceleration_std=acceleration,
+                                             confirm_startup=True)
                     accepted = True
                 else:
                     accepted = estimator.update(observation, reject_outliers=self.reject_outliers.isChecked())
                 self.rejected_observations[index] = not accepted
                 self.rejected_counts[index] += not accepted
-                if accepted:
+                if accepted and estimator.ready:
                     self.filter_observation_times[index] = sample_time
                 readings[index] = observation
                 self.observation_times[index] = sample_time
@@ -1708,7 +1709,7 @@ class SimulatorWindow(QMainWindow):
                 self.measurement_squared_error[index] += self.measurement_errors[index] ** 2
                 self.measurement_counts[index] += 1
             filters[index] = estimator
-            if estimator is not None:
+            if estimator is not None and estimator.ready:
                 estimates[index] = estimator.state[:3].copy()
                 self.estimate_errors[index] = np.linalg.norm(estimates[index] - position)
                 self.estimate_squared_error[index] += self.estimate_errors[index] ** 2
@@ -1729,7 +1730,7 @@ class SimulatorWindow(QMainWindow):
         for positions, covariances in (
                 (self.observations, [self.tool_noise.value() ** 2 * np.eye(3),
                                      self.target_noise.value() ** 2 * np.eye(3)]),
-                (estimates, [estimator.covariance[:3, :3] if estimator is not None else None
+                (estimates, [estimator.covariance[:3, :3] if estimator is not None and estimator.ready else None
                              for estimator in filters])):
             self.target_feedbacks.append(
                 get_target_feedback(*positions, self.target_tolerance, *covariances)
@@ -1807,6 +1808,8 @@ class SimulatorWindow(QMainWindow):
             f'<td align="right">2 mm region</td></tr>{rows}</table>')
         mode = self.navigation_mode_combo.currentIndex()
         selected = self.target_feedbacks[mode]
+        starting = mode == 2 and any(estimator is not None and not estimator.ready
+                                    for estimator in (self.tool_filter, self.target_filter))
         if self.route_result is not None:
             self.feedback_status_label.setText(self.route_result_label.text())
         elif self.tracking_paused_time is not None:
@@ -1814,6 +1817,8 @@ class SimulatorWindow(QMainWindow):
                 f"Tracking paused · recovery {self.tracking_recovery_samples} / 2.\nArrival confirmation restarts after recovery.")
         elif self.route_feedback_active and not self.route_clearance_valid:
             self.feedback_status_label.setText("Remaining route lacks updated clearance. Arrival confirmation paused.")
+        elif starting:
+            self.feedback_status_label.setText("Checking filter startup. Waiting for three consistent tool + target readings.")
         elif not self.TrackingAvailable(mode):
             self.feedback_status_label.setText("Tracking unavailable. Arrival confirmation requires fresh tool + target readings.")
         elif mode == 2 and any(self.rejected_observations):
@@ -1851,7 +1856,13 @@ class SimulatorWindow(QMainWindow):
             status = "Waiting for first reading" if received is None else (
                 f"Fresh · age {now - received:.1f} s" if fresh else
                 f"{'Prediction' if filtered else 'Last reading'} · age {now - received:.1f} s")
-            if self.rejected_observations[index]:
+            estimator = (self.tool_filter, self.target_filter)[index]
+            if estimator is not None and not estimator.ready:
+                if filtered:
+                    status = "Checking startup · waiting for 3 consistent readings"
+                elif self.rejected_observations[index]:
+                    status += " · startup inconsistent"
+            elif self.rejected_observations[index]:
                 status = (f"Prediction · accepted age {now - received:.1f} s" if filtered
                           else f"{'Fresh' if fresh else 'Last reading'} · rejected by filter")
             position = self.scene_rotation @ position if position is not None else (None,) * 3
@@ -1865,7 +1876,7 @@ class SimulatorWindow(QMainWindow):
             f"Filtered error · mm\nTool {FormatReading(self.estimate_errors[0])}   Target {FormatReading(self.estimate_errors[1])}")
         # calculates model RMS uncertainty from the three position variances
         uncertainties = [np.sqrt(max(0.0, np.trace(estimator.covariance[:3, :3])))
-                         if estimator is not None else None
+                         if estimator is not None and estimator.ready else None
                          for estimator in (self.tool_filter, self.target_filter)]
         self.uncertainty_label.setText(
             f"Position uncertainty · RMS mm\nTool {FormatReading(uncertainties[0])}   Target {FormatReading(uncertainties[1])}")
@@ -1889,7 +1900,8 @@ class SimulatorWindow(QMainWindow):
         distance = selected["distance"] if mode != 1 or self.TrackingAvailable(mode) else None
         prediction_note = ""
         if mode == 2 and not self.TrackingAvailable(mode):
-            prediction_note = " · Prediction" if np.isfinite(distance) else " · Unavailable"
+            prediction_note = (" · Checking startup" if starting else
+                               " · Prediction" if np.isfinite(distance) else " · Unavailable")
         self.target_label.setText(f"{self.navigation_mode_combo.currentText().upper()} DISTANCE\n{FormatReading(distance)} mm{prediction_note}  ·  Actual {self.target_feedbacks[0]['distance']:.2f} mm")
         minimum = self.execution_clearance if self.route_feedback_active else self.required_clearance
         guide_margin = (f"\nGuide planned at {self.route_clearance:.2f} mm"
@@ -1903,6 +1915,9 @@ class SimulatorWindow(QMainWindow):
         now = perf_counter()
         for index in required:
             filtered = source == 2 or mode == "uncert_aware" and index == 0
+            estimator = (self.tool_filter, self.target_filter)[index]
+            if filtered and (estimator is None or not estimator.ready):
+                return False
             received = (self.filter_observation_times if filtered else self.observation_times)[index]
             if (self.observations[index] is None or received is None
                     or now - received > self.tracking_timeout
@@ -2099,7 +2114,7 @@ class SimulatorWindow(QMainWindow):
                                 and now - self.observation_times[index] <= self.tracking_timeout)
         for actor, estimator in ((self.tool_estimate_actor, self.tool_filter),
                                  (self.target_estimate_actor, self.target_filter)):
-            actor.SetVisibility(self.estimates_checkbox.isChecked() and estimator is not None)
+            actor.SetVisibility(self.estimates_checkbox.isChecked() and estimator is not None and estimator.ready)
         if render:
             self.viewport.render()
 
