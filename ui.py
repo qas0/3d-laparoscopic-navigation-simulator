@@ -105,6 +105,8 @@ class SimulatorWindow(QMainWindow):
         material_folder = Path(__file__).resolve().parent / "assets" / "materials"
         self.material_textures = {name: pv.read_texture(material_folder / f"{name}.png")
                                   for name in ("skin", "tissue", "liver")}
+        self.anatomy_meshes = {name: pv.read(material_folder.parent / "anatomy" / f"{name}.vtp")
+                               for name in ("liver", "gallbladder")}
         for texture in self.material_textures.values():
             texture.interpolate = texture.mipmap = texture.repeat = True
             texture.use_srgb_color_space = True
@@ -762,9 +764,6 @@ class SimulatorWindow(QMainWindow):
         self.motion_started_time = None
         self.structure_points = scenario["structure_points"].copy()
         self.structure_radius = scenario["structure_radius"]
-        # anchors the target to the near surface of the organ
-        self.rest_organ_centre = self.rest_target + np.array([20.0, 0.0, 0.0])
-        self.organ_centre = self.rest_organ_centre.copy()
         self.stop_path()
         self.pressed_keys.clear()
         self.pause_button.setChecked(False)
@@ -784,25 +783,12 @@ class SimulatorWindow(QMainWindow):
                                     color=(1.0, 0.97, 0.94), intensity=2.75,
                                     cone_angle=55, exponent=2,
                                     attenuation_values=(0.55, 0.0, 0.00008))
-        organ = pv.Sphere(radius=1, theta_resolution=96, phi_resolution=73)
-        x, y, z = organ.points.T
-        # shapes unequal lobes inside the original envelope + preserves the target-facing pole
-        groove = np.exp(-((y + 0.12) / 0.24) ** 2) * (0.6 + 0.4 * z ** 2)
-        lobes = 1 - 0.3 * (1 + x) / 2 * (0.25 + 0.75 * groove)
-        organ.points = organ.points * lobes[:, None] * [20, 26, 22] + self.organ_centre
-        del organ.point_data["Normals"]
-        # joins the target-bearing lobe to a broad posterior mass outside the tool envelope
-        posterior = pv.Sphere(radius=1, theta_resolution=96, phi_resolution=73)
-        x, y, z = posterior.points.T.copy()
-        posterior.points = np.column_stack((133 + 15 * x + 2 * y * z,
-                                            -8 + 95 * y * (0.87 - 0.2 * z),
-                                            -10 + 70 * z * (0.83 + 0.22 * y) + 5 * y))
-        posterior.points[:, 0] += (11 * np.exp(-((posterior.points[:, 1] - 20) / 18) ** 2)
-                                   * np.maximum(-x, 0) ** 2)
-        posterior.points[:, 0] -= 1.2 * np.maximum(x, 0) ** 2
-        reach = np.exp(-((posterior.points[:, 1] - self.rest_target[1]) / 26) ** 2)
-        posterior.points[:, 0] -= reach * max(0.0, 90 - self.rest_target[0]) * 0.65
-        del posterior.point_data["Normals"]
+        # preserves the source pair's proportions + anchors its fundus to the target
+        organ = self.anatomy_meshes["gallbladder"].copy()
+        posterior = self.anatomy_meshes["liver"].copy()
+        organ.points += self.rest_target
+        posterior.points += self.rest_target
+        self.organ_label_point = organ.points[np.argmax(organ.points[:, 2])].copy()
         organ.compute_normals(inplace=True)
         posterior.compute_normals(inplace=True)
         # matches each vessel section to the rounded segment used for clearance
@@ -844,22 +830,38 @@ class SimulatorWindow(QMainWindow):
         normals /= np.linalg.norm(normals, axis=1)[:, None]
         sides = np.cross(tangents, normals)
         blend = np.sin(np.pi * samples / distances[-1]) ** 2
-        angles = np.linspace(0, 2 * np.pi, 24, endpoint=False)
+        angles = np.linspace(0, 2 * np.pi, 48, endpoint=False)
         fold_radius = self.structure_radius + self.required_clearance - 0.3
-        ripple = 0.12 * blend[:, None] * np.sin(0.65 * samples[:, None] + 3 * angles)
-        points = (centres[:, None, :] + 2 * blend[:, None, None] * normals[:, None, :]
-                  + (fold_radius - 2 * blend)[:, None, None]
-                  * np.cos(angles)[None, :, None] * normals[:, None, :]
-                  + (fold_radius - 0.8 * blend[:, None] + ripple)[:, :, None]
-                  * np.sin(angles)[None, :, None] * sides[:, None, :])
-        indices = np.arange(len(centres) - 1)[:, None] * len(angles) + np.arange(len(angles))
-        next_indices = np.roll(indices, -1, axis=1)
-        faces = np.stack((np.full_like(indices, 4), indices, next_indices,
-                          next_indices + len(angles), indices + len(angles)), axis=-1)
-        fold = pv.PolyData(points.reshape(-1, 3), faces=faces.reshape(-1, 5))
-        caps = [pv.Sphere(radius=fold_radius, center=point, theta_resolution=24, phi_resolution=17)
-                for point in self.structure_points[[0, -1]]]
-        tissue = fold.merge(caps)
+        # tapers the ends + lowers the port-facing side to leave the vessel exposed
+        radii = (fold_radius - 1 + 0.8 * blend[:, None]
+                 - 1.6 * blend[:, None] * (1 - np.cos(angles))
+                 + 0.1 * blend[:, None] * np.sin(0.65 * samples[:, None] + 2 * angles))
+        directions = (np.cos(angles)[None, :, None] * normals[:, None, :]
+                      + np.sin(angles)[None, :, None] * sides[:, None, :])
+        points = centres[:, None, :] + radii[:, :, None] * directions
+        # closes the same surface with rounded ends instead of overlapping spheres
+        cap_radius = fold_radius - 1
+        cap_angles = np.linspace(np.pi / 2, 0, 7)[1:-1]
+        caps = []
+        for end, sign in ((0, -1), (-1, 1)):
+            phase = cap_angles if end == 0 else cap_angles[::-1]
+            caps.append(centres[end] + sign * cap_radius * np.sin(phase)[:, None, None]
+                        * tangents[end] + cap_radius * np.cos(phase)[:, None, None]
+                        * directions[end])
+        points = np.concatenate((caps[0], points, caps[1]))
+        rings = np.arange(len(points) * len(angles)).reshape(-1, len(angles))
+        following = np.roll(rings, -1, axis=1)
+        faces = np.stack((np.full_like(rings[:-1], 4), rings[:-1], following[:-1],
+                          following[1:], rings[1:]), axis=-1)
+        poles = centres[[0, -1]] + np.array([-1, 1])[:, None] * cap_radius * tangents[[0, -1]]
+        count = points.size // 3
+        fans = np.vstack((np.column_stack((np.full(len(angles), 3),
+                                          np.full(len(angles), count), following[0], rings[0])),
+                          np.column_stack((np.full(len(angles), 3),
+                                           np.full(len(angles), count + 1), rings[-1], following[-1]))))
+        tissue = pv.PolyData(np.vstack((points.reshape(-1, 3), poles)),
+                             faces=np.r_[faces.ravel(), fans.ravel()]).triangulate().compute_normals(
+                                 auto_orient_normals=True, consistent_normals=True)
         # joins a rounded body lining to the skin + leaves a permanent front inspection opening
         angles = np.linspace(0, 2 * np.pi, 192, endpoint=False)
         outline = np.column_stack((np.cos(angles), np.sin(angles)))
@@ -869,11 +871,12 @@ class SimulatorWindow(QMainWindow):
         y = radial * outline[:, 0]
         z = radial * outline[:, 1]
         x = np.broadcast_to(2 + 153 * (1 - radial ** 6) ** 0.4, y.shape).copy()
-        # raises broad tissue folds behind the instrument's maximum insertion
+        # gathers broad connected folds around the posterior working area
         folds = (12 * np.exp(-((y + 45) / 45) ** 2 - ((z + 25) / 55) ** 2)
-                 + 8 * np.exp(-((y - 55) / 40) ** 2 - ((z - 25) / 45) ** 2))
+                 + 8 * np.exp(-((y - 55) / 40) ** 2 - ((z - 25) / 45) ** 2)
+                 + 7 * np.exp(-((z + 70 + 0.16 * y) / 18) ** 2 - (y / 110) ** 6)
+                 + 6 * np.exp(-((z - 72 + 0.12 * y) / 20) ** 2 - (y / 105) ** 6))
         x -= folds * np.clip((x - 125) / 20, 0, 1)
-        x -= 1.4 * np.sin(0.13 * y + 0.04 * z) ** 2 * np.clip((x - 125) / 20, 0, 1)
         points = np.vstack(([np.mean(x[0]), 0.0, 0.0],
                             np.column_stack((x.ravel(), y.ravel(), z.ravel()))))
         indices = np.arange(48 * len(angles)).reshape(48, -1) + 1
@@ -894,14 +897,40 @@ class SimulatorWindow(QMainWindow):
         # gives the cut edge thickness without bringing the surface closer to the tool
         cavity = cavity.extrude((4, 0, 0), capping=True).triangulate().compute_normals(
             auto_orient_normals=True, consistent_normals=True, split_vertices=True, feature_angle=50)
+        cavity.point_data["bowel"] = np.zeros(cavity.n_points, dtype=np.uint8)
+        # frames the clear workspace with continuous bowel folds along the body lining
+        for controls in (
+                [(145, -99, -34), (127, -95, -64), (126, -73, -77), (125, -50, -66),
+                 (125, -28, -82), (126, -4, -68), (127, 20, -84), (128, 44, -68),
+                 (129, 68, -76), (131, 91, -57), (146, 103, -29)],
+                [(147, -100, 32), (126, -102, 58), (125, -76, 78), (124, -50, 65),
+                 (124, -24, 82), (125, 0, 68), (126, 27, 81), (128, 51, 66),
+                 (128, 78, 76), (132, 99, 54), (144, 105, 26)]):
+            centreline = pv.Spline(controls, n_points=240)
+            along = centreline["arc_length"] / centreline["arc_length"][-1]
+            centreline["radius"] = (7 + 1.2 * np.exp(-((along - 0.3) / 0.17) ** 2)
+                                     + 0.8 * np.exp(-((along - 0.72) / 0.12) ** 2))
+            # tapers both ends into the lining so the tube caps remain buried
+            for distance in (along, 1 - along):
+                centreline["radius"] *= 0.15 + 0.85 * np.sin(np.pi / 2 * np.clip(distance / 0.065, 0, 1))
+            bowel = centreline.tube(scalars="radius", absolute=True, n_sides=24).triangulate()
+            bowel.clear_data()
+            bowel.point_data["bowel"] = np.ones(bowel.n_points, dtype=np.uint8)
+            cavity = cavity.merge(bowel, merge_points=False)
+        # recesses the lining + peripheral folds to accommodate the full organ depth
+        cavity.points[:, 0] = 2 + 1.21 * (cavity.points[:, 0] - 2)
         # tints full-colour textures without multiplying the old baked colours into them
         for mesh in (organ, posterior, tissue, cavity):
             x, y, z = mesh.points.T
             colour = np.tile([250.0, 246.0, 241.0], (mesh.n_points, 1))
+            if mesh is organ:
+                colour[:] = [130, 215, 120]
             if mesh is cavity:
                 fat = (0.65 * np.exp(-((y - 70) / 80) ** 2 - ((z + 80) / 55) ** 2)
                        + 0.45 * np.exp(-((y + 90) / 60) ** 2 - ((z - 25) / 90) ** 2))
                 colour = colour * (1 - fat[:, None]) + fat[:, None] * [255, 244, 173]
+                colour[cavity["bowel"].astype(bool)] = [255, 226, 226]
+                del cavity.point_data["bowel"]
             mesh.point_data["colour"] = np.clip(np.rint(colour), 0, 255).astype(np.uint8)
         offset = organ.points - self.target
         angle = np.arctan2(offset[:, 2], offset[:, 1])
@@ -1146,7 +1175,7 @@ class SimulatorWindow(QMainWindow):
             if actor is self.cavity_actor:
                 # unwraps the bowl as a disc so detail follows the deep side walls
                 radius = np.linalg.norm(coordinates, axis=1)
-                arc = 155 * np.arctan2(radius, mesh.points[:, 0])
+                arc = 187 * np.arctan2(radius, mesh.points[:, 0])
                 coordinates *= (arc / np.maximum(radius, 1e-6))[:, None]
             mesh.active_texture_coordinates = (coordinates / scale).astype(np.float32)
             mesh.compute_normals(consistent_normals=True, split_vertices=False, inplace=True)
@@ -1207,7 +1236,7 @@ class SimulatorWindow(QMainWindow):
             actor.user_matrix = self.scene_matrix
         self.label_points = pv.PolyData(np.array([
             self.port, self.target, self.structure_points[len(self.structure_points) // 2],
-            self.organ_centre + np.array([0.0, 0.0, 22.0]), self.port + [0.0, -22.0, 18.0],
+            self.organ_label_point, self.port + [0.0, -22.0, 18.0],
             self.scope_port - (rear + 6) * self.scope_direction]))
         self.label_points.points = self.label_points.points @ self.scene_rotation.T
         self.label_points["labels"] = ["Fixed port", "Target", "Blood vessel", "Organ surface", "Body wall",
@@ -1230,13 +1259,12 @@ class SimulatorWindow(QMainWindow):
         if np.array_equal(target, self.target):
             return
         self.target = target
-        self.organ_centre = self.rest_organ_centre + offset
         # translates persistent meshes and labels without changing camera framing
         for actor in (self.organ_actor, self.posterior_actor):
             actor.SetPosition(*offset)
         self.label_points.points[1] = self.scene_rotation @ self.target
         self.label_points.points[3] = self.scene_rotation @ (
-            self.organ_centre + [0.0, 0.0, 22.0])
+            self.organ_label_point + offset)
         self.render_pending = True
 
     def reset_camera(self, view_index=None):
