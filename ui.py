@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from multiprocessing import get_context
+from pathlib import Path
 from queue import Empty
 from threading import Event
 from time import perf_counter
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 from pyvistaqt import QtInteractor
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleUser
+from vtkmodules.vtkFiltersCore import vtkPolyDataTangents
 
 from astar import find_path, get_uncertainty_margin
 from experiments import RunStudyWorker
@@ -31,6 +33,33 @@ from sensors import ApplyBias, ApplyDropout, ApplyOutlier, measure_position
 
 def FormatReading(value):
     return "—" if value is None or not np.isfinite(value) else f"{value:.2f}"
+
+
+def CreateRevolvedMesh(profile, inner_radius=0.0, resolution=64):
+    # revolves an axial radius profile + caps either a solid part or an open bore
+    profile = np.asarray(profile, dtype=float)
+    if (profile.ndim != 2 or profile.shape[1] != 2 or len(profile) < 2
+            or not np.isfinite(profile).all() or np.any(profile[:, 1] <= inner_radius)
+            or inner_radius < 0 or resolution < 3):
+        raise ValueError("Invalid profile.")
+    if inner_radius:
+        profile = np.vstack((profile, [[profile[-1, 0], inner_radius],
+                                       [profile[0, 0], inner_radius]]))
+    angles = np.linspace(0, 2 * np.pi, resolution, endpoint=False)
+    points = np.column_stack((np.repeat(profile[:, 0], resolution),
+                              (profile[:, 1, None] * np.cos(angles)).ravel(),
+                              (profile[:, 1, None] * np.sin(angles)).ravel()))
+    indices = np.arange(len(profile) * resolution).reshape(-1, resolution)
+    following = np.roll(indices, -1, axis=0)
+    if not inner_radius:
+        indices, following = indices[:-1], following[:-1]
+    faces = np.stack((np.full_like(indices, 4), indices, np.roll(indices, -1, axis=1),
+                      np.roll(following, -1, axis=1), following), axis=-1).ravel()
+    if not inner_radius:
+        faces = np.r_[faces, resolution, np.arange(resolution)[::-1], resolution,
+                       np.arange((len(profile) - 1) * resolution, len(profile) * resolution)]
+    return pv.PolyData(points, faces=faces).compute_normals(
+        auto_orient_normals=True, consistent_normals=True, split_vertices=True, feature_angle=50).triangulate()
 
 
 class SimulatorWindow(QMainWindow):
@@ -72,6 +101,29 @@ class SimulatorWindow(QMainWindow):
         self.speed_limits = np.array([np.deg2rad(20), np.deg2rad(20), 15.0])
         self.camera_speed_limits = self.speed_limits.copy()
         self.camera_speed_limits[:2] = np.deg2rad(3)
+        # loads project-relative materials once, including when VS Code uses another working directory
+        material_folder = Path(__file__).resolve().parent / "assets" / "materials"
+        self.material_textures = {name: pv.read_texture(material_folder / f"{name}.png")
+                                  for name in ("skin", "tissue", "liver")}
+        for texture in self.material_textures.values():
+            texture.interpolate = texture.mipmap = texture.repeat = True
+            texture.use_srgb_color_space = True
+        # adds subtle surface grain through shading, without displacing physical geometry
+        grain = np.random.default_rng(41).standard_normal((512, 512))
+        for _ in range(4):
+            grain = (grain + np.roll(grain, 1, axis=0) + np.roll(grain, -1, axis=0)
+                     + np.roll(grain, 1, axis=1) + np.roll(grain, -1, axis=1)) / 5
+        grain /= np.max(np.abs(grain))
+        dy, dx = np.gradient(grain)
+        normals = np.dstack((-dx, -dy, np.ones_like(grain)))
+        normals /= np.linalg.norm(normals, axis=2)[:, :, None]
+        self.material_normal = pv.Texture(np.rint(127.5 * (normals + 1)).astype(np.uint8))
+        roughness = 0.9 + 0.1 * grain
+        self.material_roughness = pv.Texture(np.rint(255 * np.dstack(
+            (np.ones_like(grain), roughness, np.zeros_like(grain)))).astype(np.uint8))
+        for texture in (self.material_normal, self.material_roughness):
+            texture.interpolate = texture.mipmap = texture.repeat = True
+            texture.use_srgb_color_space = False
         self.target_tolerance = 2.0
         self.arrival_dwell = 0.5
         self.tracking_timeout = 0.25
@@ -565,7 +617,7 @@ class SimulatorWindow(QMainWindow):
         scene_layout.addWidget(self.viewport.interactor, 1)
         body.addWidget(scene_frame, 1)
         self.viewport.set_background("#edf2f6", top="#fafcfd")
-        self.viewport.enable_anti_aliasing("fxaa")
+        self.viewport.enable_anti_aliasing("ssaa")
         scene_key = QLabel('<span style="color:#d59420">●</span> Tool tip &nbsp; '
                            '<span style="color:#9eadb7">━</span> Laparoscope &nbsp; '
                            '<span style="color:#a9394c">●</span> Target &nbsp; '
@@ -729,9 +781,9 @@ class SimulatorWindow(QMainWindow):
         self.viewport.enable_lightkit()
         self.viewport.add_light(pv.Light(light_type="headlight", intensity=0.3))
         self.scope_light = pv.Light(light_type="scene light", positional=True,
-                                    color=(1.0, 0.97, 0.94), intensity=1.25,
+                                    color=(1.0, 0.97, 0.94), intensity=2.75,
                                     cone_angle=55, exponent=2,
-                                    attenuation_values=(0.9, 0.0, 0.00004))
+                                    attenuation_values=(0.55, 0.0, 0.00008))
         organ = pv.Sphere(radius=1, theta_resolution=96, phi_resolution=73)
         x, y, z = organ.points.T
         # shapes unequal lobes inside the original envelope + preserves the target-facing pole
@@ -751,8 +803,8 @@ class SimulatorWindow(QMainWindow):
         reach = np.exp(-((posterior.points[:, 1] - self.rest_target[1]) / 26) ** 2)
         posterior.points[:, 0] -= reach * max(0.0, 90 - self.rest_target[0]) * 0.65
         del posterior.point_data["Normals"]
-        organ = organ.merge(posterior)
         organ.compute_normals(inplace=True)
+        posterior.compute_normals(inplace=True)
         # matches each vessel section to the rounded segment used for clearance
         vessel_parts = []
         for first, second in zip(self.structure_points, self.structure_points[1:]):
@@ -772,7 +824,7 @@ class SimulatorWindow(QMainWindow):
         vessel.points = self.vessel_axis + self.structure_radius * self.vessel_radial
         self.vessel_actor = self.viewport.add_mesh(
             vessel, color="#a33245", smooth_shading=True, ambient=0.18,
-            specular=0.4, specular_power=45)
+            pbr=True, metallic=0.0, roughness=0.32)
         self.margin_mesh = vessel.copy()
         self.margin_mesh.points = self.vessel_axis + (
             self.structure_radius + self.required_clearance) * self.vessel_radial
@@ -842,37 +894,25 @@ class SimulatorWindow(QMainWindow):
         # gives the cut edge thickness without bringing the surface closer to the tool
         cavity = cavity.extrude((4, 0, 0), capping=True).triangulate().compute_normals(
             auto_orient_normals=True, consistent_normals=True, split_vertices=True, feature_angle=50)
-        # bakes subtle tissue mottling + fine vessels into stable surface colours
-        for mesh, base, detail in ((organ, [202, 139, 130], 1.0),
-                                   (tissue, [190, 124, 113], 0.5),
-                                   (cavity, [180, 117, 107], 0.0)):
+        # tints full-colour textures without multiplying the old baked colours into them
+        for mesh in (organ, posterior, tissue, cavity):
             x, y, z = mesh.points.T
-            variation = (3 * np.sin(0.09 * x + 0.07 * y) * np.cos(0.08 * z)
-                         + detail * np.sin(1.4 * y + 0.9 * z) * np.cos(1.1 * x))
-            vessels = np.exp(-((np.sin(0.22 * y + 0.13 * z)
-                               + 0.55 * np.sin(0.32 * z - 0.09 * y)
-                               + 0.2 * np.sin(0.65 * y + 0.43 * z)) / 0.14) ** 2)
-            colour = (np.asarray(base) + variation[:, None] * [1.0, 0.85, 0.7]
-                      - detail * vessels[:, None] * [6, 17, 13])
-            if mesh is organ:
-                posterior = np.clip((np.linalg.norm(mesh.points - self.target, axis=1) - 30) / 30, 0, 1)
-                colour = colour * (1 - posterior[:, None]) + posterior[:, None] * [133, 67, 63]
+            colour = np.tile([250.0, 246.0, 241.0], (mesh.n_points, 1))
             if mesh is cavity:
                 fat = (0.65 * np.exp(-((y - 70) / 80) ** 2 - ((z + 80) / 55) ** 2)
                        + 0.45 * np.exp(-((y + 90) / 60) ** 2 - ((z - 25) / 90) ** 2))
-                colour = colour * (1 - fat[:, None]) + fat[:, None] * [205, 160, 98]
+                colour = colour * (1 - fat[:, None]) + fat[:, None] * [255, 244, 173]
             mesh.point_data["colour"] = np.clip(np.rint(colour), 0, 255).astype(np.uint8)
         offset = organ.points - self.target
         angle = np.arctan2(offset[:, 2], offset[:, 1])
         radius = 4 * (1 + 0.1 * np.sin(3 * angle) + 0.06 * np.cos(5 * angle))
         blend = np.exp(-2 * (np.linalg.norm(offset, axis=1) / radius) ** 2)
         organ.point_data["colour"] = np.rint(
-            organ["colour"] * (1 - blend[:, None]) + blend[:, None] * [169, 57, 76]).astype(np.uint8)
-        self.organ_actor, self.tissue_actor, self.cavity_actor = [
+            organ["colour"] * (1 - blend[:, None]) + blend[:, None] * [190, 67, 100]).astype(np.uint8)
+        self.organ_actor, self.posterior_actor, self.tissue_actor, self.cavity_actor = [
             self.viewport.add_mesh(mesh, scalars="colour", rgb=True, show_scalar_bar=False,
-                                   smooth_shading=True, ambient=0.2,
-                                   specular=shine, specular_power=power)
-            for mesh, shine, power in ((organ, 0.32, 45), (tissue, 0.28, 40), (cavity, 0.22, 35))]
+                                   smooth_shading=True, pbr=True, metallic=0.0, roughness=0.4)
+            for mesh in (organ, posterior, tissue, cavity)]
         # keeps the roof fully opaque with the same real port openings
         points = [np.column_stack((outline, np.zeros(len(outline))))]
         faces = [np.r_[len(outline), np.arange(len(outline))]]
@@ -897,31 +937,45 @@ class SimulatorWindow(QMainWindow):
         wall = wall.extrude((thickness, 0, 0), capping=True).compute_normals(
             auto_orient_normals=True, consistent_normals=True, split_vertices=False)
         face_x = wall.cell_centers().points[:, 0] - self.port[0]
-        wall.cell_data["colour"] = np.tile([161, 100, 93], (wall.n_cells, 1)).astype(np.uint8)
-        wall.cell_data["colour"][np.isclose(face_x, self.wall_bounds[0])] = [219, 173, 152]
-        wall.cell_data["colour"][np.isclose(face_x, self.wall_bounds[1])] = [189, 129, 120]
+        wall.cell_data["colour"] = np.tile([233, 193, 179], (wall.n_cells, 1)).astype(np.uint8)
+        wall.cell_data["colour"][np.isclose(face_x, self.wall_bounds[0])] = [255, 255, 255]
+        wall.cell_data["colour"][np.isclose(face_x, self.wall_bounds[1])] = [243, 210, 200]
         self.wall_actor = self.viewport.add_mesh(
-            wall, scalars="colour", rgb=True, show_scalar_bar=False, ambient=0.2, specular=0.05)
+            wall, scalars="colour", rgb=True, show_scalar_bar=False, pbr=True, roughness=0.65)
         # builds a hollow housing that pivots around the fixed entry point
-        port = pv.Disc(normal=(1, 0, 0), inner=1.9, outer=3.1, c_res=48).extrude(
-            (-12, 0, 0), capping=True)
-        flange = pv.Disc(center=(-12, 0, 0), normal=(1, 0, 0),
-                         inner=1.9, outer=5.5, c_res=48).extrude((1.4, 0, 0), capping=True)
+        port = CreateRevolvedMesh([(-12, 4.7), (-11.7, 5.5), (-10.8, 5.5), (-10.5, 3.1),
+                                   (-8.3, 3.1), (-8, 2.95), (-7.7, 3.1),
+                                   (-4.3, 3.1), (-4, 2.95), (-3.7, 3.1),
+                                   (-0.5, 3.1), (0, 2.8)], inner_radius=1.9)
+        port.cell_data["colour"] = np.tile([76, 117, 133], (port.n_cells, 1)).astype(np.uint8)
+        port.cell_data["colour"][port.cell_centers().points[:, 0] < -10.8] = [108, 151, 164]
         self.port_actor = self.viewport.add_mesh(
-            port.merge(flange), color="#4c7585", smooth_shading=True,
+            port, scalars="colour", rgb=True, show_scalar_bar=False, smooth_shading=True,
             ambient=0.2, specular=0.3, specular_power=25)
 
         # separates the anchored housing from sliding laparoscope
         rear = self.scope_length - self.scope_depth
-        scope_port = pv.Disc(normal=(1, 0, 0), inner=self.scope_radius + 0.4,
-                             outer=3.9, c_res=48).extrude((-18, 0, 0), capping=True)
-        scope_flange = pv.Disc(center=(-18, 0, 0), normal=(1, 0, 0), inner=self.scope_radius + 0.4,
-                               outer=6.5, c_res=48).extrude((1.4, 0, 0), capping=True)
-        shaft = pv.Cylinder(center=((self.scope_depth - 1 - rear) / 2, 0, 0),
-                            direction=(1, 0, 0), radius=self.scope_radius,
-                            height=rear + self.scope_depth - 1, resolution=32)
-        head = pv.Capsule(center=(-rear - 6, 0, 0), direction=(1, 0, 0),
-                          radius=6.5, cylinder_length=5, resolution=24)
+        scope_profile = [(-18, 5.8), (-17.7, 6.5), (-16.9, 6.5), (-16.5, 3.9)]
+        for position in (-12, -8, -4):
+            scope_profile.extend(((position - 0.4, 3.9), (position, 3.7), (position + 0.4, 3.9)))
+        scope_profile.extend(((-0.5, 3.9), (0, 3.7)))
+        scope_port = CreateRevolvedMesh(scope_profile, inner_radius=self.scope_radius + 0.4)
+        # keeps engraved depth bands outside the body throughout the scope's insertion range
+        shaft_positions = np.sort(np.r_[-rear, self.scope_depth - 1,
+                                        (self.scope_depth - np.arange(70, 131, 10)[:, None]
+                                         + [-0.12, 0.12]).ravel()])
+        shaft = CreateRevolvedMesh(np.column_stack((shaft_positions,
+                                                   np.full(len(shaft_positions), self.scope_radius))))
+        head_profile = [(-15, 3.4), (-14, 5.3), (-12.5, 6.5)]
+        for position in (-11, -8, -5):
+            head_profile.extend(((position - 0.35, 6.5), (position - 0.15, 6.15),
+                                 (position + 0.15, 6.15), (position + 0.35, 6.5)))
+        head_profile.extend(((-2.8, 6.5), (-1, 5.6), (1, 4.4), (3, self.scope_radius)))
+        head_profile = np.asarray(head_profile)
+        head_profile[:, 0] -= rear
+        head = CreateRevolvedMesh(head_profile).clean(tolerance=1e-6, absolute=True).clip_closed_surface(
+            normal=(0, 0, -1), origin=(0, 0, 5.7))
+        head.compute_normals(split_vertices=True, feature_angle=50, inplace=True)
         cable = pv.Spline([(-rear - 6, -6, 0), (-rear - 12, -14, -2),
                            (-rear - 8, -30, -8), (-rear, -45, -12)], n_points=32).tube(
                                radius=1.2, n_sides=12)
@@ -929,21 +983,43 @@ class SimulatorWindow(QMainWindow):
                              radius=self.scope_radius, height=0.9, resolution=32)
         rim = pv.Disc(center=(self.scope_depth - 0.1, 0, 0), normal=(1, 0, 0),
                       inner=1.65, outer=self.scope_radius, c_res=48).extrude((0.1, 0, 0), capping=True)
-        lens = pv.Disc(center=(self.scope_depth, 0, 0), normal=(1, 0, 0),
-                       inner=0, outer=1.65, c_res=48)
-        scope_port = scope_port.merge(scope_flange)
+        lens = pv.Sphere(radius=1, theta_resolution=48, phi_resolution=33)
+        lens.points = lens.points * [0.12, 1.65, 1.65] + [self.scope_depth - 0.12, 0, 0]
+        del lens.point_data["Normals"]
+        lens.compute_normals(inplace=True)
+        illumination = pv.Disc(center=(self.scope_depth - 0.04, 0, 0), normal=(1, 0, 0),
+                               inner=1.85, outer=2.15, c_res=64)
         scope_port.cell_data["colour"] = np.tile([76, 117, 133], (scope_port.n_cells, 1)).astype(np.uint8)
         self.scope_port_actor = self.viewport.add_mesh(
             scope_port, scalars="colour", rgb=True, show_scalar_bar=False, smooth_shading=True,
             ambient=0.2, specular=0.45, specular_power=35)
         self.scope_port_actor.user_matrix = self.scene_matrix @ self.scope_matrix
         scope_parts = []
-        for mesh, colour in ((shaft, [158, 173, 183]), (head, [42, 54, 65]),
-                             (cable, [36, 43, 50]), (collar.merge(rim), [190, 201, 210]),
-                             (lens, [24, 49, 65])):
+        for mesh, colour in ((shaft, [176, 188, 197]), (head, [35, 43, 50]),
+                             (cable, [36, 43, 50]), (collar.merge(rim, merge_points=False), [190, 201, 210]),
+                             (lens, [16, 49, 64]), (illumination, [218, 216, 189])):
+            if mesh.point_data.active_normals_name is None:
+                mesh.compute_normals(split_vertices=True, feature_angle=50, inplace=True)
+            mesh.point_data["Normals"] = mesh.point_normals.copy()
             mesh.cell_data["colour"] = np.tile(colour, (mesh.n_cells, 1)).astype(np.uint8)
+            if mesh is shaft:
+                distance = self.scope_depth - mesh.cell_centers().points[:, 0]
+                engraved = (distance > 69) & (distance < 131) & (np.abs(distance / 10 - np.rint(distance / 10)) < 0.02)
+                mesh.cell_data["colour"][engraved] = [46, 57, 64]
             scope_parts.append(mesh)
-        scope = scope_parts[0].merge(scope_parts[1:])
+        # adds tactile buttons + a flexible strain relief behind the optical shaft
+        for position in (-8.5, -4.5):
+            button = pv.Cylinder(center=(-rear + position, 0, 5.95), direction=(0, 0, 1),
+                                 radius=1.1, height=0.5, resolution=32)
+            button.cell_data["colour"] = np.tile([94, 137, 153], (button.n_cells, 1)).astype(np.uint8)
+            scope_parts.append(button)
+        relief_direction = np.array([-6.0, -8.0, -2.0])
+        for fraction in np.linspace(0.1, 0.7, 5):
+            relief = pv.Cylinder(center=np.array([-rear - 6, -6, 0]) + fraction * relief_direction,
+                                 direction=relief_direction, radius=1.6, height=0.65, resolution=24)
+            relief.cell_data["colour"] = np.tile([48, 56, 63], (relief.n_cells, 1)).astype(np.uint8)
+            scope_parts.append(relief)
+        scope = scope_parts[0].merge(scope_parts[1:], merge_points=False)
         scope.points -= [self.scope_depth, 0.0, 0.0]
         self.scope_actor = self.viewport.add_mesh(
             scope, scalars="colour", rgb=True, show_scalar_bar=False, smooth_shading=True,
@@ -955,64 +1031,159 @@ class SimulatorWindow(QMainWindow):
         # builds each instrument part once
         self.shaft_actor = self.viewport.add_mesh(
             pv.Cylinder(center=(0.5, 0, 0), direction=(1, 0, 0),
-                        radius=self.tool_radius, height=1, resolution=32),
-            color="#48545f", smooth_shading=True, ambient=0.22, specular=0.65, specular_power=65)
+                        radius=self.tool_radius, height=1, resolution=64),
+            color="#2c343b", smooth_shading=True, ambient=0.22, specular=0.65, specular_power=65)
         self.external_shaft_actor = self.viewport.add_mesh(
             pv.Cylinder(center=(-0.5, 0, 0), direction=(1, 0, 0),
-                        radius=self.tool_radius, height=1, resolution=32),
-            color="#48545f", smooth_shading=True, ambient=0.22, specular=0.65, specular_power=65)
-        grip = pv.Sphere(radius=1, theta_resolution=24, phi_resolution=16)
-        grip.points = grip.points * [4, 2.3, 3.2] + [-5.5, 0, 0]
+                        radius=self.tool_radius, height=1, resolution=64),
+            color="#2c343b", smooth_shading=True, ambient=0.22, specular=0.65, specular_power=65)
+        grip = CreateRevolvedMesh([(-9.5, 1.5), (-9, 2.7), (-7.5, 3.6),
+                                   (-3.5, 3.6), (-2, 2.7), (-1.5, 1.5)])
+        grip.points[:, 1:] *= [0.65, 0.85]
+        del grip.point_data["Normals"], grip.cell_data["Normals"]
+        grip.compute_normals(inplace=True)
+        grip.cell_data["colour"] = np.tile([34, 42, 48], (grip.n_cells, 1)).astype(np.uint8)
         handle_parts = [grip]
-        angles = np.linspace(0, 2 * np.pi, 48, endpoint=False)
         for centre, radius in (((-7.5, -17), (5, 7.5)), ((-25, -12), (6, 6.8))):
-            points = np.column_stack((centre[0] + radius[0] * np.cos(angles), np.zeros_like(angles),
-                                      centre[1] + radius[1] * np.sin(angles)))
-            ring = pv.PolyData(points, lines=np.r_[len(points) + 1, np.arange(len(points)), 0])
-            handle_parts.append(ring.tube(radius=1.2, n_sides=12))
+            ring = CreateRevolvedMesh([(-1.1, 1.15), (-0.7, 1.2), (0.7, 1.2), (1.1, 1.15)],
+                                      inner_radius=0.78)
+            inner = np.linalg.norm(ring.cell_centers().points[:, 1:], axis=1) < 0.8
+            ring.cell_data["colour"] = np.tile([31, 38, 43], (ring.n_cells, 1)).astype(np.uint8)
+            ring.cell_data["colour"][inner] = [55, 65, 71]
+            ring.points = np.column_stack((centre[0] + radius[0] * ring.points[:, 1],
+                                          ring.points[:, 0], centre[1] - radius[1] * ring.points[:, 2]))
+            del ring.point_data["Normals"], ring.cell_data["Normals"]
+            ring.compute_normals(inplace=True)
+            handle_parts.append(ring)
         for points in (
                 [(-4.5, 0, -1.5), (-3, 0, -4), (-2.8, 0, -7), (-4, 0, -11.6)],
                 [(-6, 0, -1), (-10, 0, -3), (-14, 0, -7), (-19.8, 0, -8.6)]):
-            handle_parts.append(pv.Spline(points, n_points=32).tube(radius=1.5, n_sides=12, capping=True))
+            strut = pv.Spline(points, n_points=48).tube(radius=1.5, n_sides=24, capping=True)
+            strut.point_data["Normals"] = strut.point_normals.copy()
+            strut.cell_data["colour"] = np.tile([38, 46, 52], (strut.n_cells, 1)).astype(np.uint8)
+            handle_parts.append(strut)
+        rivet = pv.Cylinder(center=(-5.5, 0, -2), direction=(0, 1, 0),
+                            radius=0.85, height=3.8, resolution=32)
+        rivet.cell_data["colour"] = np.tile([133, 148, 157], (rivet.n_cells, 1)).astype(np.uint8)
+        handle_parts.append(rivet)
         self.handle_actor = self.viewport.add_mesh(
-            handle_parts[0].merge(handle_parts[1:]), color="#282e34", smooth_shading=True,
+            handle_parts[0].merge(handle_parts[1:], merge_points=False),
+            scalars="colour", rgb=True, show_scalar_bar=False, smooth_shading=True,
             ambient=0.25, specular=0.2, specular_power=25)
-        collar_parts = [pv.Cylinder(center=(-2, 0, 0), direction=(1, 0, 0), radius=2.8,
-                                    height=4, resolution=32),
+        knob = CreateRevolvedMesh([(-4, 2.5), (-3.8, 3.4), (-3.5, 3.8),
+                                   (-0.6, 3.8), (-0.3, 3.3), (0, 2.7)], resolution=96)
+        angles = np.arctan2(knob.points[:, 2], knob.points[:, 1])
+        knob.points[:, 1:] *= (1 - 0.035 * (0.5 + 0.5 * np.cos(24 * angles)))[:, None]
+        del knob.point_data["Normals"], knob.cell_data["Normals"]
+        knob.compute_normals(inplace=True)
+        collar_parts = [knob,
                         pv.Cylinder(center=(-5.5, 0, 0), direction=(0, 1, 0), radius=1.25,
                                     height=5, resolution=24)]
-        collar_parts.extend(pv.Cylinder(center=(position, 0, 0), direction=(1, 0, 0),
-                                       radius=3.3, height=0.4, resolution=32)
-                            for position in (-2.8, -1.8, -0.8))
-        collar = collar_parts[0].merge(collar_parts[1:])
+        collar = collar_parts[0].merge(collar_parts[1:], merge_points=False)
         collar.cell_data["colour"] = np.tile([52, 61, 70], (collar.n_cells, 1)).astype(np.uint8)
         collar.cell_data["colour"][collar.cell_centers().points[:, 0] < -4] = [135, 144, 153]
         self.collar_actor = self.viewport.add_mesh(
             collar, scalars="colour", rgb=True, show_scalar_bar=False, smooth_shading=True,
             ambient=0.25, specular=0.35, specular_power=30)
         # keeps closed jaws inside the existing shaft clearance envelope
-        sleeve = pv.Cylinder(center=(-self.tip_length + 1, 0, 0), direction=(1, 0, 0),
-                             radius=self.tool_radius, height=2, resolution=32)
-        sleeve.cell_data["colour"] = np.tile([154, 168, 178], (sleeve.n_cells, 1)).astype(np.uint8)
+        sleeve = CreateRevolvedMesh([(-self.tip_length, self.tool_radius),
+                                      (-14.8, self.tool_radius), (-14.6, 1.38),
+                                      (-13.9, 1.38), (-13.7, 1.46), (-13.2, 1.46),
+                                      (-self.jaw_length, 1.2)])
+        sleeve.cell_data["colour"] = np.tile([176, 188, 198], (sleeve.n_cells, 1)).astype(np.uint8)
         hinge = pv.Cylinder(center=(-self.jaw_length + 0.7, 0, 0), direction=(0, 1, 0),
                             radius=0.55, height=2.55, resolution=20)
         hinge.cell_data["colour"] = np.tile([100, 115, 125], (hinge.n_cells, 1)).astype(np.uint8)
         jaw_parts = [sleeve, hinge]
+        for side in (-1, 1):
+            washer = pv.Disc(center=(-self.jaw_length + 0.7, side * 1.28, 0), normal=(0, side, 0),
+                             inner=0.18, outer=0.48, c_res=48).extrude((0, side * 0.06, 0), capping=True)
+            washer.cell_data["colour"] = np.tile([202, 211, 218], (washer.n_cells, 1)).astype(np.uint8)
+            slot = pv.Cube(center=(-self.jaw_length + 0.7, side * 1.345, 0),
+                           x_length=0.58, y_length=0.02, z_length=0.07)
+            slot.cell_data["colour"] = np.tile([52, 64, 74], (slot.n_cells, 1)).astype(np.uint8)
+            jaw_parts.extend((washer, slot))
         face_length = self.jaw_length
         shape = pv.Capsule(center=(-(face_length + 1.2) / 2, 0, 0), direction=(1, 0, 0),
-                           radius=1.2, cylinder_length=face_length - 1.2, resolution=24)
+                           radius=1.2, cylinder_length=face_length - 1.2, resolution=48)
         shape = shape.clean(tolerance=1e-5, absolute=True).clip_closed_surface(
             normal=(1, 0, 0), origin=(-face_length, 0, 0))
         for side in (-1, 1):
             jaw = shape.clip_closed_surface(normal=(0, 0, side), origin=(0, 0, side * 0.04))
             back, front = jaw.bounds[:2]
             jaw.points[:, 0] = (jaw.points[:, 0] - front) * face_length / (front - back)
-            jaw.cell_data["colour"] = np.tile([154, 168, 178], (jaw.n_cells, 1)).astype(np.uint8)
+            along = (jaw.points[:, 0] + face_length) / face_length
+            jaw.points[:, 1] *= 0.88 - 0.42 * along ** 1.5
+            jaw.points[:, 2] *= 0.7 - 0.32 * along
+            if "Normals" in jaw.point_data:
+                del jaw.point_data["Normals"]
+            if "Normals" in jaw.cell_data:
+                del jaw.cell_data["Normals"]
+            jaw.compute_normals(split_vertices=True, feature_angle=50, inplace=True)
+            jaw.cell_data["colour"] = np.tile([176, 188, 198], (jaw.n_cells, 1)).astype(np.uint8)
+            faces = jaw.cell_centers().points
+            jaw.cell_data["colour"][np.abs(faces[:, 2]) < 0.06] = [104, 122, 134]
             jaw.cell_data["colour"][jaw.cell_centers().points[:, 0] > -0.3] = [213, 148, 32]
             jaw_parts.append(jaw)
+        # preserves each part's hard-edge normals when assembling the closed tip
+        for part in jaw_parts:
+            if part.point_data.active_normals_name is None:
+                part.compute_normals(split_vertices=True, feature_angle=50, inplace=True)
+            part.point_data["Normals"] = part.point_normals.copy()
         self.tip_actor = self.viewport.add_mesh(
-            jaw_parts[0].merge(jaw_parts[1:]), scalars="colour", rgb=True, show_scalar_bar=False,
+            jaw_parts[0].merge(jaw_parts[1:], merge_points=False), scalars="colour", rgb=True, show_scalar_bar=False,
             smooth_shading=True, ambient=0.18, specular=0.7, specular_power=65)
+
+        # maps material detail in local millimetres so breathing + view changes cannot slide it
+        for actor, material, scale, roughness, grain, coat in (
+                (self.organ_actor, "tissue", 55.0, 0.42, 0.14, 0.19),
+                (self.posterior_actor, "liver", 85.0, 0.38, 0.16, 0.22),
+                (self.tissue_actor, "tissue", 55.0, 0.46, 0.12, 0.15),
+                (self.cavity_actor, "tissue", 75.0, 0.5, 0.12, 0.14),
+                (self.wall_actor, "skin", 60.0, 0.68, 0.22, 0.0)):
+            mesh = actor.mapper.dataset.triangulate()
+            coordinates = mesh.points[:, 1:].copy()
+            if actor is self.cavity_actor:
+                # unwraps the bowl as a disc so detail follows the deep side walls
+                radius = np.linalg.norm(coordinates, axis=1)
+                arc = 155 * np.arctan2(radius, mesh.points[:, 0])
+                coordinates *= (arc / np.maximum(radius, 1e-6))[:, None]
+            mesh.active_texture_coordinates = (coordinates / scale).astype(np.float32)
+            mesh.compute_normals(consistent_normals=True, split_vertices=False, inplace=True)
+            tangent_filter = vtkPolyDataTangents()
+            tangent_filter.SetInputData(mesh)
+            tangent_filter.Update()
+            mesh = pv.wrap(tangent_filter.GetOutput())
+            tangents = mesh.point_data["Tangents"]
+            tangents -= mesh.point_normals * np.sum(tangents * mesh.point_normals, axis=1)[:, None]
+            invalid = ~np.isfinite(tangents).all(axis=1) | (np.linalg.norm(tangents, axis=1) < 1e-6)
+            # supplies a finite tangent at silhouette vertices where planar UVs collapse
+            normals = mesh.point_normals[invalid]
+            fallback = np.array([0.0, 1.0, 0.0]) - normals * normals[:, 1, None]
+            parallel = np.linalg.norm(fallback, axis=1) < 1e-6
+            fallback[parallel] = np.cross(normals[parallel], [1.0, 0.0, 0.0])
+            tangents[invalid] = fallback
+            tangents /= np.linalg.norm(tangents, axis=1)[:, None]
+            actor.mapper.dataset = mesh
+            actor.mapper.interpolate_before_map = False
+            actor.prop.SetBaseColorTexture(self.material_textures[material])
+            actor.prop.roughness = roughness
+            actor.prop.SetNormalTexture(self.material_normal)
+            actor.prop.SetNormalScale(grain)
+            actor.prop.SetORMTexture(self.material_roughness)
+            actor.prop.SetCoatStrength(coat)
+            actor.prop.SetCoatRoughness(0.32)
+        # separates steel, coated shafts + plastic through their response to light
+        for actor, metallic, roughness in (
+                (self.shaft_actor, 0.45, 0.28), (self.external_shaft_actor, 0.45, 0.28),
+                (self.tip_actor, 0.3, 0.25), (self.scope_actor, 0.35, 0.3),
+                (self.collar_actor, 0.35, 0.33), (self.handle_actor, 0.0, 0.55),
+                (self.port_actor, 0.05, 0.4), (self.scope_port_actor, 0.05, 0.4)):
+            actor.prop.interpolation = "pbr"
+            actor.prop.metallic = metallic
+            actor.prop.roughness = roughness
+        self.vessel_actor.prop.SetCoatStrength(0.3)
+        self.vessel_actor.prop.SetCoatRoughness(0.22)
 
         # keeps sensor overlays distinct from the physical instrument
         marker = pv.PolyData(
@@ -1029,7 +1200,7 @@ class SimulatorWindow(QMainWindow):
         for actor in (self.tool_estimate_actor, self.target_estimate_actor):
             actor.SetVisibility(self.estimates_checkbox.isChecked())
         # applies the shared layout to anatomy + tracking overlays
-        for actor in (self.organ_actor, self.vessel_actor, self.margin_actor, self.cavity_actor,
+        for actor in (self.organ_actor, self.posterior_actor, self.vessel_actor, self.margin_actor, self.cavity_actor,
                       self.tissue_actor, self.wall_actor, self.tool_measurement_actor,
                       self.target_measurement_actor, self.tool_estimate_actor,
                       self.target_estimate_actor):
@@ -1061,7 +1232,8 @@ class SimulatorWindow(QMainWindow):
         self.target = target
         self.organ_centre = self.rest_organ_centre + offset
         # translates persistent meshes and labels without changing camera framing
-        self.organ_actor.SetPosition(*offset)
+        for actor in (self.organ_actor, self.posterior_actor):
+            actor.SetPosition(*offset)
         self.label_points.points[1] = self.scene_rotation @ self.target
         self.label_points.points[3] = self.scene_rotation @ (
             self.organ_centre + [0.0, 0.0, 22.0])
@@ -1091,7 +1263,9 @@ class SimulatorWindow(QMainWindow):
             self.render_pending = False
             return
         self.viewport.enable_lightkit()
-        self.viewport.add_light(pv.Light(light_type="headlight", intensity=0.3))
+        for light in self.viewport.renderer.lights:
+            light.intensity *= 2
+        self.viewport.add_light(pv.Light(light_type="headlight", intensity=0.6))
         self.viewport.set_background("#edf2f6", top="#fafcfd")
         self.viewport.enable_trackball_style()
         focal = (0, 0, 0)
@@ -1106,13 +1280,16 @@ class SimulatorWindow(QMainWindow):
         # fits current physical models without letting sensor overlays shift the view
         actors = (self.shaft_actor, self.external_shaft_actor, self.tip_actor,
                   self.handle_actor, self.collar_actor, self.port_actor, self.wall_actor,
-                  self.scope_actor, self.scope_port_actor, self.organ_actor,
+                  self.scope_actor, self.scope_port_actor, self.organ_actor, self.posterior_actor,
                   self.vessel_actor, self.tissue_actor, self.cavity_actor)
         bounds = np.array([actor.GetBounds() for actor in actors
                            if actor.GetVisibility()]).reshape(-1, 3, 2)
         low = bounds[:, :, 0].min(axis=0)
         high = bounds[:, :, 1].max(axis=0)
-        organ_bounds = np.array(self.organ_actor.mapper.dataset.bounds).reshape(3, 2)
+        organ_bounds = np.array([actor.mapper.dataset.bounds for actor in (
+            self.organ_actor, self.posterior_actor)]).reshape(2, 3, 2)
+        organ_bounds = np.column_stack((organ_bounds[:, :, 0].min(axis=0),
+                                       organ_bounds[:, :, 1].max(axis=0)))
         organ_centre = self.scene_rotation @ organ_bounds.mean(axis=1)
         organ_extent = abs(self.scene_rotation) @ (np.diff(organ_bounds, axis=1).ravel() / 2)
         breathing = abs(self.scene_rotation) @ np.array([0.0, 0.0, self.motion_amplitude.value()])
@@ -1141,7 +1318,7 @@ class SimulatorWindow(QMainWindow):
             offset = focal - self.viewport.camera.focal_point
             self.viewport.camera.SetPosition(*(np.asarray(self.viewport.camera.position) + offset))
             self.viewport.camera.SetFocalPoint(*focal)
-            self.viewport.camera.zoom(1.15)
+            self.viewport.camera.zoom(1.3)
         self.viewport.renderer.ResetCameraClippingRange(bounds)
         self.viewport.render()
         self.render_pending = False
