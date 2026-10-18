@@ -809,8 +809,8 @@ class SimulatorWindow(QMainWindow):
         del vessel.point_data["axis"], vessel.point_data["radial"]
         vessel.points = self.vessel_axis + self.structure_radius * self.vessel_radial
         self.vessel_actor = self.viewport.add_mesh(
-            vessel, color="#a33245", smooth_shading=True, ambient=0.18,
-            pbr=True, metallic=0.0, roughness=0.32)
+            vessel, color="#812632", smooth_shading=True, ambient=0.18,
+            pbr=True, metallic=0.0, roughness=0.45)
         self.margin_mesh = vessel.copy()
         self.margin_mesh.points = self.vessel_axis + (
             self.structure_radius + self.required_clearance) * self.vessel_radial
@@ -862,6 +862,57 @@ class SimulatorWindow(QMainWindow):
         tissue = pv.PolyData(np.vstack((points.reshape(-1, 3), poles)),
                              faces=np.r_[faces.ravel(), fans.ravel()]).triangulate().compute_normals(
                                  auto_orient_normals=True, consistent_normals=True)
+        tissue.point_data["breathing"] = np.zeros(tissue.n_points)
+        # joins the upper neck to the liver, leaving the target fundus exposed
+        along = np.linspace(0, 1, 32)
+        guide = self.rest_target + np.column_stack((15 + 13 * along, 1 - 3 * along, 3 - 10 * along))
+        cells, first = organ.find_closest_cell(guide, return_closest_point=True)
+        first -= 0.3 * organ.cell_normals[cells]
+        cells, last = posterior.find_closest_cell(first + [1, 0, 4], return_closest_point=True)
+        last -= 0.4 * posterior.cell_normals[cells]
+        across = np.linspace(0, 1, 14)[None, :, None]
+        points = first[:, None, :] * (1 - across) + last[:, None, :] * across
+        points[:, :, 1] += 0.3 * np.sin(np.pi * across[0, :, 0]) * np.sin(2 * np.pi * along[:, None])
+        attachments = [(points, np.ones(points.shape[:2]))]
+        # joins the nearest part of the vessel backing with a short rounded tissue bridge
+        cells, anchors = posterior.find_closest_cell(centres, return_closest_point=True)
+        nearest = np.argmin(np.linalg.norm(anchors - centres, axis=1))
+        first = centres[nearest] + 0.2 * normals[nearest]
+        last = anchors[nearest] - 2 * posterior.cell_normals[cells[nearest]]
+        along = np.linspace(0, 1, 40)
+        control = (first + last) / 2 + [0, 0, 1.5]
+        points = ((1 - along[:, None]) ** 2 * first + 2 * along[:, None]
+                  * (1 - along[:, None]) * control + along[:, None] ** 2 * last)
+        direction = np.gradient(points, axis=0)
+        height = np.cross(direction, [0, 0, 1])
+        height /= np.linalg.norm(height, axis=1)[:, None]
+        bridge = pv.PolyData(points, lines=np.r_[len(points), np.arange(len(points))])
+        bridge.point_data["axis"] = points.copy()
+        bridge.point_data["height"] = height
+        bridge.point_data["breathing"] = along
+        bridge.point_data["radius"] = 1.5 + 1.1 * along + 0.25 * np.sin(np.pi * along)
+        bridge = bridge.tube(scalars="radius", absolute=True, n_sides=32, capping=True).triangulate()
+        radial = bridge.points - bridge["axis"]
+        bridge.points -= 0.3 * np.sum(radial * bridge["height"], axis=1)[:, None] * bridge["height"]
+        weights = bridge["breathing"].copy()
+        bridge.clear_data()
+        bridge.point_data["breathing"] = weights
+        tissue = tissue.merge(bridge, merge_points=False)
+        # gives each connecting sheet a thin closed edge + shared breathing weights
+        for points, weights in attachments:
+            sheet = pv.StructuredGrid(*np.moveaxis(points, -1, 0)).extract_surface(
+                algorithm="dataset_surface").triangulate().compute_normals(consistent_normals=True)
+            # follows surface point ordering when assigning the moving edge
+            weights = weights.ravel(order="F")[sheet["vtkOriginalPointIds"]]
+            normal = sheet.point_normals.mean(axis=0)
+            normal *= 0.6 / np.linalg.norm(normal)
+            sheet.clear_data()
+            sheet.point_data["breathing"] = weights
+            sheet.points -= normal / 2
+            sheet = sheet.extrude(normal, capping=True).triangulate().smooth(
+                n_iter=20, relaxation_factor=0.08)
+            tissue = tissue.merge(sheet, merge_points=False)
+        tissue.compute_normals(auto_orient_normals=True, consistent_normals=True, inplace=True)
         # loads the layered cutaway + retracted bowel without changing navigation geometry
         abdomen = self.anatomy_meshes["abdomen"].copy()
         outer = abdomen["region"][abdomen.faces.reshape(-1, 4)[:, 1]] == 2
@@ -1145,6 +1196,8 @@ class SimulatorWindow(QMainWindow):
             tangents[invalid] = fallback
             tangents /= np.linalg.norm(tangents, axis=1)[:, None]
             actor.mapper.dataset = mesh
+            # refreshes the scalar pipeline before caching the moving tissue
+            actor.mapper.GetInputAlgorithm().Update()
             actor.mapper.interpolate_before_map = False
             actor.prop.SetBaseColorTexture(self.material_textures[material])
             actor.prop.roughness = roughness
@@ -1153,6 +1206,8 @@ class SimulatorWindow(QMainWindow):
             actor.prop.SetORMTexture(self.material_roughness)
             actor.prop.SetCoatStrength(coat)
             actor.prop.SetCoatRoughness(0.32)
+        self.rest_tissue_points = self.tissue_actor.mapper.dataset.points.copy()
+        self.rest_tissue_tangents = self.tissue_actor.mapper.dataset.point_data["Tangents"].copy()
         # separates steel, coated shafts + plastic through their response to light
         for actor, metallic, roughness in (
                 (self.shaft_actor, 0.45, 0.28), (self.external_shaft_actor, 0.45, 0.28),
@@ -1162,7 +1217,7 @@ class SimulatorWindow(QMainWindow):
             actor.prop.interpolation = "pbr"
             actor.prop.metallic = metallic
             actor.prop.roughness = roughness
-        self.vessel_actor.prop.SetCoatStrength(0.3)
+        self.vessel_actor.prop.SetCoatStrength(0.1)
         self.vessel_actor.prop.SetCoatRoughness(0.22)
 
         # keeps sensor overlays distinct from the physical instrument
@@ -1213,6 +1268,18 @@ class SimulatorWindow(QMainWindow):
         # translates persistent meshes and labels without changing camera framing
         for actor in (self.organ_actor, self.posterior_actor):
             actor.SetPosition(*offset)
+        # keeps the vessel edge anchored while its tissue attachments follow the liver
+        tissue = self.tissue_actor.mapper.dataset
+        tissue.points = self.rest_tissue_points + tissue["breathing"][:, None] * offset
+        tissue.compute_normals(consistent_normals=True, split_vertices=False, inplace=True)
+        tangents = self.rest_tissue_tangents.copy()
+        tangents -= tissue.point_normals * np.sum(tangents * tissue.point_normals, axis=1)[:, None]
+        invalid = np.linalg.norm(tangents, axis=1) < 1e-6
+        fallback = np.cross(tissue.point_normals[invalid], [1.0, 0.0, 0.0])
+        parallel = np.linalg.norm(fallback, axis=1) < 1e-6
+        fallback[parallel] = np.cross(tissue.point_normals[invalid][parallel], [0.0, 1.0, 0.0])
+        tangents[invalid] = fallback
+        tissue.point_data["Tangents"] = tangents / np.linalg.norm(tangents, axis=1)[:, None]
         self.label_points.points[1] = self.scene_rotation @ self.target
         self.label_points.points[3] = self.scene_rotation @ (
             self.organ_label_point + offset)
