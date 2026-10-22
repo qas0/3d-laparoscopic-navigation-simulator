@@ -107,7 +107,7 @@ class SimulatorWindow(QMainWindow):
         self.camera_lower_limits = np.array([np.deg2rad(-3), np.deg2rad(-3), self.scope_depth])
         self.camera_upper_limits = np.array([np.deg2rad(3), np.deg2rad(3), 40.0])
         # shares the physical camera's optics between the viewport + saved captures
-        self.camera_view_angle = 60.0
+        self.camera_view_angle = 45.0
         self.camera_clipping_range = (0.5, 1000.0)
         self.speed_limits = np.array([np.deg2rad(20), np.deg2rad(20), 15.0])
         self.camera_speed_limits = self.speed_limits.copy()
@@ -899,11 +899,11 @@ class SimulatorWindow(QMainWindow):
     def build_scene(self):
         self.viewport.enable_lightkit()
         self.viewport.add_light(pv.Light(light_type="headlight", intensity=0.3))
-        # softens nearby wall illumination while retaining distance + angular falloff
+        # lights the operative field while retaining distance + angular falloff
         self.scope_light = pv.Light(light_type="scene light", positional=True,
-                                    color=(1.0, 0.99, 0.97), intensity=2.5,
-                                    cone_angle=62, exponent=1.3,
-                                    attenuation_values=(0.8, 0.0, 0.00005))
+                                    color=(1.0, 0.99, 0.97), intensity=2.7,
+                                    cone_angle=52, exponent=1.2,
+                                    attenuation_values=(0.75, 0.0, 0.00007))
         # preserves the source pair's proportions + anchors its fundus to the target
         organ = self.anatomy_meshes["gallbladder"].copy()
         posterior = self.anatomy_meshes["liver"].copy()
@@ -923,7 +923,7 @@ class SimulatorWindow(QMainWindow):
             mesh.points = mesh.points @ anatomy_rotation.T + self.rest_target
         vascular.point_data["colour"] = np.array([[151, 55, 57], [112, 58, 66]], dtype=np.uint8)[
             np.rint(vascular.point_data["region"]).astype(int)]
-        # matches each vessel section to the rounded segment used for clearance
+        # retains the exact rounded collision envelope for clearance overlays
         vessel_parts = []
         for first, second in zip(self.structure_points, self.structure_points[1:]):
             direction = second - first
@@ -939,20 +939,16 @@ class SimulatorWindow(QMainWindow):
         self.vessel_axis = vessel["axis"].copy()
         self.vessel_radial = vessel["radial"].copy()
         del vessel.point_data["axis"], vessel.point_data["radial"]
-        vessel.points = self.vessel_axis + self.structure_radius * self.vessel_radial
-        self.vessel_actor = self.viewport.add_mesh(
-            vessel, color="#812632", smooth_shading=True, ambient=0.18,
-            pbr=True, metallic=0.0, roughness=0.45)
         self.margin_mesh = vessel.copy()
         self.margin_mesh.points = self.vessel_axis + (
             self.structure_radius + self.required_clearance) * self.vessel_radial
         self.margin_actor = self.viewport.add_mesh(
             self.margin_mesh, color="#ce7a7e", opacity=0.045, lighting=False)
-        # backs the exposed vessel with a thin web inside its required clearance envelope
+        # samples the original segments without rounding their centreline away from the collision model
         lengths = np.linalg.norm(np.diff(self.structure_points, axis=0), axis=1)
         distances = np.r_[0.0, np.cumsum(lengths)]
         samples = np.unique(np.r_[distances, np.linspace(
-            0.0, distances[-1], int(np.ceil(distances[-1] / 2)) + 1)])
+            0.0, distances[-1], int(np.ceil(distances[-1])) + 1)])
         centres = np.column_stack([np.interp(samples, distances, self.structure_points[:, axis])
                                    for axis in range(3)])
         tangents = np.gradient(centres, samples, axis=0)
@@ -961,18 +957,50 @@ class SimulatorWindow(QMainWindow):
         normals -= np.sum(normals * tangents, axis=1)[:, None] * tangents
         normals /= np.linalg.norm(normals, axis=1)[:, None]
         sides = np.cross(tangents, normals)
+        # forms one continuous vessel with a slight inward taper beneath its tissue sleeves
+        vessel = pv.PolyData(centres, lines=np.r_[len(centres), np.arange(len(centres))])
+        ends = np.exp(-(samples / 3.2) ** 2) + np.exp(-((distances[-1] - samples) / 3.8) ** 2)
+        vessel.point_data["radius"] = self.structure_radius * (
+            0.98 + 0.02 * np.sin(0.19 * samples + 0.4) ** 2 - 0.07 * ends)
+        vessel.point_data["length"] = samples
+        vessel = vessel.tube(scalars="radius", absolute=True, n_sides=64,
+                             capping=True).triangulate().clean()
+        indices = np.searchsorted(samples, vessel["length"])
+        radial = vessel.points - centres[indices]
+        angle = np.arctan2(np.sum(radial * sides[indices], axis=1),
+                           np.sum(radial * normals[indices], axis=1))
+        length = vessel["length"].copy()
+        coordinates = np.column_stack((length, np.mod(angle, 2 * np.pi) * self.structure_radius))
+        # varies the outer wall colour with restrained longitudinal fibres + mottling
+        mottling = np.sin(0.7 * length + 1.6 * np.sin(3 * angle))
+        fibres = np.exp(-(np.sin(5 * angle + 0.08 * length) / 0.12) ** 2)
+        colour = (np.array([163, 69, 75]) + mottling[:, None] * [7, 4, 4]
+                  + fibres[:, None] * [12, 10, 8])
+        # feathers an uneven pale outer sheath into the fatty ends
+        edge = np.minimum(length + 0.8 * np.sin(2 * angle) + 0.4 * np.sin(5 * angle),
+                          distances[-1] - length + 1.1 * np.sin(3 * angle + 0.8))
+        sheath = np.clip((6 - edge) / 4, 0, 1)
+        sheath = 0.85 * sheath * sheath * (3 - 2 * sheath)
+        colour = colour * (1 - sheath[:, None]) + sheath[:, None] * [200, 174, 148]
+        vessel.clear_data()
+        vessel.active_texture_coordinates = coordinates.astype(np.float32)
+        vessel.point_data["colour"] = np.rint(colour).astype(np.uint8)
+        self.vessel_actor = self.viewport.add_mesh(
+            vessel, scalars="colour", rgb=True, show_scalar_bar=False,
+            smooth_shading=True, ambient=0.18, pbr=True, metallic=0.0, roughness=0.58)
         blend = np.sin(np.pi * samples / distances[-1]) ** 2
         angles = np.linspace(0, 2 * np.pi, 48, endpoint=False)
         fold_radius = self.structure_radius + self.required_clearance - 0.3
-        # flattens the backing away from the port + gathers small unequal folds
-        widths = fold_radius * (0.65 + 0.11 * blend + 0.025 * blend * np.sin(0.4 * samples))
-        heights = fold_radius * (0.085 + 0.035 * blend)
-        centres += (fold_radius * (0.47 + 0.025 * blend * np.sin(0.5 * samples)))[:, None] * normals
+        # beds the vessel in fat + buries both terminal caps within the clearance envelope
+        widths = fold_radius * (0.72 + 0.06 * blend + 0.10 * ends
+                                + 0.025 * blend * np.sin(0.8 * samples))
+        heights = fold_radius * (0.16 + 0.65 * ends)
+        centres += (fold_radius * (0.48 - 0.34 * ends))[:, None] * normals
         directions = (heights[:, None, None] * np.cos(angles)[None, :, None] * normals[:, None, :]
                       + widths[:, None, None] * np.sin(angles)[None, :, None] * sides[:, None, :])
         points = centres[:, None, :] + directions
         # closes both ends with the same flattened section
-        cap_radius = fold_radius * 0.25
+        cap_radius = fold_radius * 0.82
         cap_angles = np.linspace(np.pi / 2, 0, 7)[1:-1]
         caps = []
         for end, sign in ((0, -1), (-1, 1)):
@@ -1060,24 +1088,32 @@ class SimulatorWindow(QMainWindow):
                                 faces=np.column_stack((np.full(len(triangles), 3), triangles)).ravel())
             plate.point_data["breathing"] = np.ones(plate.n_points)
             tissue = tissue.merge(plate, merge_points=False)
+        # joins a complete body lining to a curved anterior wall with two real port openings
+        abdomen = self.anatomy_meshes["abdomen"].copy()
+        outer = abdomen["region"][abdomen.faces.reshape(-1, 4)[:, 1]] == 2
+        body = abdomen.extract_cells(outer).extract_surface(algorithm="dataset_surface")
+        cavity = abdomen.extract_cells(~outer).extract_surface(algorithm="dataset_surface")
         attachments = []
-        # spreads the vessel attachment into a thin tapered connective fold
-        cells, anchors = posterior.find_closest_cell(centres, return_closest_point=True)
-        nearest = np.argmin(np.linalg.norm(anchors - centres, axis=1))
+        # anchors the vessel bed to its nearest host instead of stretching a ribbon across the cavity
+        hosts = (posterior, cavity)
+        anchors = [host.find_closest_cell(centres, return_closest_point=True)[1] for host in hosts]
+        gaps = np.array([np.linalg.norm(points - centres, axis=1) for points in anchors])
+        host_index, nearest = np.unravel_index(np.argmin(gaps), gaps.shape)
+        host = hosts[host_index]
         edge = np.linspace(-1, 1, 28)
         first = (centres[nearest] + 0.15 * normals[nearest]
-                 + 2.3 * edge[:, None] * sides[nearest])
-        direction = anchors[nearest] - centres[nearest]
+                 + 3.2 * edge[:, None] * sides[nearest])
+        direction = anchors[host_index][nearest] - centres[nearest]
         direction /= np.linalg.norm(direction)
         first -= 0.6 * max(0.0, np.dot(direction, normals[nearest])) * normals[nearest]
-        guide = anchors[nearest] + 6.5 * edge[:, None] * sides[nearest]
-        cells, last = posterior.find_closest_cell(guide, return_closest_point=True)
-        last -= 0.65 * posterior.cell_normals[cells]
+        guide = anchors[host_index][nearest] + 7.5 * edge[:, None] * sides[nearest]
+        cells, last = host.find_closest_cell(guide, return_closest_point=True)
+        last -= 0.65 * host.cell_normals[cells]
         across = np.linspace(0, 1, 38)[None, :, None]
         points = first[:, None, :] * (1 - across) + last[:, None, :] * across
         folds = 0.8 + 0.45 * np.cos(1.5 * np.pi * edge)
         points += folds[:, None, None] * np.sin(np.pi * across) * normals[nearest]
-        weights = np.broadcast_to(across[0, :, 0], points.shape[:2])
+        weights = np.broadcast_to(across[0, :, 0] if host_index == 0 else 0.0, points.shape[:2])
         attachments.append((points, weights))
         # gives each connecting sheet a thin closed edge + shared breathing weights
         for points, weights in attachments:
@@ -1095,11 +1131,6 @@ class SimulatorWindow(QMainWindow):
             tissue = tissue.merge(sheet, merge_points=False)
         tissue = tissue.clean(tolerance=1e-6, absolute=True)
         tissue.compute_normals(auto_orient_normals=True, consistent_normals=True, inplace=True)
-        # joins a complete body lining to a curved anterior wall with two real port openings
-        abdomen = self.anatomy_meshes["abdomen"].copy()
-        outer = abdomen["region"][abdomen.faces.reshape(-1, 4)[:, 1]] == 2
-        body = abdomen.extract_cells(outer).extract_surface(algorithm="dataset_surface")
-        cavity = abdomen.extract_cells(~outer).extract_surface(algorithm="dataset_surface")
         outline = abdomen.field_data["front_outline"]
         hole_angles = np.linspace(0, 2 * np.pi, 64, endpoint=False)
         tool_opening = self.wall_opening_radius * np.column_stack((np.cos(hole_angles), np.sin(hole_angles)))
@@ -1420,21 +1451,24 @@ class SimulatorWindow(QMainWindow):
 
         # maps material detail in local millimetres so breathing + view changes cannot slide it
         for actor, material, scale, roughness, grain, coat in (
-                (self.organ_actor, "tissue", 55.0, 0.4, 0.14, 0.3),
-                (self.posterior_actor, "liver", 85.0, 0.36, 0.16, 0.32),
+                (self.organ_actor, "tissue", 55.0, 0.4, 0.1, 0.3),
+                (self.posterior_actor, "liver", 85.0, 0.36, 0.12, 0.32),
+                (self.vessel_actor, "tissue", 35.0, 0.58, 0.08, 0.06),
                 (self.tissue_actor, "fat", 35.0, 0.56, 0.1, 0.1),
                 (self.duct_actor, "tissue", 35.0, 0.44, 0.08, 0.2),
                 (self.vascular_actor, "tissue", 35.0, 0.43, 0.05, 0.2),
                 (self.diaphragm_actor, "tissue", 65.0, 0.52, 0.1, 0.12),
-                (self.stomach_actor, "tissue", 65.0, 0.43, 0.12, 0.22),
+                (self.stomach_actor, "tissue", 65.0, 0.48, 0.09, 0.18),
                 (self.duodenum_actor, "tissue", 45.0, 0.45, 0.1, 0.2),
-                (self.bowel_actor, "tissue", 65.0, 0.46, 0.12, 0.18),
+                (self.bowel_actor, "tissue", 65.0, 0.5, 0.09, 0.14),
                 (self.peritoneum_actor, "fat", 35.0, 0.56, 0.1, 0.1),
                 (self.cavity_actor, "tissue", 75.0, 0.5, 0.12, 0.14),
                 (self.wall_actor, "skin", 60.0, 0.68, 0.22, 0.0),
                 (self.body_actor, "skin", 60.0, 0.68, 0.22, 0.0)):
             mesh = actor.mapper.dataset.triangulate()
             coordinates = mesh.points[:, 1:].copy()
+            if actor is self.vessel_actor:
+                coordinates = mesh.active_texture_coordinates.copy()
             if actor is self.cavity_actor:
                 # follows the body lining with continuous material detail
                 radius = np.linalg.norm(coordinates, axis=1)
@@ -1476,6 +1510,7 @@ class SimulatorWindow(QMainWindow):
             actor.prop.SetNormalScale(grain)
             actor.prop.SetORMTexture(self.material_roughness)
             actor.prop.SetCoatStrength(coat)
+            actor.prop.SetCoatIOR(1.38)
             actor.prop.SetCoatRoughness(0.24 if actor in (self.organ_actor, self.posterior_actor) else 0.3)
         self.rest_tissue_points = self.tissue_actor.mapper.dataset.points.copy()
         self.rest_tissue_tangents = self.tissue_actor.mapper.dataset.point_data["Tangents"].copy()
@@ -1488,8 +1523,6 @@ class SimulatorWindow(QMainWindow):
             actor.prop.interpolation = "pbr"
             actor.prop.metallic = metallic
             actor.prop.roughness = roughness
-        self.vessel_actor.prop.SetCoatStrength(0.18)
-        self.vessel_actor.prop.SetCoatRoughness(0.25)
 
         # keeps sensor overlays distinct from the physical instrument
         marker = pv.PolyData(

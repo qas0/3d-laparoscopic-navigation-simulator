@@ -303,25 +303,35 @@ class CaptureTests(unittest.TestCase):
         actor.GetProperty().SetInterpolationToPBR()
         actor.GetProperty().SetMetallic(0.2)
         actor.GetProperty().SetRoughness(0.35)
+        actor.GetProperty().SetCoatStrength(0.3)
+        actor.GetProperty().SetCoatRoughness(0.24)
+        actor.GetProperty().SetCoatIOR(1.38)
         actor.GetProperty().SetBaseColorTexture(texture)
         camera = pv.Camera()
         camera.position = (0, 0, 12)
         camera.focal_point = (0, 0, 0)
         camera.up = (0, 1, 0)
-        camera.view_angle = 57
+        camera.view_angle = 45
         camera.clipping_range = (0.5, 40)
         camera.SetWindowCenter(-0.2, 0.13)
         light = pv.Light(position=(0, 0, 12), focal_point=(0, 0, 0), light_type="scene light")
         light.intensity = 0.7
         light.positional = True
-        light.cone_angle = 65
+        light.cone_angle = 52
+        light.exponent = 1.2
+        light.attenuation_values = (0.75, 0.0, 0.00007)
         actors = {"tissue": [actor]}
         metadata = {"scenario": "pickled scene"}
 
         expected_rgb, expected_labels = CaptureFrame(actors, camera, light, metadata, image_size=(160, 120))
         payload = SnapshotScene(actors, camera, light, serializable=True)
         snapshot = pickle.loads(pickle.dumps(payload))
-        rebuilt, _, _ = SnapshotScene(*snapshot)
+        rebuilt, frozen_camera, frozen_light = SnapshotScene(*snapshot)
+        self.assertEqual(frozen_camera.view_angle, 45)
+        self.assertEqual(frozen_light.cone_angle, 52)
+        self.assertEqual(frozen_light.exponent, 1.2)
+        self.assertEqual(frozen_light.attenuation_values, (0.75, 0.0, 0.00007))
+        self.assertAlmostEqual(rebuilt["tissue"][0].GetProperty().GetCoatIOR(), 1.38)
         rebuilt_mesh = pv.wrap(rebuilt["tissue"][0].GetMapper().GetInput())
         for key in ("points", "faces", "lines", "verts", "strips"):
             self.assertIs(type(snapshot[0]["tissue"][0]["mesh"][key]), np.ndarray)
@@ -345,10 +355,15 @@ class CaptureTests(unittest.TestCase):
         mesh.field_data["source"] = np.array(["changed"])
         actor.SetPosition(20, 30, 40)
         actor.GetProperty().SetRoughness(0.9)
+        actor.GetProperty().SetCoatStrength(0)
+        actor.GetProperty().SetCoatIOR(2.0)
         texture.GetInput().GetPointData().GetScalars().SetTuple3(0, 1, 2, 3)
         camera.SetWindowCenter(0, 0)
+        camera.view_angle = 70
         camera.clipping_range = (2, 200)
         light.intensity = 0.1
+        light.exponent = 3
+        light.attenuation_values = (1, 0, 0)
 
         rgb, labels = CaptureFrame(*snapshot, metadata, image_size=(160, 120))
 
@@ -357,7 +372,7 @@ class CaptureTests(unittest.TestCase):
         for name, expected in expected_labels.items():
             with self.subTest(label=name):
                 np.testing.assert_equal(labels[name], expected)
-        focal_length = 120 / (2 * np.tan(np.radians(57) / 2))
+        focal_length = 120 / (2 * np.tan(np.radians(45) / 2))
         np.testing.assert_allclose(labels["camera_intrinsics"],
                                    [[focal_length, 0, 95.5], [0, focal_length, 67.3], [0, 0, 1]])
         np.testing.assert_array_equal(labels["camera_clipping_mm"], [0.5, 40])
