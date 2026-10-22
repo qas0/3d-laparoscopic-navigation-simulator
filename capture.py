@@ -18,8 +18,19 @@ def SnapshotScene(actors, camera, light, serializable=False):
         for name, sources in actors.items():
             snapshot[name] = []
             for source in sources:
+                mesh = source["mesh"]
+                if isinstance(mesh, dict):
+                    data = mesh
+                    mesh = pv.PolyData(data["points"], faces=data["faces"], lines=data["lines"],
+                                       verts=data["verts"], strips=data["strips"], force_float=False)
+                    for association, arrays in data["data"].items():
+                        for key, value in arrays.items():
+                            getattr(mesh, association)[key] = value
+                    for attributes, active in zip((mesh.GetPointData(), mesh.GetCellData()), data["active"]):
+                        for role, key in enumerate(active):
+                            attributes.SetActiveAttribute(-1 if key is None else key, role)
                 mapper = vtkPolyDataMapper()
-                mapper.SetInputData(source["mesh"])
+                mapper.SetInputData(mesh)
                 for setting, value in source["mapper"].items():
                     getattr(mapper, f"Set{setting}")(value)
                 if source["lookup"] is not None:
@@ -67,7 +78,20 @@ def SnapshotScene(actors, camera, light, serializable=False):
     for name, sources in actors.items():
         snapshot[name] = []
         for source in sources:
-            mesh = pv.wrap(source.GetMapper().GetInput()).copy(deep=True)
+            mesh = pv.wrap(source.GetMapper().GetInput())
+            if serializable:
+                # plain arrays avoid VTK serialization holding the UI's Python lock
+                mesh = {
+                    "points": np.array(mesh.points),
+                    **{key: np.array(getattr(mesh, key)) for key in ("faces", "lines", "verts", "strips")},
+                    "data": {association: {key: np.array(value) for key, value in getattr(mesh, association).items()}
+                             for association in ("point_data", "cell_data", "field_data")},
+                    "active": [[None if attributes.GetAbstractAttribute(role) is None
+                                else attributes.GetAbstractAttribute(role).GetName()
+                                for role in range(attributes.NUM_ATTRIBUTES)]
+                               for attributes in (mesh.GetPointData(), mesh.GetCellData())]}
+            else:
+                mesh = mesh.copy(deep=True)
             mapper = {setting: getattr(source.GetMapper(), f"Get{setting}")()
                       for setting in ("ScalarVisibility", "ScalarMode", "ColorMode", "ArrayName", "ArrayId",
                                       "ArrayAccessMode", "ArrayComponent", "ScalarRange",
@@ -98,7 +122,8 @@ def SnapshotScene(actors, camera, light, serializable=False):
                 key = texture.GetAddressAsString("")
                 if key not in textures:
                     textures[key] = {
-                        "key": key, "image": pv.wrap(texture.GetInput()).copy(deep=True),
+                        "key": key, "image": (pv.Texture(pv.wrap(texture.GetInput())).to_array().copy()
+                                               if serializable else pv.wrap(texture.GetInput()).copy(deep=True)),
                         "settings": {setting: getattr(texture, f"Get{setting}")()
                                      for setting in ("Interpolate", "Repeat", "Mipmap", "EdgeClamp", "UseSRGBColorSpace",
                                                      "Quality", "BlendingMode", "ColorMode")}}

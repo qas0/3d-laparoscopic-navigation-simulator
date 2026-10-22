@@ -106,16 +106,19 @@ class SimulatorWindow(QMainWindow):
         # keeps the scope inside its opening + clear of the grasper's movement envelope
         self.camera_lower_limits = np.array([np.deg2rad(-3), np.deg2rad(-3), self.scope_depth])
         self.camera_upper_limits = np.array([np.deg2rad(3), np.deg2rad(3), 40.0])
+        # shares the physical camera's optics between the viewport + saved captures
+        self.camera_view_angle = 60.0
+        self.camera_clipping_range = (0.5, 1000.0)
         self.speed_limits = np.array([np.deg2rad(20), np.deg2rad(20), 15.0])
         self.camera_speed_limits = self.speed_limits.copy()
         self.camera_speed_limits[:2] = np.deg2rad(3)
         # loads project-relative materials once, including when VS Code uses another working directory
         material_folder = Path(__file__).resolve().parent / "assets" / "materials"
         self.material_textures = {name: pv.read_texture(material_folder / f"{name}.png")
-                                  for name in ("skin", "tissue", "liver")}
+                                  for name in ("skin", "tissue", "liver", "fat")}
         self.anatomy_meshes = {name: pv.read(material_folder.parent / "anatomy" / f"{name}.vtp")
                                for name in ("liver", "gallbladder", "abdomen", "bowel", "diaphragm",
-                                            "stomach", "duodenum")}
+                                            "stomach", "duodenum", "peritoneum", "ducts", "vessels")}
         for texture in self.material_textures.values():
             texture.interpolate = texture.mipmap = texture.repeat = True
             texture.use_srgb_color_space = True
@@ -173,6 +176,9 @@ class SimulatorWindow(QMainWindow):
             Qt.Key.Key_Q: (1, -1), Qt.Key.Key_E: (1, 1),
             Qt.Key.Key_S: (2, -1), Qt.Key.Key_W: (2, 1),
         }
+        self.camera_key_directions = {Qt.Key.Key_C: 1, Qt.Key.Key_V: -1}
+        self.camera_mouse_position = None
+        self.camera_mouse_sensitivity = np.deg2rad(0.03)
 
         self.setStyleSheet("""
             QWidget { background: #f3f6f9; color: #25384b; font: 10pt 'Segoe UI'; }
@@ -621,7 +627,7 @@ class SimulatorWindow(QMainWindow):
         self.labels_checkbox.toggled.connect(self.toggle_labels)
         scene_toolbar.addWidget(self.labels_checkbox)
         self.view_combo = QComboBox()
-        self.view_combo.setToolTip("Camera view moves the laparoscope with the movement keys + sliders.")
+        self.view_combo.setToolTip("Camera view: left-drag to aim the scope; C / V advance / retract. Tool keys + sliders stay active.")
         self.view_combo.addItems(["Perspective", "Camera view", "Top", "Front", "Overview"])
         self.view_combo.currentIndexChanged.connect(self.reset_camera)
         scene_toolbar.addWidget(self.view_combo)
@@ -653,7 +659,7 @@ class SimulatorWindow(QMainWindow):
         body.addWidget(scene_frame, 1)
         self.viewport.set_background("#edf2f6", top="#fafcfd")
         self.viewport.enable_anti_aliasing("ssaa")
-        scene_key = QLabel('<span style="color:#d59420">●</span> Tool tip &nbsp; '
+        scene_key = QLabel('<span style="color:#aebfca">●</span> Tool tip &nbsp; '
                            '<span style="color:#9eadb7">━</span> Laparoscope &nbsp; '
                            '<span style="color:#a9394c">●</span> Target &nbsp; '
                            '<span style="color:#a33245">━</span> Blood vessel &nbsp; '
@@ -733,14 +739,15 @@ class SimulatorWindow(QMainWindow):
                 camera.position = self.scope_tip.copy()
                 camera.focal_point = self.scope_tip + rotation[:, 0]
                 camera.up = rotation[:, 2]
-                camera.view_angle = 60.0
-                camera.clipping_range = (0.5, 1000.0)
+                camera.view_angle = self.camera_view_angle
+                camera.clipping_range = self.camera_clipping_range
                 actors = {
                     "instrument": [self.shaft_actor, self.external_shaft_actor, self.tip_actor,
                                    self.handle_actor, self.collar_actor, self.port_actor],
                     "gallbladder": [self.organ_actor], "liver": [self.posterior_actor],
                     "protected_vessel": [self.vessel_actor], "connective_tissue": [self.tissue_actor],
-                    "internal_tissue": [self.cavity_actor, self.bowel_actor],
+                    "internal_tissue": [self.cavity_actor, self.bowel_actor, self.peritoneum_actor,
+                                        self.vascular_actor],
                     "skin": [self.body_actor, self.wall_actor],
                     "laparoscope": [self.scope_actor, self.scope_port_actor], "bile_duct": [self.duct_actor],
                     "diaphragm": [self.diaphragm_actor], "stomach": [self.stomach_actor],
@@ -892,10 +899,11 @@ class SimulatorWindow(QMainWindow):
     def build_scene(self):
         self.viewport.enable_lightkit()
         self.viewport.add_light(pv.Light(light_type="headlight", intensity=0.3))
+        # softens nearby wall illumination while retaining distance + angular falloff
         self.scope_light = pv.Light(light_type="scene light", positional=True,
-                                    color=(1.0, 0.97, 0.94), intensity=2.75,
-                                    cone_angle=55, exponent=2,
-                                    attenuation_values=(0.55, 0.0, 0.00008))
+                                    color=(1.0, 0.99, 0.97), intensity=2.5,
+                                    cone_angle=62, exponent=1.3,
+                                    attenuation_values=(0.8, 0.0, 0.00005))
         # preserves the source pair's proportions + anchors its fundus to the target
         organ = self.anatomy_meshes["gallbladder"].copy()
         posterior = self.anatomy_meshes["liver"].copy()
@@ -903,33 +911,18 @@ class SimulatorWindow(QMainWindow):
         angle = np.radians(-53.2)
         cosine, sine = np.cos(angle), np.sin(angle)
         anatomy_rotation = np.array([[1, 0, 0], [0, cosine, -sine], [0, sine, cosine]])
-        neck = organ.points[np.argmax(organ.points[:, 0])].copy()
         organ.points = organ.points @ anatomy_rotation.T + self.rest_target
         posterior.points = posterior.points @ anatomy_rotation.T + self.rest_target
         self.organ_label_point = organ.points[np.argmax(organ.points[:, 2])].copy()
         organ.compute_normals(inplace=True)
         posterior.compute_normals(inplace=True)
-        # continues the gallbladder neck into a short duct junction beneath the liver
-        junction = np.array([38.0, -9.0, -16.5])
-        cystic = np.array([neck + [-2.0, 2.0, 2.0], neck + [2.0, -0.4, -0.6],
-                          neck + [5.0, -1.3, -1.0], junction])
-        hepatic = np.array([[41.0, -11.0, -11.0], [40.0, -10.0, -13.5], junction,
-                            [39.0, -7.0, -20.5], [43.0, -4.0, -23.5]])
-        cystic = cystic @ anatomy_rotation.T
-        hepatic = hepatic @ anatomy_rotation.T
-        cells, ends = posterior.find_closest_cell(hepatic[[0, -1]] + self.rest_target,
-                                                return_closest_point=True)
-        hepatic[[0, -1]] = ends - 2.0 * posterior.cell_normals[cells] - self.rest_target
-        duct_parts = []
-        for controls, radius in ((cystic, 0.8), (hepatic, 1.05)):
-            duct = pv.Spline(controls + self.rest_target, n_points=96)
-            along = np.linspace(0, 1, duct.n_points)
-            duct.point_data["radius"] = radius * (0.9 + 0.1 * np.sin(np.pi * along))
-            duct = duct.tube(scalars="radius", absolute=True, n_sides=24, capping=True).triangulate()
-            duct.clear_data()
-            duct_parts.append(duct)
-        duct = duct_parts[0].merge(duct_parts[1], merge_points=False).clean().compute_normals(
-            auto_orient_normals=True, consistent_normals=True, split_vertices=False)
+        # keeps the registered biliary + vascular branches attached to their source organs
+        duct = self.anatomy_meshes["ducts"].copy()
+        vascular = self.anatomy_meshes["vessels"].copy().cell_data_to_point_data(pass_cell_data=True)
+        for mesh in (duct, vascular):
+            mesh.points = mesh.points @ anatomy_rotation.T + self.rest_target
+        vascular.point_data["colour"] = np.array([[151, 55, 57], [112, 58, 66]], dtype=np.uint8)[
+            np.rint(vascular.point_data["region"]).astype(int)]
         # matches each vessel section to the rounded segment used for clearance
         vessel_parts = []
         for first, second in zip(self.structure_points, self.structure_points[1:]):
@@ -1002,20 +995,72 @@ class SimulatorWindow(QMainWindow):
                              faces=np.r_[faces.ravel(), fans.ravel()]).triangulate().compute_normals(
                                  auto_orient_normals=True, consistent_normals=True)
         tissue.point_data["breathing"] = np.zeros(tissue.n_points)
-        # joins the upper neck to the liver, leaving the target fundus exposed
-        along = np.linspace(0, 1, 32)
-        guide = (np.column_stack((15 + 13 * along, 1 - 3 * along, 3 - 10 * along))
-                 @ anatomy_rotation.T + self.rest_target)
-        cells, first = organ.find_closest_cell(guide, return_closest_point=True)
-        first -= 0.3 * organ.cell_normals[cells]
-        cells, last = posterior.find_closest_cell(first + np.array([1, 0, 4]) @ anatomy_rotation.T,
-                                                return_closest_point=True)
-        last -= 0.4 * posterior.cell_normals[cells]
-        across = np.linspace(0, 1, 14)[None, :, None]
-        points = first[:, None, :] * (1 - across) + last[:, None, :] * across
-        folds = 0.3 * np.sin(np.pi * across) * np.sin(2 * np.pi * along[:, None, None])
-        points += folds * anatomy_rotation[:, 1]
-        attachments = [(points, np.ones(points.shape[:2]))]
+        # forms a contact plate while leaving the target fundus exposed
+        cells, last = posterior.find_closest_cell(organ.points, return_closest_point=True)
+        direction = last - organ.points
+        contact = (((organ.points - self.rest_target) @ anatomy_rotation)[:, 0] > 8)
+        contact &= np.linalg.norm(direction, axis=1) < 4
+        contact &= np.sum(direction * organ.point_normals, axis=1) > -0.2
+        triangles = organ.faces.reshape(-1, 4)[:, 1:]
+        triangles = triangles[np.all(contact[triangles], axis=1)]
+        indices, inverse = np.unique(triangles, return_inverse=True)
+        triangles = inverse.reshape(-1, 3)
+        first = organ.points[indices] - 0.25 * organ.point_normals[indices]
+        # retains surface spacing to prevent collapsed projection cells
+        anchors = last[indices]
+        normal = posterior.cell_normals[cells[indices]]
+        last = 0.8 * anchors + 0.2 * organ.points[indices]
+        depth = np.maximum(np.sum((last - anchors) * normal, axis=1), 0) + 0.35
+        last -= depth[:, None] * normal
+        edges = np.vstack((triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]))
+        _, inverse, counts = np.unique(np.sort(edges, axis=1), axis=0,
+                                       return_inverse=True, return_counts=True)
+        border = np.unique(edges[counts[inverse] == 1])
+        distance = np.linalg.norm(organ.points[indices, None] - organ.points[indices[border]][None], axis=2).min(axis=1)
+        blend = np.clip(distance / 1.8, 0, 1)
+        blend = blend * blend * (3 - 2 * blend)
+        # tapers the exposed border into the gallbladder surface
+        last = first + blend[:, None] * (last - first) + (1 - blend[:, None]) * 0.15 * organ.point_normals[indices]
+        contacts = [(first, last, triangles)]
+        # follows the liver behind the neck while keeping the registered branches exposed
+        neck = organ.points[np.argmax(organ.points[:, 0])]
+        distance = np.linalg.norm(posterior.points - neck, axis=1)
+        near = np.flatnonzero(distance < 6)
+        _, near_duct = duct.find_closest_cell(posterior.points[near], return_closest_point=True)
+        _, near_vessel = vascular.find_closest_cell(posterior.points[near], return_closest_point=True)
+        gap = np.minimum(np.linalg.norm(near_duct - posterior.points[near], axis=1),
+                         np.linalg.norm(near_vessel - posterior.points[near], axis=1))
+        score = np.full(posterior.n_points, -1.0)
+        score[near] = np.minimum((6 - distance[near]) / 1.8, (gap - 0.8) / 0.8)
+        triangles = posterior.faces.reshape(-1, 4)[:, 1:]
+        triangles = triangles[np.all(score[triangles] > 0, axis=1)]
+        indices, inverse = np.unique(triangles, return_inverse=True)
+        triangles = inverse.reshape(-1, 3)
+        edges = np.vstack((triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]))
+        _, inverse, counts = np.unique(np.sort(edges, axis=1), axis=0,
+                                       return_inverse=True, return_counts=True)
+        border = np.unique(edges[counts[inverse] == 1])
+        distance = np.linalg.norm(posterior.points[indices, None] - posterior.points[indices[border]][None], axis=2).min(axis=1)
+        blend = np.clip(np.minimum(score[indices], distance / 0.8), 0, 1)
+        blend = blend * blend * (3 - 2 * blend)
+        first = posterior.points[indices] - 0.35 * posterior.point_normals[indices]
+        last = posterior.points[indices] + (-0.15 + 0.5 * blend[:, None]) * posterior.point_normals[indices]
+        contacts.append((first, last, triangles))
+        # closes both contact layers + moves them with their shared organ hosts
+        for first, last, triangles in contacts:
+            count = len(first)
+            edges = np.vstack((triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]))
+            _, inverse, counts = np.unique(np.sort(edges, axis=1), axis=0,
+                                           return_inverse=True, return_counts=True)
+            edges = edges[counts[inverse] == 1]
+            triangles = np.vstack((triangles[:, ::-1], triangles + count,
+                                   np.column_stack((edges, edges[:, 1] + count)),
+                                   np.column_stack((edges[:, 0], edges[:, 1] + count, edges[:, 0] + count))))
+            plate = pv.PolyData(np.vstack((first, last)),
+                                faces=np.column_stack((np.full(len(triangles), 3), triangles)).ravel())
+            plate.point_data["breathing"] = np.ones(plate.n_points)
+            tissue = tissue.merge(plate, merge_points=False)
+        attachments = []
         # spreads the vessel attachment into a thin tapered connective fold
         cells, anchors = posterior.find_closest_cell(centres, return_closest_point=True)
         nearest = np.argmin(np.linalg.norm(anchors - centres, axis=1))
@@ -1102,9 +1147,13 @@ class SimulatorWindow(QMainWindow):
         skin = abdomen.merge([*layers, port_walls], merge_points=True).clean(tolerance=0.0001, absolute=True)
         skin.compute_normals(consistent_normals=True, split_vertices=False, inplace=True)
         # preserves the digestive group's shared anatomy + moves it with the adjacent liver
-        stomach, duodenum, bowel = [self.anatomy_meshes[name].copy()
-                                    for name in ("stomach", "duodenum", "bowel")]
-        for mesh in (stomach, duodenum, bowel):
+        stomach, duodenum, bowel, peritoneum = [self.anatomy_meshes[name].copy()
+                                               for name in ("stomach", "duodenum", "bowel", "peritoneum")]
+        # renders the refined mesenteric folds once, with their own fat material
+        cells = bowel.faces.reshape(-1, 4)[:, 1:]
+        bowel = bowel.extract_cells(np.all(bowel["region"][cells] != 1, axis=1)).extract_surface(
+            algorithm="dataset_surface")
+        for mesh in (stomach, duodenum, bowel, peritoneum):
             mesh.points = mesh.points @ anatomy_rotation.T + self.rest_target
 
         # presents a section externally while retaining the full enclosure for the scope + capture
@@ -1123,11 +1172,16 @@ class SimulatorWindow(QMainWindow):
         self.section_actor = self.viewport.add_mesh(
             pv.wrap(cutter.GetClipFaceOutput()).copy().clean(), color="#d8b590", pbr=True, roughness=0.7)
         self.section_actor.user_matrix = self.scene_matrix
+        # frames the body section displayed in external views
+        points = skin.points
+        kept = (points - np.array(section.GetOrigin())) @ np.array(section.GetNormal()) >= 0
+        points = np.vstack((points[kept], self.section_actor.mapper.dataset.points)) @ self.scene_rotation.T
+        self.section_bounds = np.column_stack((points.min(axis=0), points.max(axis=0))).ravel()
         self.section_plane = vtkPlane()
         self.section_plane.SetNormal(*(self.scene_rotation @ np.array(section.GetNormal())))
         self.section_plane.SetOrigin(*(self.scene_rotation @ np.array(section.GetOrigin())))
         # tints full-colour textures without multiplying the old baked colours into them
-        for mesh in (organ, posterior, tissue, cavity, body, stomach, duodenum, bowel):
+        for mesh in (organ, posterior, tissue, cavity, body, stomach, duodenum, bowel, peritoneum):
             colour = np.tile([250.0, 246.0, 241.0], (mesh.n_points, 1))
             if mesh is organ:
                 colour[:] = [130, 215, 120]
@@ -1147,12 +1201,15 @@ class SimulatorWindow(QMainWindow):
         organ.point_data["colour"] = np.rint(
             organ["colour"] * (1 - blend[:, None]) + blend[:, None] * [190, 67, 100]).astype(np.uint8)
         (self.organ_actor, self.posterior_actor, self.tissue_actor, self.cavity_actor, self.body_actor,
-         self.stomach_actor, self.duodenum_actor, self.bowel_actor) = [
+         self.stomach_actor, self.duodenum_actor, self.bowel_actor, self.peritoneum_actor) = [
             self.viewport.add_mesh(mesh, scalars="colour", rgb=True, show_scalar_bar=False,
                                    smooth_shading=True, pbr=True, metallic=0.0, roughness=0.4)
-            for mesh in (organ, posterior, tissue, cavity, body, stomach, duodenum, bowel)]
+            for mesh in (organ, posterior, tissue, cavity, body, stomach, duodenum, bowel, peritoneum)]
         self.duct_actor = self.viewport.add_mesh(
-            duct, color="#999878", smooth_shading=True, pbr=True, roughness=0.46)
+            duct, color="#b6b28b", smooth_shading=True, pbr=True, roughness=0.46)
+        self.vascular_actor = self.viewport.add_mesh(
+            vascular, scalars="colour", rgb=True, show_scalar_bar=False,
+            smooth_shading=True, pbr=True, metallic=0.0, roughness=0.43)
         diaphragm = self.anatomy_meshes["diaphragm"].copy()
         diaphragm.points = diaphragm.points @ anatomy_rotation.T + self.rest_target
         self.diaphragm_actor = self.viewport.add_mesh(
@@ -1160,22 +1217,22 @@ class SimulatorWindow(QMainWindow):
         self.wall_actor = self.viewport.add_mesh(
             wall, scalars="colour", rgb=True, show_scalar_bar=False, pbr=True, roughness=0.65)
         # builds a hollow housing that pivots around the fixed entry point
-        port = CreateRevolvedMesh([(-12, 4.7), (-11.7, 5.5), (-10.8, 5.5), (-10.5, 3.1),
-                                   (-8.3, 3.1), (-8, 2.95), (-7.7, 3.1),
-                                   (-4.3, 3.1), (-4, 2.95), (-3.7, 3.1),
-                                   (-0.5, 3.1), (0, 2.8)], inner_radius=1.9)
+        port = CreateRevolvedMesh([(-18, 5.8), (-17.5, 7), (-14, 7), (-13, 5.2),
+                                   (-11.5, 3.4), (-4, 3.4), (-3.5, 3.1),
+                                   (-0.5, 3.1), (0, 2.7), (0.4, 2.2),
+                                   (5, 2.2), (5.3, 2.05)], inner_radius=1.9)
         port.cell_data["colour"] = np.tile([76, 117, 133], (port.n_cells, 1)).astype(np.uint8)
-        port.cell_data["colour"][port.cell_centers().points[:, 0] < -10.8] = [108, 151, 164]
+        port.cell_data["colour"][port.cell_centers().points[:, 0] < -14] = [108, 151, 164]
+        port.cell_data["colour"][port.cell_centers().points[:, 0] > 0] = [167, 180, 189]
         self.port_actor = self.viewport.add_mesh(
             port, scalars="colour", rgb=True, show_scalar_bar=False, smooth_shading=True,
             ambient=0.2, specular=0.3, specular_power=25)
 
         # separates the anchored housing from sliding laparoscope
         rear = self.scope_length - self.scope_depth
-        scope_profile = [(-18, 5.8), (-17.7, 6.5), (-16.9, 6.5), (-16.5, 3.9)]
-        for position in (-12, -8, -4):
-            scope_profile.extend(((position - 0.4, 3.9), (position, 3.7), (position + 0.4, 3.9)))
-        scope_profile.extend(((-0.5, 3.9), (0, 3.7)))
+        scope_profile = [(-32, 7.5), (-31.5, 9.5), (-28, 9.5), (-26.5, 6.7),
+                         (-23.5, 3.8), (-4, 3.8), (-0.5, 3.8),
+                         (0, 3.5), (0.4, 3.2), (5, 3.2), (5.3, 3.05)]
         scope_port = CreateRevolvedMesh(scope_profile, inner_radius=self.scope_radius + 0.4)
         # keeps engraved depth bands outside the body throughout the scope's insertion range
         shaft_positions = np.sort(np.r_[-rear, self.scope_depth - 1,
@@ -1183,19 +1240,19 @@ class SimulatorWindow(QMainWindow):
                                          + [-0.12, 0.12]).ravel()])
         shaft = CreateRevolvedMesh(np.column_stack((shaft_positions,
                                                    np.full(len(shaft_positions), self.scope_radius))))
-        head_profile = [(-15, 3.4), (-14, 5.3), (-12.5, 6.5)]
-        for position in (-11, -8, -5):
-            head_profile.extend(((position - 0.35, 6.5), (position - 0.15, 6.15),
-                                 (position + 0.15, 6.15), (position + 0.35, 6.5)))
-        head_profile.extend(((-2.8, 6.5), (-1, 5.6), (1, 4.4), (3, self.scope_radius)))
+        head_profile = [(-23, 5.1), (-21.5, 8.1), (-19.5, 11.4)]
+        for position in (-17, -12, -7):
+            head_profile.extend(((position - 0.5, 11.4), (position - 0.2, 10.9),
+                                 (position + 0.2, 10.9), (position + 0.5, 11.4)))
+        head_profile.extend(((-3.5, 11.4), (-1, 9.2), (2, 5), (4, self.scope_radius)))
         head_profile = np.asarray(head_profile)
         head_profile[:, 0] -= rear
         head = CreateRevolvedMesh(head_profile).clean(tolerance=1e-6, absolute=True).clip_closed_surface(
-            normal=(0, 0, -1), origin=(0, 0, 5.7))
+            normal=(0, 0, -1), origin=(0, 0, 10))
         head.compute_normals(split_vertices=True, feature_angle=50, inplace=True)
-        cable = pv.Spline([(-rear - 6, -6, 0), (-rear - 12, -14, -2),
-                           (-rear - 8, -30, -8), (-rear, -45, -12)], n_points=32).tube(
-                               radius=1.2, n_sides=12)
+        cable = pv.Spline([(-rear - 14, -10, 0), (-rear - 22, -22, -4),
+                           (-rear - 31, -34, -12), (-rear - 40, -45, -18)], n_points=32).tube(
+                               radius=1.4, n_sides=16)
         collar = pv.Cylinder(center=(self.scope_depth - 0.55, 0, 0), direction=(1, 0, 0),
                              radius=self.scope_radius, height=0.9, resolution=32)
         rim = pv.Disc(center=(self.scope_depth - 0.1, 0, 0), normal=(1, 0, 0),
@@ -1207,6 +1264,7 @@ class SimulatorWindow(QMainWindow):
         illumination = pv.Disc(center=(self.scope_depth - 0.04, 0, 0), normal=(1, 0, 0),
                                inner=1.85, outer=2.15, c_res=64)
         scope_port.cell_data["colour"] = np.tile([76, 117, 133], (scope_port.n_cells, 1)).astype(np.uint8)
+        scope_port.cell_data["colour"][scope_port.cell_centers().points[:, 0] > 0] = [167, 180, 189]
         self.scope_port_actor = self.viewport.add_mesh(
             scope_port, scalars="colour", rgb=True, show_scalar_bar=False, smooth_shading=True,
             ambient=0.2, specular=0.45, specular_power=35)
@@ -1225,15 +1283,15 @@ class SimulatorWindow(QMainWindow):
                 mesh.cell_data["colour"][engraved] = [46, 57, 64]
             scope_parts.append(mesh)
         # adds tactile buttons + a flexible strain relief behind the optical shaft
-        for position in (-8.5, -4.5):
-            button = pv.Cylinder(center=(-rear + position, 0, 5.95), direction=(0, 0, 1),
-                                 radius=1.1, height=0.5, resolution=32)
+        for position in (-13.5, -7.5):
+            button = pv.Cylinder(center=(-rear + position, 0, 10.3), direction=(0, 0, 1),
+                                 radius=1.9, height=0.6, resolution=32)
             button.cell_data["colour"] = np.tile([94, 137, 153], (button.n_cells, 1)).astype(np.uint8)
             scope_parts.append(button)
-        relief_direction = np.array([-6.0, -8.0, -2.0])
-        for fraction in np.linspace(0.1, 0.7, 5):
-            relief = pv.Cylinder(center=np.array([-rear - 6, -6, 0]) + fraction * relief_direction,
-                                 direction=relief_direction, radius=1.6, height=0.65, resolution=24)
+        relief_direction = np.array([-8.0, -12.0, -4.0])
+        for fraction in np.linspace(0.1, 0.8, 6):
+            relief = pv.Cylinder(center=np.array([-rear - 14, -10, 0]) + fraction * relief_direction,
+                                 direction=relief_direction, radius=2.2, height=0.8, resolution=24)
             relief.cell_data["colour"] = np.tile([48, 56, 63], (relief.n_cells, 1)).astype(np.uint8)
             scope_parts.append(relief)
         scope = scope_parts[0].merge(scope_parts[1:], merge_points=False)
@@ -1261,7 +1319,7 @@ class SimulatorWindow(QMainWindow):
         grip.compute_normals(inplace=True)
         grip.cell_data["colour"] = np.tile([34, 42, 48], (grip.n_cells, 1)).astype(np.uint8)
         handle_parts = [grip]
-        for centre, radius in (((-7.5, -17), (5, 7.5)), ((-25, -12), (6, 6.8))):
+        for centre, radius in (((-9, -22), (10, 11)), ((-31, -18), (10.5, 10.5))):
             ring = CreateRevolvedMesh([(-1.1, 1.15), (-0.7, 1.2), (0.7, 1.2), (1.1, 1.15)],
                                       inner_radius=0.78)
             inner = np.linalg.norm(ring.cell_centers().points[:, 1:], axis=1) < 0.8
@@ -1274,7 +1332,7 @@ class SimulatorWindow(QMainWindow):
             handle_parts.append(ring)
         for points in (
                 [(-4.5, 0, -1.5), (-3, 0, -4), (-2.8, 0, -7), (-4, 0, -11.6)],
-                [(-6, 0, -1), (-10, 0, -3), (-14, 0, -7), (-19.8, 0, -8.6)]):
+                [(-6, 0, -1), (-12, 0, -3), (-18, 0, -7), (-23, 0, -9)]):
             strut = pv.Spline(points, n_points=48).tube(radius=1.5, n_sides=24, capping=True)
             strut.point_data["Normals"] = strut.point_normals.copy()
             strut.cell_data["colour"] = np.tile([38, 46, 52], (strut.n_cells, 1)).astype(np.uint8)
@@ -1313,34 +1371,43 @@ class SimulatorWindow(QMainWindow):
         hinge.cell_data["colour"] = np.tile([100, 115, 125], (hinge.n_cells, 1)).astype(np.uint8)
         jaw_parts = [sleeve, hinge]
         for side in (-1, 1):
+            # supports the hinge pin with two cheeks joined to the distal sleeve
+            cheek = pv.PolyData(np.array([[-13.3, side * 1.05, -0.3], [-13.3, side * 1.05, 0.3],
+                                          [-12.4, side * 1.05, 0.55], [-11.55, side * 1.05, 0.3],
+                                          [-11.55, side * 1.05, -0.3], [-12.4, side * 1.05, -0.55]]),
+                                faces=[6, 0, 1, 2, 3, 4, 5]).extrude(
+                                    (0, side * 0.23, 0), capping=True).triangulate().compute_normals(
+                                        auto_orient_normals=True, consistent_normals=True,
+                                        split_vertices=True, feature_angle=50)
+            cheek.cell_data["colour"] = np.tile([176, 188, 198], (cheek.n_cells, 1)).astype(np.uint8)
             washer = pv.Disc(center=(-self.jaw_length + 0.7, side * 1.28, 0), normal=(0, side, 0),
                              inner=0.18, outer=0.48, c_res=48).extrude((0, side * 0.06, 0), capping=True)
             washer.cell_data["colour"] = np.tile([202, 211, 218], (washer.n_cells, 1)).astype(np.uint8)
             slot = pv.Cube(center=(-self.jaw_length + 0.7, side * 1.345, 0),
                            x_length=0.58, y_length=0.02, z_length=0.07)
             slot.cell_data["colour"] = np.tile([52, 64, 74], (slot.n_cells, 1)).astype(np.uint8)
-            jaw_parts.extend((washer, slot))
-        face_length = self.jaw_length
-        shape = pv.Capsule(center=(-(face_length + 1.2) / 2, 0, 0), direction=(1, 0, 0),
-                           radius=1.2, cylinder_length=face_length - 1.2, resolution=48)
-        shape = shape.clean(tolerance=1e-5, absolute=True).clip_closed_surface(
-            normal=(1, 0, 0), origin=(-face_length, 0, 0))
+            jaw_parts.extend((cheek, washer, slot))
+        # tapers two closed blades with flat sides + a small bevel around each edge
+        outline = np.array([[-13, 0.08], [-13, 0.38], [-12.2, 0.72], [-10.5, 0.78],
+                            [-8, 0.61], [-5, 0.38], [-2.2, 0.16], [0, 0],
+                            [-1.1, 0.03], [-4, 0.08], [-8, 0.12], [-11.8, 0.1]])
+        outline[:, 0] *= self.jaw_length / 13
+        inset = 0.96 * outline + 0.04 * outline.mean(axis=0)
+        indices = np.arange(4 * len(outline)).reshape(4, -1)
+        faces = np.column_stack((np.full(3 * len(outline), 4), indices[:-1].ravel(),
+                                  np.roll(indices[:-1], -1, axis=1).ravel(),
+                                  np.roll(indices[1:], -1, axis=1).ravel(), indices[1:].ravel())).ravel()
+        faces = np.r_[faces, len(outline), indices[0, ::-1], len(outline), indices[-1]]
         for side in (-1, 1):
-            jaw = shape.clip_closed_surface(normal=(0, 0, side), origin=(0, 0, side * 0.04))
-            back, front = jaw.bounds[:2]
-            jaw.points[:, 0] = (jaw.points[:, 0] - front) * face_length / (front - back)
-            along = (jaw.points[:, 0] + face_length) / face_length
-            jaw.points[:, 1] *= 0.88 - 0.42 * along ** 1.5
-            jaw.points[:, 2] *= 0.7 - 0.32 * along
-            if "Normals" in jaw.point_data:
-                del jaw.point_data["Normals"]
-            if "Normals" in jaw.cell_data:
-                del jaw.cell_data["Normals"]
-            jaw.compute_normals(split_vertices=True, feature_angle=50, inplace=True)
+            points = np.vstack([np.column_stack((edge[:, 0], np.full(len(edge), side * 0.18 + depth),
+                                                  side * edge[:, 1]))
+                                for edge, depth in ((inset, -0.15), (outline, -0.1),
+                                                    (outline, 0.1), (inset, 0.15))])
+            jaw = pv.PolyData(points, faces=faces).triangulate().compute_normals(
+                auto_orient_normals=True, consistent_normals=True, split_vertices=True, feature_angle=50)
             jaw.cell_data["colour"] = np.tile([176, 188, 198], (jaw.n_cells, 1)).astype(np.uint8)
-            faces = jaw.cell_centers().points
-            jaw.cell_data["colour"][np.abs(faces[:, 2]) < 0.06] = [104, 122, 134]
-            jaw.cell_data["colour"][jaw.cell_centers().points[:, 0] > -0.3] = [213, 148, 32]
+            jaw.cell_data["colour"][np.abs(jaw.cell_normals[:, 1]) > 0.95] = [150, 168, 181]
+            jaw.cell_data["colour"][np.abs(jaw.cell_normals[:, 1]) < 0.9] = [210, 220, 227]
             jaw_parts.append(jaw)
         # preserves each part's hard-edge normals when assembling the closed tip
         for part in jaw_parts:
@@ -1353,14 +1420,16 @@ class SimulatorWindow(QMainWindow):
 
         # maps material detail in local millimetres so breathing + view changes cannot slide it
         for actor, material, scale, roughness, grain, coat in (
-                (self.organ_actor, "tissue", 55.0, 0.42, 0.14, 0.19),
-                (self.posterior_actor, "liver", 85.0, 0.38, 0.16, 0.22),
-                (self.tissue_actor, "tissue", 55.0, 0.46, 0.12, 0.15),
-                (self.duct_actor, "tissue", 35.0, 0.46, 0.08, 0.15),
-                (self.diaphragm_actor, "tissue", 65.0, 0.55, 0.1, 0.08),
-                (self.stomach_actor, "tissue", 65.0, 0.46, 0.12, 0.16),
-                (self.duodenum_actor, "tissue", 45.0, 0.48, 0.1, 0.14),
-                (self.bowel_actor, "tissue", 65.0, 0.5, 0.12, 0.14),
+                (self.organ_actor, "tissue", 55.0, 0.4, 0.14, 0.3),
+                (self.posterior_actor, "liver", 85.0, 0.36, 0.16, 0.32),
+                (self.tissue_actor, "fat", 35.0, 0.56, 0.1, 0.1),
+                (self.duct_actor, "tissue", 35.0, 0.44, 0.08, 0.2),
+                (self.vascular_actor, "tissue", 35.0, 0.43, 0.05, 0.2),
+                (self.diaphragm_actor, "tissue", 65.0, 0.52, 0.1, 0.12),
+                (self.stomach_actor, "tissue", 65.0, 0.43, 0.12, 0.22),
+                (self.duodenum_actor, "tissue", 45.0, 0.45, 0.1, 0.2),
+                (self.bowel_actor, "tissue", 65.0, 0.46, 0.12, 0.18),
+                (self.peritoneum_actor, "fat", 35.0, 0.56, 0.1, 0.1),
                 (self.cavity_actor, "tissue", 75.0, 0.5, 0.12, 0.14),
                 (self.wall_actor, "skin", 60.0, 0.68, 0.22, 0.0),
                 (self.body_actor, "skin", 60.0, 0.68, 0.22, 0.0)):
@@ -1372,7 +1441,14 @@ class SimulatorWindow(QMainWindow):
                 arc = 187 * np.arctan2(radius, mesh.points[:, 0])
                 coordinates *= (arc / np.maximum(radius, 1e-6))[:, None]
             mesh.active_texture_coordinates = (coordinates / scale).astype(np.float32)
-            mesh.compute_normals(consistent_normals=True, split_vertices=False, inplace=True)
+            # keeps the cropped torso ends distinct from the curved wall when shading
+            split = actor in (self.body_actor, self.cavity_actor)
+            # rebuilds normals after the anatomy's shared rotation
+            for attributes in (mesh.point_data, mesh.cell_data):
+                if "Normals" in attributes:
+                    del attributes["Normals"]
+            mesh.compute_normals(consistent_normals=True, split_vertices=split,
+                                 feature_angle=60, inplace=True)
             tangent_filter = vtkPolyDataTangents()
             tangent_filter.SetInputData(mesh)
             tangent_filter.Update()
@@ -1388,6 +1464,9 @@ class SimulatorWindow(QMainWindow):
             tangents[invalid] = fallback
             tangents /= np.linalg.norm(tangents, axis=1)[:, None]
             actor.mapper.dataset = mesh
+            if actor is self.tissue_actor:
+                # keeps deforming geometry independent of the colour-selection filter
+                actor.mapper.SetInputData(mesh)
             # refreshes the scalar pipeline before caching the moving tissue
             actor.mapper.GetInputAlgorithm().Update()
             actor.mapper.interpolate_before_map = False
@@ -1397,20 +1476,20 @@ class SimulatorWindow(QMainWindow):
             actor.prop.SetNormalScale(grain)
             actor.prop.SetORMTexture(self.material_roughness)
             actor.prop.SetCoatStrength(coat)
-            actor.prop.SetCoatRoughness(0.32)
+            actor.prop.SetCoatRoughness(0.24 if actor in (self.organ_actor, self.posterior_actor) else 0.3)
         self.rest_tissue_points = self.tissue_actor.mapper.dataset.points.copy()
         self.rest_tissue_tangents = self.tissue_actor.mapper.dataset.point_data["Tangents"].copy()
         # separates steel, coated shafts + plastic through their response to light
         for actor, metallic, roughness in (
-                (self.shaft_actor, 0.45, 0.28), (self.external_shaft_actor, 0.45, 0.28),
-                (self.tip_actor, 0.3, 0.25), (self.scope_actor, 0.35, 0.3),
-                (self.collar_actor, 0.35, 0.33), (self.handle_actor, 0.0, 0.55),
-                (self.port_actor, 0.05, 0.4), (self.scope_port_actor, 0.05, 0.4)):
+                (self.shaft_actor, 0.0, 0.5), (self.external_shaft_actor, 0.0, 0.5),
+                (self.tip_actor, 0.5, 0.24), (self.scope_actor, 0.15, 0.33),
+                (self.collar_actor, 0.12, 0.4), (self.handle_actor, 0.0, 0.6),
+                (self.port_actor, 0.05, 0.43), (self.scope_port_actor, 0.05, 0.43)):
             actor.prop.interpolation = "pbr"
             actor.prop.metallic = metallic
             actor.prop.roughness = roughness
-        self.vessel_actor.prop.SetCoatStrength(0.1)
-        self.vessel_actor.prop.SetCoatRoughness(0.22)
+        self.vessel_actor.prop.SetCoatStrength(0.18)
+        self.vessel_actor.prop.SetCoatRoughness(0.25)
 
         # keeps sensor overlays distinct from the physical instrument
         marker = pv.PolyData(
@@ -1428,8 +1507,9 @@ class SimulatorWindow(QMainWindow):
             actor.SetVisibility(self.estimates_checkbox.isChecked())
         # applies the shared layout to anatomy + tracking overlays
         for actor in (self.organ_actor, self.posterior_actor, self.vessel_actor, self.margin_actor, self.cavity_actor,
-                      self.tissue_actor, self.duct_actor, self.diaphragm_actor, self.stomach_actor,
-                      self.duodenum_actor, self.bowel_actor, self.wall_actor, self.body_actor,
+                      self.tissue_actor, self.duct_actor, self.vascular_actor, self.diaphragm_actor, self.stomach_actor,
+                      self.duodenum_actor, self.bowel_actor, self.peritoneum_actor,
+                      self.wall_actor, self.body_actor,
                       self.tool_measurement_actor,
                       self.target_measurement_actor, self.tool_estimate_actor,
                       self.target_estimate_actor):
@@ -1460,12 +1540,15 @@ class SimulatorWindow(QMainWindow):
             return
         self.target = target
         # translates persistent meshes and labels without changing camera framing
-        for actor in (self.organ_actor, self.posterior_actor, self.duct_actor, self.diaphragm_actor,
-                      self.stomach_actor, self.duodenum_actor, self.bowel_actor):
+        for actor in (self.organ_actor, self.posterior_actor, self.duct_actor, self.vascular_actor, self.diaphragm_actor,
+                      self.stomach_actor, self.duodenum_actor, self.bowel_actor, self.peritoneum_actor):
             actor.SetPosition(*offset)
         # keeps the vessel edge anchored while its tissue attachments follow the liver
         tissue = self.tissue_actor.mapper.dataset
         tissue.points = self.rest_tissue_points + tissue["breathing"][:, None] * offset
+        for attributes in (tissue.point_data, tissue.cell_data):
+            if "Normals" in attributes:
+                del attributes["Normals"]
         tissue.compute_normals(consistent_normals=True, split_vertices=False, inplace=True)
         tangents = self.rest_tissue_tangents.copy()
         tangents -= tissue.point_normals * np.sum(tangents * tissue.point_normals, axis=1)[:, None]
@@ -1475,6 +1558,8 @@ class SimulatorWindow(QMainWindow):
         fallback[parallel] = np.cross(tissue.point_normals[invalid][parallel], [0.0, 1.0, 0.0])
         tangents[invalid] = fallback
         tissue.point_data["Tangents"] = tangents / np.linalg.norm(tangents, axis=1)[:, None]
+        # refreshes the rendered colour pipeline after replacing normal + tangent arrays
+        self.tissue_actor.mapper.GetInputAlgorithm().Update()
         self.label_points.points[1] = self.scene_rotation @ self.target
         self.label_points.points[3] = self.scene_rotation @ (
             self.organ_label_point + offset)
@@ -1485,6 +1570,7 @@ class SimulatorWindow(QMainWindow):
         view = self.view_combo.currentText()
         camera_view = view == "Camera view"
         self.pressed_keys.clear()
+        self.camera_mouse_position = None
         if not self.following:
             self.command = self.configuration.copy()
         if camera_view and view_index is None:
@@ -1503,15 +1589,15 @@ class SimulatorWindow(QMainWindow):
             self.viewport.add_light(self.scope_light)
             self.viewport.set_background("#291419", top="#4b272b")
             self.viewport.iren.style = vtkInteractorStyleUser()
-            self.viewport.camera.view_angle = 60.0
+            self.viewport.camera.view_angle = self.camera_view_angle
             self.UpdateCameraPose()
             self.viewport.render()
             self.render_pending = False
             return
         self.viewport.enable_lightkit()
         for light in self.viewport.renderer.lights:
-            light.intensity *= 2
-        self.viewport.add_light(pv.Light(light_type="headlight", intensity=0.6))
+            light.intensity *= 1.5
+        self.viewport.add_light(pv.Light(light_type="headlight", intensity=0.45))
         self.viewport.set_background("#edf2f6", top="#fafcfd")
         self.viewport.enable_trackball_style()
         focal = (0, 0, 0)
@@ -1524,13 +1610,20 @@ class SimulatorWindow(QMainWindow):
         }
         self.viewport.camera_position = cameras[view]
         self.viewport.camera.view_angle = 30.0
+        if view == "Perspective":
+            # presents both entry ports side by side, with the laparoscope on the left
+            camera = self.viewport.camera
+            camera.up = np.cross(np.array(camera.position) - np.array(camera.focal_point),
+                                 self.scene_rotation @ (self.port - self.scope_port))
         # fits current physical models without letting sensor overlays shift the view
         actors = (self.shaft_actor, self.external_shaft_actor, self.tip_actor,
                   self.handle_actor, self.collar_actor, self.port_actor, self.wall_actor,
                   self.scope_actor, self.scope_port_actor, self.organ_actor, self.posterior_actor,
-                  self.vessel_actor, self.tissue_actor, self.duct_actor, self.diaphragm_actor,
-                  self.cavity_actor, self.body_actor, self.stomach_actor, self.duodenum_actor, self.bowel_actor)
-        bounds = np.array([actor.GetBounds() for actor in actors
+                  self.vessel_actor, self.tissue_actor, self.duct_actor, self.vascular_actor, self.diaphragm_actor,
+                  self.cavity_actor, self.body_actor, self.stomach_actor, self.duodenum_actor,
+                  self.bowel_actor, self.peritoneum_actor)
+        bounds = np.array([self.section_bounds if actor in (self.body_actor, self.cavity_actor, self.wall_actor)
+                           else actor.GetBounds() for actor in actors
                            if actor.GetVisibility()]).reshape(-1, 3, 2)
         low = bounds[:, :, 0].min(axis=0)
         high = bounds[:, :, 1].max(axis=0)
@@ -1538,9 +1631,10 @@ class SimulatorWindow(QMainWindow):
             # frames the torso section + both ports as one anatomical setup
             actors = (self.shaft_actor, self.tip_actor, self.port_actor, self.scope_port_actor,
                       self.organ_actor, self.posterior_actor, self.vessel_actor, self.tissue_actor,
-                      self.duct_actor, self.diaphragm_actor, self.body_actor, self.cavity_actor, self.wall_actor,
-                      self.stomach_actor, self.duodenum_actor, self.bowel_actor)
-            bounds = np.array([actor.GetBounds() for actor in actors
+                      self.duct_actor, self.vascular_actor, self.diaphragm_actor, self.body_actor, self.cavity_actor, self.wall_actor,
+                      self.stomach_actor, self.duodenum_actor, self.bowel_actor, self.peritoneum_actor)
+            bounds = np.array([self.section_bounds if actor in (self.body_actor, self.cavity_actor, self.wall_actor)
+                               else actor.GetBounds() for actor in actors
                                if actor.GetVisibility()]).reshape(-1, 3, 2)
             outside = np.vstack((self.scene_rotation @ self.port - 60 * self.scene_rotation
                                   @ InstrumentRotation(*self.configuration[:2])[:, 0],
@@ -1548,8 +1642,8 @@ class SimulatorWindow(QMainWindow):
             low = np.minimum(bounds[:, :, 0].min(axis=0), outside.min(axis=0))
             high = np.maximum(bounds[:, :, 1].max(axis=0), outside.max(axis=0))
         organ_bounds = np.array([actor.mapper.dataset.bounds for actor in (
-            self.organ_actor, self.posterior_actor, self.duct_actor, self.diaphragm_actor,
-            self.stomach_actor, self.duodenum_actor, self.bowel_actor)]).reshape(-1, 3, 2)
+            self.organ_actor, self.posterior_actor, self.duct_actor, self.vascular_actor, self.diaphragm_actor,
+            self.stomach_actor, self.duodenum_actor, self.bowel_actor, self.peritoneum_actor)]).reshape(-1, 3, 2)
         organ_bounds = np.column_stack((organ_bounds[:, :, 0].min(axis=0),
                                        organ_bounds[:, :, 1].max(axis=0)))
         organ_centre = self.scene_rotation @ organ_bounds.mean(axis=1)
@@ -2058,23 +2152,18 @@ class SimulatorWindow(QMainWindow):
 
     def set_command(self, axis):
         value = self.sliders[axis].value() / 10
-        camera_control = self.view_combo.currentText() == "Camera view"
-        if not camera_control:
-            self.start_manual_control()
-        command = self.camera_command if camera_control else self.command
-        command[axis] = np.deg2rad(value) if axis < 2 else value
+        self.start_manual_control()
+        self.command[axis] = np.deg2rad(value) if axis < 2 else value
         self.sync_controls()
 
     def sync_controls(self):
-        camera_control = self.view_combo.currentText() == "Camera view"
-        self.instrument_group.setTitle("Camera controls" if camera_control else "Instrument commands")
-        self.keyboard_help.setText("W / S  Insert / retract\nA / D  Yaw · Q / E  Pitch")
-        command = self.camera_command if camera_control else self.command
-        values = np.r_[np.rad2deg(command[:2]), command[2]]
-        lower = self.camera_lower_limits if camera_control else self.lower_limits
-        lower = np.r_[np.rad2deg(lower[:2]), lower[2]]
-        upper = self.camera_upper_limits if camera_control else self.upper_limits
-        upper = np.r_[np.rad2deg(upper[:2]), upper[2]]
+        help_text = "Tool: W / S  Insert / retract\nA / D  Yaw · Q / E  Pitch"
+        if self.view_combo.currentText() == "Camera view":
+            help_text += "\nScope: left-drag to aim · C / V  Advance / retract"
+        self.keyboard_help.setText(help_text)
+        values = np.r_[np.rad2deg(self.command[:2]), self.command[2]]
+        lower = np.r_[np.rad2deg(self.lower_limits[:2]), self.lower_limits[2]]
+        upper = np.r_[np.rad2deg(self.upper_limits[:2]), self.upper_limits[2]]
         for index, (name, unit) in enumerate([("Yaw", "°"), ("Pitch", "°"),
                                               ("Insertion", "mm")]):
             self.sliders[index].blockSignals(True)
@@ -2085,6 +2174,8 @@ class SimulatorWindow(QMainWindow):
 
     def set_paused(self, paused):
         self.pressed_keys.clear()
+        self.camera_mouse_position = None
+        self.camera_command = self.camera_configuration.copy()
         self.pause_button.setText("Resume movement" if paused else "Pause movement")
         if self.tracking_paused_time is not None:
             self.message_label.setText("Tracking recovery pending. Movement stays paused.")
@@ -2097,6 +2188,7 @@ class SimulatorWindow(QMainWindow):
     def reset_instrument(self):
         self.stop_path()
         self.pressed_keys.clear()
+        self.camera_mouse_position = None
         self.pause_button.setChecked(False)
         current_tip = tip_position(self.port, *self.configuration)
         # samples a different clear position within the movement limits
@@ -2650,24 +2742,24 @@ class SimulatorWindow(QMainWindow):
             self.last_tick = now
             self.poll_planning()
             camera_control = self.view_combo.currentText() == "Camera view"
-            speed = self.camera_speed_limits if camera_control else self.speed_limits
-            if self.pressed_keys and not self.pause_button.isChecked():
+            tool_keys = self.pressed_keys & self.key_directions.keys()
+            if tool_keys and not self.pause_button.isChecked():
                 velocity = np.zeros(3)
-                for key in self.pressed_keys:
+                for key in tool_keys:
                     axis, direction = self.key_directions[key]
-                    velocity[axis] += direction * speed[axis]
-                configuration = self.camera_configuration if camera_control else self.configuration
-                lower = self.camera_lower_limits if camera_control else self.lower_limits
-                upper = self.camera_upper_limits if camera_control else self.upper_limits
-                command = np.clip(configuration + velocity * timestep, lower, upper)
-                if camera_control:
-                    self.camera_command = command
-                else:
-                    self.command = command
+                    velocity[axis] += direction * self.speed_limits[axis]
+                self.command = np.clip(self.configuration + velocity * timestep,
+                                       self.lower_limits, self.upper_limits)
                 self.sync_controls()
             if camera_control and not self.pause_button.isChecked():
+                direction = sum(self.camera_key_directions[key]
+                                for key in self.pressed_keys & self.camera_key_directions.keys())
+                if direction:
+                    self.camera_command[2] = np.clip(
+                        self.camera_configuration[2] + direction * self.camera_speed_limits[2] * timestep,
+                        self.camera_lower_limits[2], self.camera_upper_limits[2])
                 change = np.clip(self.camera_command - self.camera_configuration,
-                                 -speed * timestep, speed * timestep)
+                                 -self.camera_speed_limits * timestep, self.camera_speed_limits * timestep)
                 if np.any(change):
                     self.camera_configuration += change
                     self.UpdateCameraPose()
@@ -2772,18 +2864,51 @@ class SimulatorWindow(QMainWindow):
             camera.SetPosition(*self.scope_tip)
             camera.SetFocalPoint(*(self.scope_tip + rotation[:, 0]))
             camera.SetViewUp(*rotation[:, 2])
-            self.viewport.reset_camera_clipping_range()
-            near, far = camera.clipping_range
-            camera.SetClippingRange(min(0.5, near), far)
+            camera.SetClippingRange(*self.camera_clipping_range)
         self.render_pending = True
 
     def eventFilter(self, watched, event):
         if event.type() == QEvent.Type.ApplicationDeactivate or (
                 watched is self and event.type() == QEvent.Type.WindowDeactivate):
             self.pressed_keys.clear()
-        if isinstance(watched, QWidget) and watched.window() is self and event.type() in (
+            self.camera_mouse_position = None
+            self.camera_command = self.camera_configuration.copy()
+        in_window = isinstance(watched, QWidget) and watched.window() is self
+        viewport_event = in_window and (watched is self.viewport or self.viewport.isAncestorOf(watched))
+        camera_control = self.view_combo.currentText() == "Camera view"
+        if viewport_event and event.type() in (QEvent.Type.Leave, QEvent.Type.FocusOut):
+            self.camera_mouse_position = None
+            self.camera_command[:2] = self.camera_configuration[:2]
+        if camera_control and viewport_event and event.type() in (
+                QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick,
+                QEvent.Type.MouseMove, QEvent.Type.MouseButtonRelease, QEvent.Type.Wheel):
+            if event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick):
+                if event.button() == Qt.MouseButton.LeftButton and not self.pause_button.isChecked():
+                    watched.setFocus(Qt.FocusReason.MouseFocusReason)
+                    self.camera_mouse_position = event.globalPosition()
+            elif event.type() == QEvent.Type.MouseMove and self.camera_mouse_position is not None:
+                if event.buttons() & Qt.MouseButton.LeftButton and not self.pause_button.isChecked():
+                    position = event.globalPosition()
+                    delta = position - self.camera_mouse_position
+                    # applies mouse aim directly so quick drags remain responsive
+                    self.camera_command[:2] = np.clip(
+                        self.camera_configuration[:2] + self.camera_mouse_sensitivity * np.array([delta.x(), -delta.y()]),
+                        self.camera_lower_limits[:2], self.camera_upper_limits[:2])
+                    self.camera_configuration[:2] = self.camera_command[:2]
+                    self.UpdateCameraPose()
+                    self.camera_mouse_position = position
+                else:
+                    self.camera_mouse_position = None
+                    self.camera_command[:2] = self.camera_configuration[:2]
+            elif event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+                self.camera_mouse_position = None
+                self.camera_command[:2] = self.camera_configuration[:2]
+            event.accept()
+            return True
+        if in_window and event.type() in (
                 QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
-            if event.key() in self.key_directions:
+            tool_key = event.key() in self.key_directions
+            if tool_key or (camera_control and event.key() in self.camera_key_directions):
                 if event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier):
                     if event.type() == QEvent.Type.KeyRelease and not event.isAutoRepeat():
                         self.pressed_keys.discard(event.key())
@@ -2792,14 +2917,13 @@ class SimulatorWindow(QMainWindow):
                     event.accept()
                 elif not event.isAutoRepeat():
                     if event.type() == QEvent.Type.KeyPress and not self.pause_button.isChecked():
-                        if self.view_combo.currentText() != "Camera view":
+                        if tool_key:
                             self.start_manual_control()
                         self.pressed_keys.add(event.key())
                     else:
                         self.pressed_keys.discard(event.key())
                 return True
-            viewport_event = watched is self.viewport or self.viewport.isAncestorOf(watched)
-            if viewport_event and self.view_combo.currentText() != "Camera view" and (
+            if viewport_event and not camera_control and (
                     event.key() == Qt.Key.Key_R and not event.modifiers() & (
                         Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier)):
     
@@ -2807,8 +2931,8 @@ class SimulatorWindow(QMainWindow):
                     self.reset_camera()
                 event.accept()
                 return True
-            if self.view_combo.currentText() == "Camera view" and viewport_event:
-                # keeps movement on the shared keys + sliders
+            if camera_control and viewport_event:
+                # prevents VTK shortcuts from changing the scope's physical view
                 event.accept()
                 return True
         return super().eventFilter(watched, event)

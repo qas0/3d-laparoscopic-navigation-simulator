@@ -271,6 +271,23 @@ class CaptureTests(unittest.TestCase):
 
     def test_PickledSnapshotKeepsRenderedMaterialsDepthAndOffAxisCalibration(self):
         mesh = pv.Plane(i_size=10, j_size=8, i_resolution=2, j_resolution=2)
+        mesh.lines = np.array([2, 0, 1])
+        mesh.verts = np.array([1, 0])
+        mesh.strips = np.array([3, 0, 1, 4])
+        mesh.cell_data.clear()
+        mesh.field_data["source"] = np.array(["tissue", "snapshot"])
+        for association, count in ((mesh.point_data, mesh.n_points), (mesh.cell_data, mesh.n_cells)):
+            association["phase"] = np.arange(count, dtype=np.float64)
+            association["directions"] = np.tile([1., 0., 0.], (count, 1))
+            association["tensor"] = np.tile(np.eye(3).ravel(), (count, 1))
+            association["ids"] = np.arange(count, dtype=np.int64)
+            association["enabled"] = np.arange(count) % 2 == 0
+            association.SetActiveScalars("phase")
+            association.SetActiveVectors("directions")
+            association.SetActiveTensors("tensor")
+            association.SetActiveGlobalIds("ids")
+        mesh.point_data["tangents"] = np.tile([1., 0., 0.], (mesh.n_points, 1))
+        mesh.GetPointData().SetActiveTangents("tangents")
         mapper = vtkPolyDataMapper()
         mapper.SetInputData(mesh)
         mapper.ScalarVisibilityOff()
@@ -304,7 +321,28 @@ class CaptureTests(unittest.TestCase):
         expected_rgb, expected_labels = CaptureFrame(actors, camera, light, metadata, image_size=(160, 120))
         payload = SnapshotScene(actors, camera, light, serializable=True)
         snapshot = pickle.loads(pickle.dumps(payload))
+        rebuilt, _, _ = SnapshotScene(*snapshot)
+        rebuilt_mesh = pv.wrap(rebuilt["tissue"][0].GetMapper().GetInput())
+        for key in ("points", "faces", "lines", "verts", "strips"):
+            self.assertIs(type(snapshot[0]["tissue"][0]["mesh"][key]), np.ndarray)
+            np.testing.assert_array_equal(getattr(rebuilt_mesh, key), getattr(mesh, key))
+        for name in ("point_data", "cell_data", "field_data"):
+            before, after = getattr(mesh, name), getattr(rebuilt_mesh, name)
+            self.assertEqual(list(after), list(before))
+            for key, value in before.items():
+                self.assertEqual(after[key].dtype, value.dtype)
+                np.testing.assert_array_equal(after[key], value)
+        for before, after in ((mesh.GetPointData(), rebuilt_mesh.GetPointData()),
+                              (mesh.GetCellData(), rebuilt_mesh.GetCellData())):
+            for role in range(before.NUM_ATTRIBUTES):
+                expected = before.GetAbstractAttribute(role)
+                actual = after.GetAbstractAttribute(role)
+                self.assertEqual(None if actual is None else actual.GetName(),
+                                 None if expected is None else expected.GetName())
         mesh.points += [5, 6, 7]
+        mesh.point_data["phase"][:] = 99
+        mesh.cell_data["phase"][:] = 99
+        mesh.field_data["source"] = np.array(["changed"])
         actor.SetPosition(20, 30, 40)
         actor.GetProperty().SetRoughness(0.9)
         texture.GetInput().GetPointData().GetScalars().SetTuple3(0, 1, 2, 3)
