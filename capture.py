@@ -1,3 +1,4 @@
+from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +9,8 @@ import vtkmodules.vtkRenderingOpenGL2
 from vtkmodules.vtkCommonCore import vtkLookupTable
 from vtkmodules.vtkCommonMath import vtkMatrix4x4
 from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper, vtkProperty
+
+from safesight import DegradeView
 
 
 def SnapshotScene(actors, camera, light, serializable=False):
@@ -260,44 +263,62 @@ def CaptureFrame(actors, camera, light, metadata, image_size=(640, 480), colour_
         plotter.close()
 
 
-def SaveCapture(folder, rgb, labels):
+def SaveCapture(folder, rgb, labels, effects=None):
     rgb = np.asarray(rgb)
     labels = {name: np.asarray(value) for name, value in labels.items()}
     if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8:
         raise ValueError("Invalid capture image.")
     if any(value.dtype.hasobject for value in labels.values()):
         raise ValueError("Invalid label data.")
-    image_folder, label_folder = Path(folder) / "images", Path(folder) / "labels"
+    degraded = None
+    if effects is not None:
+        parameters = {"blur": 0.0, "exposure": 0.0, "haze": 0.0, **effects}
+        degraded = DegradeView(rgb, **parameters)
+        labels.update(
+            degradation_blur=np.array(float(parameters["blur"])),
+            degradation_exposure_ev=np.array(float(parameters["exposure"])),
+            degradation_haze=np.array(float(parameters["haze"])),
+            degradation_convention=np.array(
+                "images/ is clean; degraded/ applies Gaussian blur (radius=12*blur*width/640 pixels), "
+                "linear-light sRGB exposure (gain=2**EV), then RGB haze toward [185,190,195] to the same frame; "
+                "blur and haze are fractions; masks, depth and calibration are unchanged; "
+                "target_visible describes geometric visibility, not image quality"))
+    image_folder, label_folder, degraded_folder = (
+        Path(folder) / name for name in ("images", "labels", "degraded"))
     image_folder.mkdir(parents=True, exist_ok=True)
     label_folder.mkdir(parents=True, exist_ok=True)
-    indices = [int(path.stem[6:]) for directory, suffix in ((image_folder, ".png"), (label_folder, ".npz"))
+    if degraded is not None:
+        degraded_folder.mkdir(parents=True, exist_ok=True)
+    indices = [int(path.stem[6:]) for directory, suffix in (
+        (image_folder, ".png"), (label_folder, ".npz"), (degraded_folder, ".png"))
                for path in directory.glob(f"frame_*{suffix}") if path.stem[6:].isdigit()]
     index = max(indices, default=0) + 1
     while True:
         image_path = image_folder / f"frame_{index:06d}.png"
         label_path = label_folder / f"frame_{index:06d}.npz"
+        paths = [image_path, label_path]
+        if degraded is not None:
+            paths.append(degraded_folder / image_path.name)
+        created = []
         try:
-            image_file = image_path.open("xb")
+            with ExitStack() as stack:
+                files = []
+                for path in paths:
+                    files.append(stack.enter_context(path.open("xb")))
+                    created.append(path)
+                Image.fromarray(rgb).save(files[0], format="PNG")
+                if degraded is not None:
+                    Image.fromarray(degraded).save(files[2], format="PNG")
+                np.savez_compressed(files[1], **labels)
         except FileExistsError:
-            index += 1
-            continue
-        try:
-            label_file = label_path.open("xb")
-        except FileExistsError:
-            image_file.close()
-            image_path.unlink()
+            for path in created:
+                path.unlink(missing_ok=True)
+            if len(created) == len(paths):
+                raise
             index += 1
             continue
         except BaseException:
-            image_file.close()
-            image_path.unlink()
-            raise
-        try:
-            with image_file, label_file:
-                Image.fromarray(rgb).save(image_file, format="PNG")
-                np.savez_compressed(label_file, **labels)
-        except BaseException:
-            image_path.unlink()
-            label_path.unlink()
+            for path in created:
+                path.unlink(missing_ok=True)
             raise
         return image_path, label_path

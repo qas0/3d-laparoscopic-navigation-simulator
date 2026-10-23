@@ -1,6 +1,7 @@
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from collections import deque
 from datetime import datetime, timezone
+import json
 from multiprocessing import get_context
 from pathlib import Path
 from queue import Empty
@@ -9,9 +10,11 @@ from time import perf_counter
 
 import numpy as np
 import pyvista as pv
+from PIL import Image
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
     QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
@@ -21,8 +24,6 @@ from PySide6.QtWidgets import (
 from pyvistaqt import QtInteractor
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleUser
 from vtkmodules.vtkFiltersCore import vtkPolyDataTangents
-from vtkmodules.vtkFiltersGeneral import vtkClipClosedSurface
-from vtkmodules.vtkCommonDataModel import vtkPlane, vtkPlaneCollection
 
 from astar import find_path, get_uncertainty_margin
 from capture import CaptureFrame, SaveCapture, SnapshotScene
@@ -31,6 +32,8 @@ from feedback import GetRouteGuidance, get_target_feedback
 from geometry import CheckRemainingRoute, InstrumentRotation, movement_is_clear, shaft_clearance, tip_position
 from kalman import KalmanFilter
 from motion import GetRespiratoryMotion
+from perception import AssessPrediction, LoadInstrument, PredictInstrument, TrainInstrument
+from safesight import AssessView, DegradeView
 from scenarios import SCENARIOS
 from sensors import ApplyBias, ApplyDropout, ApplyOutlier, measure_position
 
@@ -96,6 +99,13 @@ class SimulatorWindow(QMainWindow):
         self.capture_executor = None
         self.capture_future = None
         self.capture_saving = False
+        self.capture_effects = None
+        self.sight_result = None
+        self.perception_model = None
+        self.perception_result = None
+        self.perception_future = None
+        self.perception_executor = None
+        self.perception_cancel = Event()
         self.required_clearance = 2.0
         self.route_clearance = self.required_clearance
         self.execution_clearance = self.required_clearance
@@ -590,6 +600,80 @@ class SimulatorWindow(QMainWindow):
         comparison_layout.addStretch()
 
         capture_layout = self.create_control_tab("SafeSight")
+        sight_group = QGroupBox("View quality")
+        sight_settings = QVBoxLayout(sight_group)
+        self.sight_checkbox = QCheckBox("Monitor Camera view", checked=True)
+        self.sight_checkbox.toggled.connect(self.UpdateSafeSight)
+        sight_settings.addWidget(self.sight_checkbox)
+        self.sight_status_label = QLabel("Select Camera view", wordWrap=True)
+        self.sight_status_label.setStyleSheet("font-weight: 600;")
+        sight_settings.addWidget(self.sight_status_label)
+        self.sight_advice_label = QLabel(wordWrap=True)
+        sight_settings.addWidget(self.sight_advice_label)
+        self.sight_metrics_label = QLabel(wordWrap=True)
+        sight_settings.addWidget(self.sight_metrics_label)
+        self.sight_preview = QLabel("Select Camera view", alignment=Qt.AlignmentFlag.AlignCenter, wordWrap=True)
+        self.sight_preview.setFixedSize(240, 126)
+        self.sight_preview.setStyleSheet("background: #edf2f6; border: 1px solid #d9e1e8; border-radius: 3px;")
+        sight_settings.addWidget(self.sight_preview, alignment=Qt.AlignmentFlag.AlignHCenter)
+        self.sight_preview_label = QLabel("Assessed image centre · sampled at 1 Hz", wordWrap=True)
+        sight_settings.addWidget(self.sight_preview_label)
+        sight_settings.addWidget(QLabel(
+            "Rule-based checks of the central 80% width and height. Annotations can affect detail; "
+            "anatomy and occlusion are not assessed.", wordWrap=True))
+        capture_layout.addWidget(sight_group)
+        perception_panel = QWidget()
+        perception_layout = QVBoxLayout(perception_panel)
+        perception_layout.setContentsMargins(0, 0, 0, 0)
+        self.perception_checkbox = QCheckBox("Show instrument candidates", checked=False, enabled=False)
+        self.perception_checkbox.toggled.connect(self.UpdateSafeSight)
+        perception_layout.addWidget(self.perception_checkbox)
+        perception_layout.addWidget(QLabel(
+            "Colour-based prototype; new lighting or haze can cause many false positives. "
+            "Predictions are withheld outside the recorded appearance range or when quality is poor. "
+            "This is not calibrated confidence.", wordWrap=True))
+        self.perception_status_label = QLabel("No trained model loaded.", wordWrap=True)
+        perception_layout.addWidget(self.perception_status_label)
+        self.perception_prediction_label = QLabel("Prediction off", wordWrap=True)
+        perception_layout.addWidget(self.perception_prediction_label)
+        self.perception_metrics_label = QLabel(wordWrap=True)
+        perception_layout.addWidget(self.perception_metrics_label)
+        self.perception_load_button = QPushButton("Load instrument model")
+        self.perception_load_button.clicked.connect(self.LoadPerception)
+        perception_layout.addWidget(self.perception_load_button)
+        self.perception_train_button = QPushButton("Train from capture folder")
+        self.perception_train_button.setToolTip(
+            "Needs at least eight distinct camera/tool snapshots in the capture folder. Saves instrument.npz there.")
+        self.perception_train_button.clicked.connect(self.TrainPerception)
+        perception_layout.addWidget(self.perception_train_button)
+        self.perception_cancel_button = QPushButton("Cancel training", enabled=False)
+        self.perception_cancel_button.clicked.connect(lambda: self.perception_cancel.set())
+        perception_layout.addWidget(self.perception_cancel_button)
+        capture_layout.addWidget(self.CreateExpandableSection("Instrument perception", perception_panel))
+        sight_tests = QWidget()
+        sight_test_layout = QVBoxLayout(sight_tests)
+        sight_test_layout.setContentsMargins(0, 0, 0, 0)
+        self.sight_effects_checkbox = QCheckBox("Apply image test effects", checked=False)
+        self.sight_effects_checkbox.toggled.connect(self.UpdateSafeSight)
+        sight_test_layout.addWidget(self.sight_effects_checkbox)
+        sight_controls = QWidget(enabled=False)
+        sight_controls_layout = QFormLayout(sight_controls)
+        sight_controls_layout.setContentsMargins(0, 0, 0, 0)
+        self.sight_blur = QDoubleSpinBox(minimum=0, maximum=100, singleStep=10, decimals=0, suffix="%")
+        self.sight_exposure = QDoubleSpinBox(minimum=-4, maximum=4, singleStep=0.5, decimals=1, suffix=" EV")
+        self.sight_haze = QDoubleSpinBox(minimum=0, maximum=100, singleStep=10, decimals=0, suffix="%")
+        self.sight_blur.setToolTip("Gaussian blur; strength scales with image width.")
+        self.sight_exposure.setToolTip("Each EV doubles or halves linear-light brightness.")
+        self.sight_haze.setToolTip("Blends a neutral veil into the image to test loss of contrast.")
+        for label, control in (("Blur", self.sight_blur), ("Exposure", self.sight_exposure), ("Haze", self.sight_haze)):
+            sight_controls_layout.addRow(label, control)
+            control.valueChanged.connect(lambda _: self.UpdateSafeSight(reset=True))
+        self.sight_effects_checkbox.toggled.connect(sight_controls.setEnabled)
+        sight_test_layout.addWidget(sight_controls)
+        sight_test_layout.addWidget(QLabel(
+            "Effects apply to the sampled preview. The 3D workspace stays clear.\n"
+            "Captures also save a matching degraded image. Haze is a contrast test, not physical smoke.", wordWrap=True))
+        capture_layout.addWidget(self.CreateExpandableSection("Camera image tests", sight_tests))
         capture_group = QGroupBox("Camera capture")
         capture_settings = QVBoxLayout(capture_group)
         capture_settings.addWidget(QLabel("Captures the laparoscope's current view from any perspective.", wordWrap=True))
@@ -605,7 +689,8 @@ class SimulatorWindow(QMainWindow):
         self.capture_button = QPushButton("Capture frame", objectName="primary", enabled=False)
         self.capture_button.clicked.connect(self.CaptureCameraFrame)
         capture_settings.addWidget(self.capture_button)
-        self.capture_status_label = QLabel("Saves a clean image + separate ground-truth labels for evaluation.", wordWrap=True)
+        self.capture_status_label = QLabel(
+            "Saves a clean image + ground-truth labels. Enable image tests to also save a degraded copy.", wordWrap=True)
         capture_settings.addWidget(self.capture_status_label)
         capture_layout.addWidget(capture_group)
         capture_layout.addStretch()
@@ -653,6 +738,9 @@ class SimulatorWindow(QMainWindow):
         self.message_label = QLabel("Ready for manual movement.", wordWrap=True)
         self.message_label.setStyleSheet("border: none;")
         guidance_layout.addWidget(self.message_label)
+        self.sight_indicator = QLabel(wordWrap=True, visible=False)
+        self.sight_indicator.setToolTip("SafeSight: rule-based exposure and detail checks. See the SafeSight tab for measurements.")
+        guidance_layout.addWidget(self.sight_indicator)
         scene_layout.addWidget(self.guidance_card)
         self.viewport = QtInteractor(scene_frame, auto_update=False)
         scene_layout.addWidget(self.viewport.interactor, 1)
@@ -682,6 +770,9 @@ class SimulatorWindow(QMainWindow):
         self.readout_timer = QTimer(self)
         self.readout_timer.timeout.connect(self.update_sensor_readouts)
         self.readout_timer.timeout.connect(self.UpdateComparison)
+        self.sight_timer = QTimer(self)
+        self.sight_timer.setInterval(1000)
+        self.sight_timer.timeout.connect(self.UpdateSafeSight)
         self.load_scenario(self.scenario_combo.currentIndex())
         self.scenario_combo.currentIndexChanged.connect(self.load_scenario)
         for setting in (self.motion_amplitude, self.motion_frequency):
@@ -705,6 +796,10 @@ class SimulatorWindow(QMainWindow):
         self.timer.timeout.connect(self.advance_movement)
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.start(16)
+        self.sight_timer.start()
+        model_path = Path(__file__).resolve().parent / "assets" / "models" / "instrument.npz"
+        if model_path.exists():
+            self.LoadPerception(model_path)
         # refits once Qt has assigned the viewport dimensions
         QTimer.singleShot(0, lambda: self.reset_camera(self.view_combo.currentIndex()))
 
@@ -717,6 +812,211 @@ class SimulatorWindow(QMainWindow):
         scroll.setWidget(panel)
         self.control_tabs.addTab(scroll, title)
         return layout
+
+    def UpdateSafeSight(self, checked=None, *, reset=False):
+        # reads the displayed RGB image without changing the scene or rendering again
+        self.UpdatePerception()
+        self.sight_result = None
+        self.sight_preview.clear()
+        metrics = ""
+        colour = "#62788c"
+        active = self.sight_checkbox.isChecked() and self.view_combo.currentText() == "Camera view"
+        if not self.sight_checkbox.isChecked():
+            title, advice = "Monitoring off", "Enable monitoring to check the Camera image."
+        elif not active:
+            title, advice = "Select Camera view", "The monitor checks the laparoscope image in Camera view."
+        elif reset or checked is not None:
+            title, advice = "Waiting for image", "A new image check will appear within a second."
+        elif not self.isVisible() or self.isMinimized() or not self.viewport.isVisible():
+            title, advice = "Image unavailable", "Restore the Camera view to resume image checks."
+        else:
+            try:
+                image = np.asarray(self.viewport.image)
+                if self.sight_effects_checkbox.isChecked():
+                    # bounds preview processing; saved pairs retain their selected resolution
+                    height, width = image.shape[:2]
+                    if width > 640:
+                        image = np.asarray(Image.fromarray(image[:, :, :3]).resize(
+                            (640, max(16, round(height * 640 / width))), Image.Resampling.LANCZOS))
+                    image = DegradeView(image[:, :, :3], blur=self.sight_blur.value() / 100,
+                                        exposure=self.sight_exposure.value(), haze=self.sight_haze.value() / 100)
+                height, width = image.shape[:2]
+                view_image = image[:, :, :3]
+                # avoids most corner decorations while retaining the main camera image
+                image = image[height // 10:height - height // 10,
+                              width // 10:width - width // 10, :3].copy()
+                result = AssessView(image)
+                self.sight_result = result
+                annotations = any(actor is not None and actor.GetVisibility() for actor in (
+                    self.label_actor, self.path_actor, self.tool_measurement_actor,
+                    self.target_measurement_actor, self.tool_estimate_actor, self.target_estimate_actor))
+                overlay = self.UpdatePerception(image, annotated=annotations, view_image=view_image)
+                preview = QImage(overlay.data, overlay.shape[1], overlay.shape[0], overlay.strides[0],
+                                 QImage.Format.Format_RGB888)
+                self.sight_preview.setPixmap(QPixmap.fromImage(preview).scaled(
+                    self.sight_preview.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation))
+            except Exception:
+                self.sight_result = None
+                title, advice = "Image unavailable", "Waiting for a readable Camera image."
+            else:
+                self.sight_result = result
+                messages = {"dark": "Image is dark; inspect lighting and framing.",
+                            "bright": "Image is washed out; check bright regions and framing.",
+                            "low_detail": "Low image detail; inspect focus and framing."}
+                if result["issues"]:
+                    title = "Check camera image"
+                    advice = " ".join(messages[issue] for issue in result["issues"])
+                    colour = "#97580c"
+                elif annotations:
+                    title, advice = "Annotated camera image", "Visible labels or guidance can affect the detail check."
+                    colour = "#97580c"
+                else:
+                    title, advice = "No exposure/detail warning", "These checks do not establish visibility of the tool or anatomy."
+                if annotations and result["issues"]:
+                    advice += " Visible annotations can affect detail."
+                metrics = (f"Mean brightness: {result['mean_luminance']:.0%}\n"
+                           f"Dark pixels: {result['dark_fraction']:.0%} · Bright pixels: {result['bright_fraction']:.0%}\n"
+                           f"Local detail: {result['detail']:.4f}")
+        self.sight_status_label.setText(title)
+        self.sight_status_label.setStyleSheet(f"font-weight: 600; color: {colour};")
+        self.sight_advice_label.setText(advice)
+        self.sight_metrics_label.setText(metrics)
+        self.sight_indicator.setVisible(active)
+        test_image = self.sight_effects_checkbox.isChecked()
+        source = "Test image centre" if test_image else "Assessed image centre"
+        if self.perception_result is not None:
+            source += " + candidates" if self.perception_result["status"] == "shown" else " · prediction withheld"
+        self.sight_preview_label.setText(f"{source} · sampled at 1 Hz")
+        if self.sight_result is None:
+            self.sight_preview.setText(title)
+            self.UpdatePerception()
+        self.sight_indicator.setText(f"SafeSight · {'Image test · ' if test_image else ''}{title}")
+        if self.perception_result is not None and self.perception_result["status"] == "withheld":
+            self.sight_indicator.setText("SafeSight · Prediction withheld · " + self.perception_result["message"])
+            colour = "#97580c"
+        self.sight_indicator.setStyleSheet(f"border: none; font-size: 9pt; color: {colour};")
+
+    def TrainPerception(self):
+        if self.perception_future is not None:
+            return
+        if self.capture_folder is None:
+            self.ChooseCaptureFolder()
+        if self.capture_folder is None:
+            return
+        if self.perception_executor is None:
+            self.perception_executor = ThreadPoolExecutor(max_workers=1)
+        self.perception_cancel.clear()
+        output = self.capture_folder / "instrument.npz"
+        self.perception_future = self.perception_executor.submit(
+            TrainInstrument, self.capture_folder, output=output, cancel=self.perception_cancel)
+        self.perception_status_label.setText("Training from the capture folder; complete snapshots are held out for testing…")
+        self.perception_train_button.setEnabled(False)
+        self.perception_load_button.setEnabled(False)
+        self.perception_cancel_button.setEnabled(True)
+
+    def LoadPerception(self, path=None):
+        if self.perception_future is not None:
+            return
+        if path is None or isinstance(path, bool):
+            path, _ = QFileDialog.getOpenFileName(self, "Load instrument model", "", "Instrument model (*.npz)")
+        if not path:
+            return
+        self.perception_model = None
+        self.perception_metrics_label.clear()
+        try:
+            self.perception_model = LoadInstrument(path)
+        except Exception as error:
+            self.perception_status_label.setText(f"Model unavailable: {error}")
+        else:
+            self.perception_status_label.setText(f"Loaded experimental pixel baseline: {Path(path).name}")
+        self.perception_checkbox.setEnabled(self.perception_model is not None)
+        self.UpdateSafeSight(reset=True)
+
+    def UpdatePerception(self, image=None, annotated=False, view_image=None):
+        # polls CPU training separately from route planning and capture saving
+        if self.perception_future is not None and self.perception_future.done():
+            try:
+                model, _ = self.perception_future.result()
+            except Exception as error:
+                self.perception_status_label.setText(
+                    ("Training cancelled." if self.perception_cancel.is_set() else f"Training failed: {error}")
+                    + (" Previous model retained." if self.perception_model is not None else ""))
+            else:
+                self.perception_model = model
+                self.perception_status_label.setText("Trained experimental pixel baseline; saved instrument.npz in the capture folder.")
+                self.perception_checkbox.setEnabled(True)
+            self.perception_future = None
+            self.perception_train_button.setEnabled(True)
+            self.perception_load_button.setEnabled(True)
+            self.perception_cancel_button.setEnabled(False)
+        if self.perception_model is not None:
+            report = json.loads(str(self.perception_model["report_json"].item()))
+            lines = [f"Held-out simulator snapshots: {report['validation_groups']}"]
+            for variant in ("clean", "degraded"):
+                metrics = report.get(variant)
+                if metrics is not None:
+                    values = ["—" if metrics[key] is None else f"{metrics[key]:.1%}"
+                              for key in ("iou", "precision", "recall")]
+                    lines.append(f"{variant.capitalize()} captures: IoU {values[0]} · precision {values[1]} · recall {values[2]}")
+            negative_rate = report.get("negative_false_positive_fraction")
+            if negative_rate is not None:
+                lines.append(f"False positive pixels without a tool: {negative_rate:.2%}")
+            support = report.get("support") if int(self.perception_model["version"]) == 2 else None
+            if support is not None:
+                for variant in ("clean", "degraded"):
+                    result = support[variant]
+                    accepted_iou = "not assessed" if result["iou"] is None else f"{result['iou']:.1%}"
+                    lines.append(f"{variant.capitalize()} shown: {result['accepted']}/{result['frames']} · "
+                                 f"shown-only IoU {accepted_iou}")
+            self.perception_metrics_label.setText("\n".join(lines))
+        self.perception_result = None
+        if not self.perception_checkbox.isChecked():
+            self.perception_prediction_label.setText("Prediction off")
+        elif self.perception_model is None:
+            self.perception_prediction_label.setText("No model available")
+        elif image is None:
+            self.perception_prediction_label.setText("Waiting for a Camera image")
+        else:
+            try:
+                height, width = image.shape[:2]
+                # checks full RGB before the preview crop, matching the recorded reference
+                gate = AssessPrediction(image if view_image is None else view_image, self.perception_model)
+                reasons = (*gate["reasons"], *(("annotations",) if annotated else ()))
+                messages = {"dark": "dark image", "bright": "washed-out image", "low_detail": "low image detail",
+                            "appearance_shift": "appearance differs from training examples",
+                            "profile_missing": "model has no appearance reference; retrain it",
+                            "annotations": "visible annotations"}
+                appearance = ("" if gate["distance"] is None else
+                              f"\nAppearance difference: {gate['distance']:.3f} · limit {gate['limit']:.3f}")
+                if reasons:
+                    message = "; ".join(messages[reason] for reason in reasons)
+                    self.perception_prediction_label.setText("Prediction withheld: " + message + appearance)
+                    self.perception_result = {"status": "withheld", "reasons": reasons, "message": message,
+                                              "distance": gate["distance"], "limit": gate["limit"]}
+                    return image
+                sample = image
+                if max(height, width) > 320:
+                    scale = 320 / max(height, width)
+                    sample = np.asarray(Image.fromarray(image).resize(
+                        (max(16, round(width * scale)), max(16, round(height * scale))), Image.Resampling.LANCZOS))
+                scores = PredictInstrument(sample, self.perception_model)
+                mask = scores >= float(self.perception_model["threshold"])
+                fraction = float(mask.mean())
+                self.perception_prediction_label.setText(
+                    f"Candidate pixels: {fraction:.1%} · experimental"
+                    + appearance + "\nMatching appearance does not establish correctness.")
+                mask = np.asarray(Image.fromarray(mask).resize((width, height), Image.Resampling.NEAREST))
+                overlay = image.copy()
+                overlay[mask] = np.rint(0.5 * overlay[mask] + 0.5 * np.array([50, 215, 235])).astype(np.uint8)
+                self.perception_result = {"status": "shown", "candidate_fraction": fraction,
+                                          "distance": gate["distance"], "limit": gate["limit"]}
+                return overlay
+            except Exception as error:
+                self.perception_prediction_label.setText(f"Prediction withheld: {error}")
+                self.perception_result = {"status": "withheld", "reasons": ("prediction_error",),
+                                          "message": "prediction unavailable", "distance": None, "limit": None}
+        return image
 
     def ChooseCaptureFolder(self):
         folder = QFileDialog.getExistingDirectory(
@@ -733,6 +1033,11 @@ class SimulatorWindow(QMainWindow):
             return
         try:
             if self.capture_future is None:
+                # freezes image effects alongside the physical scene snapshot
+                self.capture_effects = ({"blur": self.sight_blur.value() / 100,
+                                         "exposure": self.sight_exposure.value(),
+                                         "haze": self.sight_haze.value() / 100}
+                                        if self.sight_effects_checkbox.isChecked() else None)
                 # freezes geometry on the UI thread + isolates capture's graphics context
                 rotation = np.array(self.scope_actor.user_matrix)[:3, :3]
                 camera = pv.Camera()
@@ -767,7 +1072,16 @@ class SimulatorWindow(QMainWindow):
                     "breathing_displacement_mm": self.motion_displacement,
                     "breathing_velocity_mm_s": self.motion_velocity,
                     "target_highlight_removed": True}
-                actors, camera, light = SnapshotScene(actors, camera, self.scope_light, serializable=True)
+                # captures the complete enclosure even when the external inspection window is shown
+                enclosure = (self.body_actor, self.cavity_actor, self.wall_actor)
+                visibility = [actor.GetVisibility() for actor in enclosure]
+                try:
+                    for actor in enclosure:
+                        actor.SetVisibility(True)
+                    actors, camera, light = SnapshotScene(actors, camera, self.scope_light, serializable=True)
+                finally:
+                    for actor, visible in zip(enclosure, visibility):
+                        actor.SetVisibility(visible)
                 if self.capture_executor is None:
                     self.capture_executor = ProcessPoolExecutor(max_workers=1, mp_context=get_context("spawn"))
                 self.capture_saving = False
@@ -780,10 +1094,12 @@ class SimulatorWindow(QMainWindow):
                 if self.capture_saving:
                     image_path, label_path = result
                     self.capture_status_label.setText(
-                        f"Saved images/{image_path.name}\n+ labels/{label_path.name}")
+                        f"Saved images/{image_path.name}\n+ labels/{label_path.name}"
+                        + (f"\n+ degraded/{image_path.name}" if self.capture_effects is not None else ""))
                     self.capture_future = None
                 else:
-                    self.capture_future = self.executor.submit(SaveCapture, self.capture_folder, *result)
+                    self.capture_future = self.executor.submit(
+                        SaveCapture, self.capture_folder, *result, effects=self.capture_effects)
                     self.capture_saving = True
             if self.capture_future is not None:
                 self.capture_timer.start(50)
@@ -1026,8 +1342,10 @@ class SimulatorWindow(QMainWindow):
         # forms a contact plate while leaving the target fundus exposed
         cells, last = posterior.find_closest_cell(organ.points, return_closest_point=True)
         direction = last - organ.points
-        contact = (((organ.points - self.rest_target) @ anatomy_rotation)[:, 0] > 8)
-        contact &= np.linalg.norm(direction, axis=1) < 4
+        local = (organ.points - self.rest_target) @ anatomy_rotation
+        contact = (local[:, 0] + 0.45 * np.sin(0.3 * local[:, 1])
+                   + 0.25 * np.cos(0.4 * local[:, 2])) > 6
+        contact &= np.linalg.norm(direction, axis=1) < 5
         contact &= np.sum(direction * organ.point_normals, axis=1) > -0.2
         triangles = organ.faces.reshape(-1, 4)[:, 1:]
         triangles = triangles[np.all(contact[triangles], axis=1)]
@@ -1045,21 +1363,21 @@ class SimulatorWindow(QMainWindow):
                                        return_inverse=True, return_counts=True)
         border = np.unique(edges[counts[inverse] == 1])
         distance = np.linalg.norm(organ.points[indices, None] - organ.points[indices[border]][None], axis=2).min(axis=1)
-        blend = np.clip(distance / 1.8, 0, 1)
+        blend = np.clip(distance / 2.4, 0, 1)
         blend = blend * blend * (3 - 2 * blend)
         # tapers the exposed border into the gallbladder surface
         last = first + blend[:, None] * (last - first) + (1 - blend[:, None]) * 0.15 * organ.point_normals[indices]
-        contacts = [(first, last, triangles)]
+        contacts = [(first, last, triangles, np.ones(len(first)))]
         # follows the liver behind the neck while keeping the registered branches exposed
         neck = organ.points[np.argmax(organ.points[:, 0])]
         distance = np.linalg.norm(posterior.points - neck, axis=1)
-        near = np.flatnonzero(distance < 6)
+        near = np.flatnonzero(distance < 10)
         _, near_duct = duct.find_closest_cell(posterior.points[near], return_closest_point=True)
         _, near_vessel = vascular.find_closest_cell(posterior.points[near], return_closest_point=True)
         gap = np.minimum(np.linalg.norm(near_duct - posterior.points[near], axis=1),
                          np.linalg.norm(near_vessel - posterior.points[near], axis=1))
         score = np.full(posterior.n_points, -1.0)
-        score[near] = np.minimum((6 - distance[near]) / 1.8, (gap - 0.8) / 0.8)
+        score[near] = np.minimum((10 - distance[near]) / 2.4, (gap - 0.8) / 0.8)
         triangles = posterior.faces.reshape(-1, 4)[:, 1:]
         triangles = triangles[np.all(score[triangles] > 0, axis=1)]
         indices, inverse = np.unique(triangles, return_inverse=True)
@@ -1069,30 +1387,68 @@ class SimulatorWindow(QMainWindow):
                                        return_inverse=True, return_counts=True)
         border = np.unique(edges[counts[inverse] == 1])
         distance = np.linalg.norm(posterior.points[indices, None] - posterior.points[indices[border]][None], axis=2).min(axis=1)
-        blend = np.clip(np.minimum(score[indices], distance / 0.8), 0, 1)
+        blend = np.clip(np.minimum(score[indices], distance / 2.4), 0, 1)
         blend = blend * blend * (3 - 2 * blend)
         first = posterior.points[indices] - 0.35 * posterior.point_normals[indices]
-        last = posterior.points[indices] + (-0.15 + 0.5 * blend[:, None]) * posterior.point_normals[indices]
-        contacts.append((first, last, triangles))
-        # closes both contact layers + moves them with their shared organ hosts
-        for first, last, triangles in contacts:
-            count = len(first)
-            edges = np.vstack((triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]))
-            _, inverse, counts = np.unique(np.sort(edges, axis=1), axis=0,
-                                           return_inverse=True, return_counts=True)
-            edges = edges[counts[inverse] == 1]
-            triangles = np.vstack((triangles[:, ::-1], triangles + count,
-                                   np.column_stack((edges, edges[:, 1] + count)),
-                                   np.column_stack((edges[:, 0], edges[:, 1] + count, edges[:, 0] + count))))
-            plate = pv.PolyData(np.vstack((first, last)),
-                                faces=np.column_stack((np.full(len(triangles), 3), triangles)).ravel())
-            plate.point_data["breathing"] = np.ones(plate.n_points)
-            tissue = tissue.merge(plate, merge_points=False)
+        last = posterior.points[indices] + (-0.15 + 0.65 * blend[:, None]) * posterior.point_normals[indices]
+        contacts.append((first, last, triangles, np.ones(len(first))))
         # joins a complete body lining to a curved anterior wall with two real port openings
         abdomen = self.anatomy_meshes["abdomen"].copy()
+        # shares one curved window boundary between the paired skin + lining surfaces
+        count = abdomen.n_points // 2
+        middle = (abdomen.points[:count] + abdomen.points[count:]) / 2
+        window_direction = np.array([-0.58, -0.35, 0.74])
+        window_direction /= np.linalg.norm(window_direction)
+        window_right = np.array([1.0, 0.0, 0.0]) - window_direction[0] * window_direction
+        window_right /= np.linalg.norm(window_right)
+        window_axes = np.array([window_right / 84,
+                                np.cross(window_direction, window_right) / 100,
+                                window_direction / 65])
+        window_centre = np.array([118.0, 12.0, -4.0]) + 20 * (
+            window_right - np.cross(window_direction, window_right))
+        coordinates = (middle - window_centre) @ window_axes.T
+        # keeps the opposite wall + a continuous skin bridge around both entry ports
+        entry = middle / [18, 95, 65] - [0, -35 / 95, 15 / 65]
+        window = np.maximum(np.sum(coordinates[:, :2] ** 2, axis=1) - 1, -coordinates[:, 2])
+        entry = 1 - np.sum(entry ** 2, axis=1)
+        window = (window + entry + np.sqrt((window - entry) ** 2 + 0.04 ** 2)) / 2
+        abdomen.point_data["section"] = np.tile(window, 2)
         outer = abdomen["region"][abdomen.faces.reshape(-1, 4)[:, 1]] == 2
         body = abdomen.extract_cells(outer).extract_surface(algorithm="dataset_surface")
         cavity = abdomen.extract_cells(~outer).extract_surface(algorithm="dataset_surface")
+        boundary = body.copy()
+        indices = boundary["vtkOriginalPointIds"]
+        boundary.points = middle[indices]
+        boundary.point_data["outside"] = abdomen.points[indices]
+        boundary.point_data["inside"] = abdomen.points[indices + count]
+        boundary = boundary.contour([0.0], scalars="section")
+        edges = boundary.lines.reshape(-1, 3)[:, 1:]
+        count = boundary.n_points
+        depth = np.unique(np.r_[np.linspace(0, 1, 9), 0.12, 0.22, 0.6, 0.78])
+        points = ((1 - depth[:, None, None]) * boundary["outside"][None]
+                  + depth[:, None, None] * boundary["inside"][None])
+        rings = np.arange(len(depth) * count).reshape(-1, count)
+        faces = np.stack((np.full((len(depth) - 1, len(edges)), 4),
+                          rings[:-1, edges[:, 0]], rings[:-1, edges[:, 1]],
+                          rings[1:, edges[:, 1]], rings[1:, edges[:, 0]]), axis=-1).ravel()
+        section = pv.PolyData(points.reshape(-1, 3), faces=faces).triangulate()
+        section.point_data["depth"] = np.repeat(depth, count)
+        # rounds the inspection edge slightly while keeping its skin + lining seams exact
+        depth = section["depth"]
+        coordinates = (section.points - window_centre) @ window_axes.T
+        normal = 2 * coordinates[:, :2] @ window_axes[:2]
+        normal /= np.linalg.norm(normal, axis=1)[:, None]
+        section.points -= 0.35 * np.sin(np.pi * depth)[:, None] ** 2 * normal
+        # distinguishes skin, subcutaneous fat + the deeper muscular lining at the cut edge
+        layers = np.array([[201, 149, 125], [219, 171, 148], [231, 201, 144],
+                           [225, 187, 125], [158, 77, 76], [211, 145, 135]])
+        section.point_data["colour"] = np.rint(np.column_stack([
+            np.interp(depth, [0, 0.12, 0.22, 0.6, 0.78, 1], layers[:, axis])
+            for axis in range(3)])).astype(np.uint8)
+        self.section_actor = self.viewport.add_mesh(
+            section, scalars="colour", rgb=True, show_scalar_bar=False,
+            smooth_shading=True, pbr=True, roughness=0.65)
+        self.section_actor.user_matrix = self.scene_matrix
         attachments = []
         # anchors the vessel bed to its nearest host instead of stretching a ribbon across the cavity
         hosts = (posterior, cavity)
@@ -1106,29 +1462,46 @@ class SimulatorWindow(QMainWindow):
         direction = anchors[host_index][nearest] - centres[nearest]
         direction /= np.linalg.norm(direction)
         first -= 0.6 * max(0.0, np.dot(direction, normals[nearest])) * normals[nearest]
-        guide = anchors[host_index][nearest] + 7.5 * edge[:, None] * sides[nearest]
+        guide = anchors[host_index][nearest] + 10 * edge[:, None] * sides[nearest]
         cells, last = host.find_closest_cell(guide, return_closest_point=True)
         last -= 0.65 * host.cell_normals[cells]
         across = np.linspace(0, 1, 38)[None, :, None]
         points = first[:, None, :] * (1 - across) + last[:, None, :] * across
         folds = 0.8 + 0.45 * np.cos(1.5 * np.pi * edge)
         points += folds[:, None, None] * np.sin(np.pi * across) * normals[nearest]
+        # broadens the middle into a soft irregular pad while retaining both embedded ends
+        points += (1.5 * edge * (1 - edge ** 2))[:, None, None] * np.sin(
+            np.pi * across) * sides[nearest]
         weights = np.broadcast_to(across[0, :, 0] if host_index == 0 else 0.0, points.shape[:2])
         attachments.append((points, weights))
-        # gives each connecting sheet a thin closed edge + shared breathing weights
+        # gives each pad variable thickness + tapered embedded edges
         for points, weights in attachments:
             sheet = pv.StructuredGrid(*np.moveaxis(points, -1, 0)).extract_surface(
                 algorithm="dataset_surface").triangulate().compute_normals(consistent_normals=True)
             # follows surface point ordering when assigning the moving edge
             weights = weights.ravel(order="F")[sheet["vtkOriginalPointIds"]]
-            normal = sheet.point_normals.mean(axis=0)
-            normal *= 0.6 / np.linalg.norm(normal)
-            sheet.clear_data()
-            sheet.point_data["breathing"] = weights
-            sheet.points -= normal / 2
-            sheet = sheet.extrude(normal, capping=True).triangulate().smooth(
-                n_iter=20, relaxation_factor=0.08)
-            tissue = tissue.merge(sheet, merge_points=False)
+            original = sheet["vtkOriginalPointIds"]
+            width = np.tile(edge, points.shape[1])[original]
+            along = np.repeat(np.linspace(0, 1, points.shape[1]), len(edge))[original]
+            thickness = 0.22 + 0.9 * (1 - width ** 2) * np.sin(np.pi * along) ** 2
+            thickness *= 0.94 + 0.06 * np.cos(7 * width + 5 * along)
+            first = sheet.points - 0.5 * thickness[:, None] * sheet.point_normals
+            last = sheet.points + 0.5 * thickness[:, None] * sheet.point_normals
+            contacts.append((first, last, sheet.faces.reshape(-1, 4)[:, 1:], weights))
+        # closes the host-conforming layers with shared geometry + breathing weights
+        for first, last, triangles, weights in contacts:
+            count = len(first)
+            edges = np.vstack((triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]))
+            _, inverse, counts = np.unique(np.sort(edges, axis=1), axis=0,
+                                           return_inverse=True, return_counts=True)
+            edges = edges[counts[inverse] == 1]
+            triangles = np.vstack((triangles[:, ::-1], triangles + count,
+                                   np.column_stack((edges, edges[:, 1] + count)),
+                                   np.column_stack((edges[:, 0], edges[:, 1] + count, edges[:, 0] + count))))
+            plate = pv.PolyData(np.vstack((first, last)),
+                                faces=np.column_stack((np.full(len(triangles), 3), triangles)).ravel())
+            plate.point_data["breathing"] = np.tile(weights, 2)
+            tissue = tissue.merge(plate, merge_points=False)
         tissue = tissue.clean(tolerance=1e-6, absolute=True)
         tissue.compute_normals(auto_orient_normals=True, consistent_normals=True, inplace=True)
         outline = abdomen.field_data["front_outline"]
@@ -1171,12 +1544,17 @@ class SimulatorWindow(QMainWindow):
                           next_edges + 128, next_edges), axis=-1).ravel()
         port_walls = pv.PolyData(points, faces=faces).triangulate()
         port_walls.point_data["region"] = np.ones(port_walls.n_points, dtype=np.uint8)
+        for mesh in (*layers, port_walls):
+            coordinates = (mesh.points - window_centre) @ window_axes.T
+            entry = mesh.points / [18, 95, 65] - [0, -35 / 95, 15 / 65]
+            window = np.maximum(np.sum(coordinates[:, :2] ** 2, axis=1) - 1, -coordinates[:, 2])
+            entry = 1 - np.sum(entry ** 2, axis=1)
+            mesh.point_data["section"] = (window + entry + np.sqrt(
+                (window - entry) ** 2 + 0.04 ** 2)) / 2
         wall = layers[0].merge(port_walls, merge_points=False)
         wall.cell_data["colour"] = np.tile([255, 255, 255], (wall.n_cells, 1)).astype(np.uint8)
         wall.cell_data["colour"][-port_walls.n_cells:] = [233, 193, 179]
         cavity = cavity.merge(layers[1], merge_points=False)
-        skin = abdomen.merge([*layers, port_walls], merge_points=True).clean(tolerance=0.0001, absolute=True)
-        skin.compute_normals(consistent_normals=True, split_vertices=False, inplace=True)
         # preserves the digestive group's shared anatomy + moves it with the adjacent liver
         stomach, duodenum, bowel, peritoneum = [self.anatomy_meshes[name].copy()
                                                for name in ("stomach", "duodenum", "bowel", "peritoneum")]
@@ -1187,30 +1565,6 @@ class SimulatorWindow(QMainWindow):
         for mesh in (stomach, duodenum, bowel, peritoneum):
             mesh.points = mesh.points @ anatomy_rotation.T + self.rest_target
 
-        # presents a section externally while retaining the full enclosure for the scope + capture
-        section = vtkPlane()
-        # keeps both port openings + exposes the target throughout breathing
-        angle = np.radians(97.5)
-        section.SetNormal(0, np.cos(angle), -np.sin(angle))
-        section.SetOrigin(0, 0, 35 / np.sin(angle))
-        planes = vtkPlaneCollection()
-        planes.AddItem(section)
-        cutter = vtkClipClosedSurface()
-        cutter.SetInputData(skin)
-        cutter.SetClippingPlanes(planes)
-        cutter.GenerateClipFaceOutputOn()
-        cutter.Update()
-        self.section_actor = self.viewport.add_mesh(
-            pv.wrap(cutter.GetClipFaceOutput()).copy().clean(), color="#d8b590", pbr=True, roughness=0.7)
-        self.section_actor.user_matrix = self.scene_matrix
-        # frames the body section displayed in external views
-        points = skin.points
-        kept = (points - np.array(section.GetOrigin())) @ np.array(section.GetNormal()) >= 0
-        points = np.vstack((points[kept], self.section_actor.mapper.dataset.points)) @ self.scene_rotation.T
-        self.section_bounds = np.column_stack((points.min(axis=0), points.max(axis=0))).ravel()
-        self.section_plane = vtkPlane()
-        self.section_plane.SetNormal(*(self.scene_rotation @ np.array(section.GetNormal())))
-        self.section_plane.SetOrigin(*(self.scene_rotation @ np.array(section.GetOrigin())))
         # tints full-colour textures without multiplying the old baked colours into them
         for mesh in (organ, posterior, tissue, cavity, body, stomach, duodenum, bowel, peritoneum):
             colour = np.tile([250.0, 246.0, 241.0], (mesh.n_points, 1))
@@ -1514,6 +1868,22 @@ class SimulatorWindow(QMainWindow):
             actor.prop.SetCoatRoughness(0.24 if actor in (self.organ_actor, self.posterior_actor) else 0.3)
         self.rest_tissue_points = self.tissue_actor.mapper.dataset.points.copy()
         self.rest_tissue_tangents = self.tissue_actor.mapper.dataset.point_data["Tangents"].copy()
+        # derives the external inspection window from the same fully textured enclosure
+        sections = []
+        for actor in (self.body_actor, self.cavity_actor, self.wall_actor):
+            mesh = actor.mapper.dataset.clip_scalar(scalars="section", value=0.0, invert=False)
+            section_actor = self.viewport.add_mesh(
+                mesh, scalars="colour", rgb=True, show_scalar_bar=False, smooth_shading=True)
+            for setting in ("Interpolation", "Metallic", "Roughness", "CoatStrength",
+                            "CoatRoughness", "CoatIOR", "NormalScale"):
+                getattr(section_actor.prop, f"Set{setting}")(getattr(actor.prop, f"Get{setting}")())
+            for slot in ("albedoTex", "normalTex", "materialTex"):
+                section_actor.prop.SetTexture(slot, actor.prop.GetTexture(slot))
+            section_actor.user_matrix = self.scene_matrix
+            sections.append(section_actor)
+        self.section_body_actor, self.section_cavity_actor, self.section_wall_actor = sections
+        points = np.vstack([actor.mapper.dataset.points for actor in sections]) @ self.scene_rotation.T
+        self.section_bounds = np.column_stack((points.min(axis=0), points.max(axis=0))).ravel()
         # separates steel, coated shafts + plastic through their response to light
         for actor, metallic, roughness in (
                 (self.shaft_actor, 0.0, 0.5), (self.external_shaft_actor, 0.0, 0.5),
@@ -1614,9 +1984,9 @@ class SimulatorWindow(QMainWindow):
         self.wall_actor.prop.opacity = 1.0
         self.section_actor.SetVisibility(not camera_view)
         for actor in (self.body_actor, self.cavity_actor, self.wall_actor):
-            actor.mapper.RemoveAllClippingPlanes()
-            if not camera_view:
-                actor.mapper.AddClippingPlane(self.section_plane)
+            actor.SetVisibility(camera_view)
+        for actor in (self.section_body_actor, self.section_cavity_actor, self.section_wall_actor):
+            actor.SetVisibility(not camera_view)
         if camera_view:
             self.viewport.remove_all_lights()
             self.viewport.add_light(self.scope_light)
@@ -1626,6 +1996,7 @@ class SimulatorWindow(QMainWindow):
             self.UpdateCameraPose()
             self.viewport.render()
             self.render_pending = False
+            self.UpdateSafeSight(reset=True)
             return
         self.viewport.enable_lightkit()
         for light in self.viewport.renderer.lights:
@@ -1650,12 +2021,12 @@ class SimulatorWindow(QMainWindow):
                                  self.scene_rotation @ (self.port - self.scope_port))
         # fits current physical models without letting sensor overlays shift the view
         actors = (self.shaft_actor, self.external_shaft_actor, self.tip_actor,
-                  self.handle_actor, self.collar_actor, self.port_actor, self.wall_actor,
+                  self.handle_actor, self.collar_actor, self.port_actor, self.section_wall_actor,
                   self.scope_actor, self.scope_port_actor, self.organ_actor, self.posterior_actor,
                   self.vessel_actor, self.tissue_actor, self.duct_actor, self.vascular_actor, self.diaphragm_actor,
-                  self.cavity_actor, self.body_actor, self.stomach_actor, self.duodenum_actor,
+                  self.section_cavity_actor, self.section_body_actor, self.stomach_actor, self.duodenum_actor,
                   self.bowel_actor, self.peritoneum_actor)
-        bounds = np.array([self.section_bounds if actor in (self.body_actor, self.cavity_actor, self.wall_actor)
+        bounds = np.array([self.section_bounds if actor in (self.section_body_actor, self.section_cavity_actor, self.section_wall_actor)
                            else actor.GetBounds() for actor in actors
                            if actor.GetVisibility()]).reshape(-1, 3, 2)
         low = bounds[:, :, 0].min(axis=0)
@@ -1664,9 +2035,10 @@ class SimulatorWindow(QMainWindow):
             # frames the torso section + both ports as one anatomical setup
             actors = (self.shaft_actor, self.tip_actor, self.port_actor, self.scope_port_actor,
                       self.organ_actor, self.posterior_actor, self.vessel_actor, self.tissue_actor,
-                      self.duct_actor, self.vascular_actor, self.diaphragm_actor, self.body_actor, self.cavity_actor, self.wall_actor,
+                      self.duct_actor, self.vascular_actor, self.diaphragm_actor,
+                      self.section_body_actor, self.section_cavity_actor, self.section_wall_actor,
                       self.stomach_actor, self.duodenum_actor, self.bowel_actor, self.peritoneum_actor)
-            bounds = np.array([self.section_bounds if actor in (self.body_actor, self.cavity_actor, self.wall_actor)
+            bounds = np.array([self.section_bounds if actor in (self.section_body_actor, self.section_cavity_actor, self.section_wall_actor)
                                else actor.GetBounds() for actor in actors
                                if actor.GetVisibility()]).reshape(-1, 3, 2)
             outside = np.vstack((self.scene_rotation @ self.port - 60 * self.scene_rotation
@@ -1708,6 +2080,8 @@ class SimulatorWindow(QMainWindow):
         self.viewport.renderer.ResetCameraClippingRange()
         self.viewport.render()
         self.render_pending = False
+
+        self.UpdateSafeSight(reset=True)
 
     def RunComparison(self):
         if self.comparison_process is not None:
@@ -2975,6 +3349,12 @@ class SimulatorWindow(QMainWindow):
         self.sensor_timer.stop()
         self.readout_timer.stop()
         self.capture_timer.stop()
+        self.sight_timer.stop()
+        self.perception_cancel.set()
+        if self.perception_future is not None:
+            self.perception_future.cancel()
+        if self.perception_executor is not None:
+            self.perception_executor.shutdown(wait=False, cancel_futures=True)
         if self.capture_future is not None:
             self.capture_future.cancel()
         if self.capture_executor is not None:

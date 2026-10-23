@@ -12,6 +12,7 @@ from PIL import Image
 from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper
 
 from capture import CaptureFrame, SaveCapture, SnapshotScene
+from safesight import DegradeView
 
 
 class CaptureTests(unittest.TestCase):
@@ -444,6 +445,7 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual(Path(second_label), label_folder / "frame_000005.npz")
             self.assertEqual(existing_image.read_bytes(), b"keep existing image")
             self.assertEqual(existing_label.read_bytes(), b"keep existing labels")
+            self.assertFalse((Path(folder) / "degraded").exists())
             with Image.open(image_path) as saved_image:
                 np.testing.assert_array_equal(np.asarray(saved_image), rgb)
             with np.load(label_path, allow_pickle=False) as saved_labels:
@@ -465,6 +467,110 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual(existing.read_bytes(), b"keep existing image")
             self.assertEqual(list(image_folder.iterdir()), [existing])
             self.assertEqual(list((Path(folder) / "labels").iterdir()), [])
+
+    def test_DegradedCaptureSharesCleanPixelsAndUnchangedGeometryLabels(self):
+        rgb = np.arange(24 * 32 * 3, dtype=np.uint8).reshape(24, 32, 3)
+        labels = {
+            "schema_version": np.array(1),
+            "semantic_mask": np.tile(np.arange(32, dtype=np.uint8) % 3, (24, 1)),
+            "depth_mm": np.full((24, 32), 12.5, dtype=np.float32),
+            "camera_intrinsics": np.array([[20, 0, 16], [0, 20, 12], [0, 0, 1]]),
+            "world_to_camera": np.eye(4),
+            "target_visible": np.array(True),
+            "scenario": np.array("synthetic"),
+        }
+        labels["depth_mm"][0] = np.nan
+        originals = {name: value.copy() for name, value in labels.items()}
+        original_rgb = rgb.copy()
+        effects = {"blur": 0.5, "exposure": -1.0, "haze": 0.25}
+        original_effects = effects.copy()
+        with tempfile.TemporaryDirectory() as folder:
+            image_path, label_path = SaveCapture(folder, rgb, labels, effects=effects)
+            degraded_path = Path(folder) / "degraded" / image_path.name
+            self.assertEqual(image_path.stem, label_path.stem)
+            with Image.open(image_path) as saved:
+                np.testing.assert_array_equal(np.asarray(saved), rgb)
+            with Image.open(degraded_path) as saved:
+                np.testing.assert_array_equal(np.asarray(saved), DegradeView(rgb, **effects))
+                self.assertFalse(np.array_equal(np.asarray(saved), rgb))
+            with np.load(label_path, allow_pickle=False) as saved:
+                for name, expected in originals.items():
+                    np.testing.assert_equal(saved[name], expected)
+                self.assertEqual(float(saved["degradation_blur"]), effects["blur"])
+                self.assertEqual(float(saved["degradation_exposure_ev"]), effects["exposure"])
+                self.assertEqual(float(saved["degradation_haze"]), effects["haze"])
+                self.assertIn("masks, depth and calibration are unchanged",
+                              str(saved["degradation_convention"]))
+                self.assertTrue(all(not saved[name].dtype.hasobject for name in saved.files))
+        np.testing.assert_array_equal(rgb, original_rgb)
+        self.assertEqual(set(labels), set(originals))
+        for name, expected in originals.items():
+            np.testing.assert_equal(labels[name], expected)
+        self.assertEqual(effects, original_effects)
+
+    def test_DegradedCaptureWithZeroEffectsIsAnExactMatchedPair(self):
+        rgb = np.arange(24 * 32 * 3, dtype=np.uint8).reshape(24, 32, 3)
+        with tempfile.TemporaryDirectory() as folder:
+            image_path, label_path = SaveCapture(folder, rgb, {}, effects={})
+            with Image.open(Path(folder) / "degraded" / image_path.name) as saved:
+                np.testing.assert_array_equal(np.asarray(saved), rgb)
+            with np.load(label_path, allow_pickle=False) as saved:
+                self.assertEqual(float(saved["degradation_blur"]), 0)
+                self.assertEqual(float(saved["degradation_exposure_ev"]), 0)
+                self.assertEqual(float(saved["degradation_haze"]), 0)
+
+    def test_CleanSaveSkipsAnOrphanDegradedFrameWithoutCreatingAnother(self):
+        rgb = np.zeros((24, 32, 3), dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as folder:
+            degraded_folder = Path(folder) / "degraded"
+            degraded_folder.mkdir()
+            existing = degraded_folder / "frame_000007.png"
+            existing.write_bytes(b"keep orphan degraded image")
+            image_path, label_path = SaveCapture(folder, rgb, {})
+            self.assertEqual(image_path.stem, "frame_000008")
+            self.assertEqual(label_path.stem, image_path.stem)
+            self.assertEqual(existing.read_bytes(), b"keep orphan degraded image")
+            self.assertEqual(list(degraded_folder.iterdir()), [existing])
+
+    def test_DegradedReservationCollisionRetriesWithoutRemovingExistingImage(self):
+        rgb = np.zeros((24, 32, 3), dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as folder:
+            degraded_folder = Path(folder) / "degraded"
+            degraded_folder.mkdir()
+            existing = degraded_folder / "frame_000001.png"
+            existing.write_bytes(b"keep concurrent degraded image")
+            # simulates a file arriving after the initial directory scan
+            with patch.object(Path, "glob", return_value=[]):
+                image_path, label_path = SaveCapture(folder, rgb, {}, effects={})
+            self.assertEqual(image_path.stem, "frame_000002")
+            self.assertEqual(label_path.stem, image_path.stem)
+            self.assertEqual(existing.read_bytes(), b"keep concurrent degraded image")
+            self.assertEqual(list((Path(folder) / "images").iterdir()), [image_path])
+            self.assertEqual(list((Path(folder) / "labels").iterdir()), [label_path])
+            self.assertTrue((degraded_folder / image_path.name).exists())
+
+    def test_DegradedSaveFailureRollsBackAllThreeNewFiles(self):
+        rgb = np.zeros((24, 32, 3), dtype=np.uint8)
+        for error in (OSError("disk write failed"), FileExistsError("write failed after reservation")):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as folder:
+                degraded_folder = Path(folder) / "degraded"
+                degraded_folder.mkdir()
+                existing = degraded_folder / "frame_000001.png"
+                existing.write_bytes(b"keep existing degraded image")
+                with patch("capture.np.savez_compressed", side_effect=error):
+                    with self.assertRaises(type(error)):
+                        SaveCapture(folder, rgb, {"schema_version": np.array(1)}, effects={})
+                self.assertEqual(existing.read_bytes(), b"keep existing degraded image")
+                self.assertEqual(list(degraded_folder.iterdir()), [existing])
+                self.assertEqual(list((Path(folder) / "images").iterdir()), [])
+                self.assertEqual(list((Path(folder) / "labels").iterdir()), [])
+
+    def test_InvalidDegradationSettingsFailBeforeCreatingCaptureFolders(self):
+        rgb = np.zeros((24, 32, 3), dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaises(ValueError):
+                SaveCapture(folder, rgb, {}, effects={"blur": 2.0})
+            self.assertEqual(list(Path(folder).iterdir()), [])
 
     def test_CaptureRejectsInvalidImageDimensions(self):
         camera = pv.Camera()
