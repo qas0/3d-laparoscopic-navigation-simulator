@@ -33,6 +33,7 @@ from geometry import CheckRemainingRoute, InstrumentRotation, movement_is_clear,
 from kalman import KalmanFilter
 from motion import GetRespiratoryMotion
 from perception import AssessPrediction, LoadInstrument, PredictInstrument, TrainInstrument
+from reliability import EvaluateReliability, ReliabilityMetrics
 from safesight import AssessView, DegradeView
 from scenarios import SCENARIOS
 from sensors import ApplyBias, ApplyDropout, ApplyOutlier, measure_position
@@ -108,6 +109,10 @@ class SimulatorWindow(QMainWindow):
         self.perception_future = None
         self.perception_executor = None
         self.perception_cancel = Event()
+        self.reliability_future = None
+        self.reliability_result = None
+        self.reliability_dialog = None
+        self.reliability_canvas = None
         self.calibration_dialog = None
         self.calibration_canvas = None
         self.required_clearance = 2.0
@@ -656,6 +661,26 @@ class SimulatorWindow(QMainWindow):
         self.perception_cancel_button.clicked.connect(lambda: self.perception_cancel.set())
         perception_layout.addWidget(self.perception_cancel_button)
         capture_layout.addWidget(self.CreateExpandableSection("Instrument perception", perception_panel))
+        reliability_panel = QWidget()
+        reliability_layout = QVBoxLayout(reliability_panel)
+        reliability_layout.setContentsMargins(0, 0, 0, 0)
+        reliability_layout.addWidget(QLabel(
+            "Compares always showing predictions, quality checks alone, and quality + appearance checks. "
+            "Uses held-out images from the model's capture folder, plus optional evaluation/ captures.", wordWrap=True))
+        self.reliability_button = QPushButton("Evaluate reliability", enabled=False)
+        self.reliability_button.setToolTip(
+            "Choose the original model capture folder. Fixed blur, exposure and haze tests use RGB predictions + labels for scoring.")
+        self.reliability_button.clicked.connect(self.RunReliability)
+        reliability_layout.addWidget(self.reliability_button)
+        self.reliability_cancel_button = QPushButton("Cancel evaluation", enabled=False)
+        self.reliability_cancel_button.clicked.connect(lambda: self.perception_cancel.set())
+        reliability_layout.addWidget(self.reliability_cancel_button)
+        self.reliability_results_button = QPushButton("View reliability results", enabled=False)
+        self.reliability_results_button.clicked.connect(self.PlotReliability)
+        reliability_layout.addWidget(self.reliability_results_button)
+        self.reliability_status_label = QLabel("Load an instrument model with an appearance profile to evaluate it.", wordWrap=True)
+        reliability_layout.addWidget(self.reliability_status_label)
+        capture_layout.addWidget(self.CreateExpandableSection("Reliability evaluation", reliability_panel))
         sight_tests = QWidget()
         sight_test_layout = QVBoxLayout(sight_tests)
         sight_test_layout.setContentsMargins(0, 0, 0, 0)
@@ -906,6 +931,9 @@ class SimulatorWindow(QMainWindow):
     def TrainPerception(self):
         if self.perception_future is not None:
             return
+        if self.reliability_future is not None:
+            self.perception_status_label.setText("Finish the reliability evaluation before training.")
+            return
         if self.capture_future is not None:
             self.perception_status_label.setText("Finish the camera capture before training.")
             return
@@ -923,9 +951,10 @@ class SimulatorWindow(QMainWindow):
         self.perception_train_button.setEnabled(False)
         self.perception_load_button.setEnabled(False)
         self.perception_cancel_button.setEnabled(True)
+        self.reliability_button.setEnabled(False)
 
     def LoadPerception(self, path=None):
-        if self.perception_future is not None:
+        if self.perception_future is not None or self.reliability_future is not None:
             return
         if path is None or isinstance(path, bool):
             path, _ = QFileDialog.getOpenFileName(self, "Load instrument model", "", "Instrument model (*.npz)")
@@ -934,6 +963,10 @@ class SimulatorWindow(QMainWindow):
         self.perception_model = None
         self.perception_report = None
         self.perception_report_json = None
+        self.reliability_result = None
+        self.reliability_results_button.setEnabled(False)
+        if self.reliability_dialog is not None:
+            self.reliability_dialog.close()
         self.perception_metrics_label.clear()
         if self.calibration_dialog is not None:
             self.calibration_dialog.close()
@@ -945,7 +978,153 @@ class SimulatorWindow(QMainWindow):
             self.perception_status_label.setText(f"Loaded experimental pixel baseline: {Path(path).name}")
         self.perception_checkbox.setEnabled(self.perception_model is not None)
         self.calibration_button.setEnabled(self.perception_model is not None and int(self.perception_model["version"]) == 3)
+        self.reliability_button.setEnabled(self.perception_model is not None and int(self.perception_model["version"]) >= 2)
+        self.reliability_status_label.setText(
+            "Choose the model's capture folder, then evaluate reliability."
+            if self.reliability_button.isEnabled() else "An instrument model with an appearance profile is required.")
         self.UpdateSafeSight(reset=True)
+
+    def RunReliability(self):
+        if self.perception_future is not None or self.reliability_future is not None:
+            return
+        if self.perception_model is None or int(self.perception_model["version"]) < 2:
+            self.reliability_status_label.setText("Load an instrument model with an appearance profile first.")
+            return
+        if self.capture_future is not None:
+            self.reliability_status_label.setText("Finish the camera capture before evaluating reliability.")
+            return
+        if self.capture_folder is None:
+            self.ChooseCaptureFolder()
+        if self.capture_folder is None:
+            return
+        if self.perception_executor is None:
+            self.perception_executor = ThreadPoolExecutor(max_workers=1)
+        self.perception_cancel.clear()
+        model = {key: value.copy() for key, value in self.perception_model.items()}
+        self.reliability_future = self.perception_executor.submit(
+            EvaluateReliability, self.capture_folder, model, cancel=self.perception_cancel)
+        self.reliability_status_label.setText("Evaluating held-out views and fixed image tests…")
+        self.reliability_button.setEnabled(False)
+        self.reliability_cancel_button.setEnabled(True)
+        self.perception_train_button.setEnabled(False)
+        self.perception_load_button.setEnabled(False)
+
+    def PlotReliability(self):
+        report = self.reliability_result
+        if report is None:
+            return
+        if self.reliability_dialog is None:
+            self.reliability_dialog = QDialog(self)
+            self.reliability_dialog.setWindowTitle("SafeSight reliability evaluation")
+            self.reliability_dialog.resize(1060, 800)
+            self.reliability_dialog.setMinimumSize(840, 680)
+            layout = QVBoxLayout(self.reliability_dialog)
+            self.reliability_heading = QLabel(wordWrap=True)
+            layout.addWidget(self.reliability_heading)
+            filters = QHBoxLayout()
+            filters.addWidget(QLabel("Image test"))
+            self.reliability_case = QComboBox()
+            self.reliability_case.addItem("All conditions", None)
+            for case in report["cases"]:
+                self.reliability_case.addItem(case["name"], case["name"])
+            filters.addWidget(self.reliability_case, 1)
+            filters.addWidget(QLabel("Views"))
+            self.reliability_subset = QComboBox()
+            for label, value in (("All views", "all"), ("Original held-out views", "heldout"),
+                                 ("Fresh evaluation views", "evaluation"), ("Instrument occluded", "occluded"),
+                                 ("Instrument unobstructed", "unoccluded"), ("Instrument outside frame", "out_of_frame")):
+                self.reliability_subset.addItem(label, value)
+            filters.addWidget(self.reliability_subset, 1)
+            layout.addLayout(filters)
+            self.reliability_canvas = FigureCanvasQTAgg(Figure(facecolor="white", layout="constrained"))
+            layout.addWidget(self.reliability_canvas, 1)
+            self.reliability_table = QTableWidget(3, 7)
+            self.reliability_table.setHorizontalHeaderLabels(
+                ["Policy", "Shown", "Coverage", "Mask error ↓", "Missed tool ↓", "False pixels ↓", "Absent alarms ↓"])
+            for column, tooltip in enumerate((
+                    "Rules that decide whether to show the same RGB prediction",
+                    "Shown image conditions / all tested image conditions",
+                    "Fraction of tested image conditions shown",
+                    "Mean per-frame (FP + FN) / (TP + FP + FN). Correct empty masks have zero error.",
+                    "Missed tool pixels / all labelled tool pixels in shown images",
+                    "False tool pixels / all labelled background pixels in shown images",
+                    "Shown preview crops with no labelled tool and at least one false candidate pixel / shown crops with no labelled tool")):
+                self.reliability_table.horizontalHeaderItem(column).setToolTip(tooltip)
+            self.reliability_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.reliability_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+            self.reliability_table.verticalHeader().setVisible(False)
+            layout.addWidget(self.reliability_table)
+            layout.addWidget(QLabel(
+                "Labels score errors and define view subsets; predictions use RGB only. Errors and tool-absent counts "
+                "use the central preview crop; geometry subsets use full-frame instrument projections. "
+                "Curve cutoffs describe this test set and do not change the live gate. "
+                "Repeated corruptions of one snapshot are not independent trials.", wordWrap=True))
+            self.reliability_case.currentIndexChanged.connect(self.PlotReliability)
+            self.reliability_subset.currentIndexChanged.connect(self.PlotReliability)
+        case = self.reliability_case.currentData()
+        subset = self.reliability_subset.currentData()
+        rows = [row for row in report["frames"]
+                if (case is None or row["case"] == case)
+                and (subset == "all" or row["source"] == subset or row.get("visibility") == subset)]
+        selected_groups = len({row["group_id"] for row in rows})
+        self.reliability_heading.setText(
+            f"Dataset: {report['heldout_groups']} original held-out snapshots + {report['evaluation_groups']} fresh views; "
+            f"{len(report['cases'])} fixed image conditions. Selected: {selected_groups} snapshots, {len(rows)} image conditions. "
+            f"Current appearance limit: {report['appearance_limit']:.3f}. Rates describe shown predictions; — means unavailable.")
+        self.reliability_canvas.figure.clear()
+        curve_axis, error_axis = self.reliability_canvas.figure.subplots(1, 2)
+        colours = ("#62788c", "#bc681d", "#00877b")
+        labels = ("Always show", "Quality only", "Quality + appearance")
+        misses, false_pixels, frame_errors = [], [], []
+        for index, (policy, label, colour) in enumerate(zip(("always", "quality", "appearance"), labels, colours)):
+            metrics = ReliabilityMetrics(rows, policy=policy)
+            values = [label, f"{metrics['accepted']} / {metrics['frames']}"]
+            values += ["—" if metrics[key] is None else
+                       (f"{metrics[key]:.1%}" if key in ("coverage", "mean_mask_error") else f"{100 * metrics[key]:.3g}%")
+                       for key in ("coverage", "mean_mask_error", "missed_tool_fraction", "false_positive_fraction")]
+            values.append(f"{metrics['negative_false_detections']} / {metrics['negative_accepted']}"
+                          if metrics["negative_accepted"] else "—")
+            for column, value in enumerate(values):
+                self.reliability_table.setItem(index, column, QTableWidgetItem(value))
+            error = metrics["mean_mask_error"]
+            if error is not None:
+                frame_errors.append(100 * error)
+                curve_axis.scatter(100 * metrics["coverage"], 100 * error, s=60, color=colour, label=label, zorder=3)
+            else:
+                curve_axis.plot([], [], "o", color=colour, label=label + " (none shown)")
+            misses.append(np.nan if metrics["missed_tool_fraction"] is None else 100 * metrics["missed_tool_fraction"])
+            false_pixels.append(np.nan if metrics["false_positive_fraction"] is None else 100 * metrics["false_positive_fraction"])
+        coverage, errors = [], []
+        for point in report["curve"]:
+            metrics = ReliabilityMetrics(rows, cutoff=point["cutoff"])
+            if metrics["mean_mask_error"] is not None:
+                coverage.append(100 * metrics["coverage"])
+                errors.append(100 * metrics["mean_mask_error"])
+        curve_axis.plot(coverage, errors, "o-", color="#286e9f", markersize=3, alpha=0.7,
+                        label="Appearance cutoff sweep")
+        upper = max(5, min(100, 5 * np.ceil(1.15 * max(frame_errors + errors, default=0) / 5)))
+        curve_axis.set(xlim=(0, 102), ylim=(0, upper * 1.02), xlabel="Image conditions shown (%)",
+                       ylabel="Mean shown-frame mask error (%)", title="Coverage and prediction error")
+        curve_axis.grid(alpha=0.2)
+        curve_axis.legend(fontsize=8)
+        positions = np.arange(3)
+        error_axis.bar(positions - 0.18, misses, width=0.36, color="#286e9f", label="Missed tool pixels")
+        error_axis.bar(positions + 0.18, false_pixels, width=0.36, color="#bc681d", label="False tool pixels")
+        upper = max(5, min(100, 5 * np.ceil(1.15 * max(
+            (value for value in misses + false_pixels if np.isfinite(value)), default=0) / 5)))
+        error_axis.set(xticks=positions, xticklabels=("Always", "Quality", "Quality +\nappearance"),
+                       ylim=(0, upper * 1.02), ylabel="Error within each pixel class (%)", title="Errors in shown predictions")
+        error_axis.grid(axis="y", alpha=0.2)
+        error_axis.legend(fontsize=8)
+        if not rows:
+            for axis in (curve_axis, error_axis):
+                axis.text(0.5, 0.5, "No captures in this subset", ha="center", va="center", transform=axis.transAxes)
+        self.reliability_dialog.show()
+        self.reliability_table.setFixedHeight(
+            self.reliability_table.horizontalHeader().height() + self.reliability_table.verticalHeader().length()
+            + 2 * self.reliability_table.frameWidth())
+        self.reliability_canvas.draw_idle()
+        self.reliability_dialog.raise_()
 
     def PlotCalibration(self):
         if self.perception_model is None or int(self.perception_model["version"]) != 3:
@@ -1036,6 +1215,25 @@ class SimulatorWindow(QMainWindow):
         self.calibration_dialog.raise_()
 
     def UpdatePerception(self, image=None, annotated=False, view_image=None, quality=None):
+        if self.reliability_future is not None and self.reliability_future.done():
+            try:
+                result = self.reliability_future.result()
+            except Exception as error:
+                self.reliability_status_label.setText(
+                    ("Evaluation cancelled." if self.perception_cancel.is_set() else f"Evaluation failed: {error}")
+                    + (" Previous results retained." if self.reliability_result is not None else ""))
+            else:
+                self.reliability_result = result
+                if self.reliability_dialog is not None:
+                    self.reliability_dialog.close()
+                self.reliability_results_button.setEnabled(True)
+                self.reliability_status_label.setText(
+                    f"Evaluated {result['groups']} snapshots across {len(result['cases'])} image conditions. View results to compare policies.")
+            self.reliability_future = None
+            self.reliability_button.setEnabled(self.perception_model is not None and int(self.perception_model["version"]) >= 2)
+            self.reliability_cancel_button.setEnabled(False)
+            self.perception_train_button.setEnabled(True)
+            self.perception_load_button.setEnabled(True)
         # polls CPU training separately from route planning and capture saving
         if self.perception_future is not None and self.perception_future.done():
             try:
@@ -1046,6 +1244,11 @@ class SimulatorWindow(QMainWindow):
                     + (" Previous model retained." if self.perception_model is not None else ""))
             else:
                 self.perception_model = model
+                self.reliability_result = None
+                self.reliability_results_button.setEnabled(False)
+                if self.reliability_dialog is not None:
+                    self.reliability_dialog.close()
+                self.reliability_status_label.setText("Model updated. Evaluate reliability using its capture folder.")
                 if self.calibration_dialog is not None:
                     self.calibration_dialog.close()
                 self.perception_status_label.setText("Trained experimental pixel baseline; saved instrument.npz in the capture folder.")
@@ -1055,6 +1258,7 @@ class SimulatorWindow(QMainWindow):
             self.perception_load_button.setEnabled(True)
             self.perception_cancel_button.setEnabled(False)
             self.calibration_button.setEnabled(self.perception_model is not None and int(self.perception_model["version"]) == 3)
+            self.reliability_button.setEnabled(self.perception_model is not None and int(self.perception_model["version"]) >= 2)
         if (self.perception_model is not None
                 and self.perception_report_json is not self.perception_model["report_json"]):
             report = json.loads(str(self.perception_model["report_json"].item()))
@@ -3511,7 +3715,12 @@ class SimulatorWindow(QMainWindow):
         if self.calibration_dialog is not None:
             self.calibration_dialog.close()
             self.calibration_canvas.close()
+        if self.reliability_dialog is not None:
+            self.reliability_dialog.close()
+            self.reliability_canvas.close()
         self.perception_cancel.set()
+        if self.reliability_future is not None:
+            self.reliability_future.cancel()
         if self.perception_future is not None:
             self.perception_future.cancel()
         if self.perception_executor is not None:
