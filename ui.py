@@ -102,10 +102,14 @@ class SimulatorWindow(QMainWindow):
         self.capture_effects = None
         self.sight_result = None
         self.perception_model = None
+        self.perception_report = None
+        self.perception_report_json = None
         self.perception_result = None
         self.perception_future = None
         self.perception_executor = None
         self.perception_cancel = Event()
+        self.calibration_dialog = None
+        self.calibration_canvas = None
         self.required_clearance = 2.0
         self.route_clearance = self.required_clearance
         self.execution_clearance = self.required_clearance
@@ -252,7 +256,9 @@ class SimulatorWindow(QMainWindow):
                                               keyboardTracking=False)
         self.motion_amplitude.setToolTip("Maximum world Y displacement from the resting position. Zero keeps anatomy still.")
         self.motion_frequency.setToolTip("Cycles per second: 0.2 Hz gives one cycle every 5 seconds.")
-        self.motion_group.setToolTip("Moves organ + target together along world Y. Changing settings restarts the selected scenario.")
+        self.motion_group.setToolTip(
+            "Moves organ + target together along world Y. Changing settings preserves tool and scope poses, "
+            "clears the old route and restarts tracking.")
         motion_settings.addRow("Amplitude", self.motion_amplitude)
         motion_settings.addRow("Frequency", self.motion_frequency)
         self.motion_label = QLabel(wordWrap=True)
@@ -497,13 +503,8 @@ class SimulatorWindow(QMainWindow):
         marker_note = QLabel("Raw: blue tool / pink target\n"
                              "Filtered: navy tool / purple target", wordWrap=True)
         sensor_layout.addWidget(marker_note)
-        sensor_baseline = QLabel("Constant-velocity filtering.\n"
-                                "Motion σa: tool 20 / target 1 mm/s².\n"
-                                "Errors use true positions for evaluation.\n"
-                                "Motion uses known configuration + obstacle geometry.\n"
-                                "The selected tracking source supplies target + guide/arrival feedback.",
-                                wordWrap=True)
-        estimate_layout.addWidget(sensor_baseline)
+        self.sensor_baseline = QLabel(wordWrap=True)
+        estimate_layout.addWidget(self.sensor_baseline)
         for setting in (self.tool_noise, self.target_noise, self.sensor_seed):
             setting.valueChanged.connect(self.reset_measurements)
 
@@ -631,11 +632,15 @@ class SimulatorWindow(QMainWindow):
         perception_layout.addWidget(QLabel(
             "Colour-based prototype; new lighting or haze can cause many false positives. "
             "Predictions are withheld outside the recorded appearance range or when quality is poor. "
-            "This is not calibrated confidence.", wordWrap=True))
+            "Reference matching does not establish prediction correctness.", wordWrap=True))
         self.perception_status_label = QLabel("No trained model loaded.", wordWrap=True)
         perception_layout.addWidget(self.perception_status_label)
         self.perception_prediction_label = QLabel("Prediction off", wordWrap=True)
         perception_layout.addWidget(self.perception_prediction_label)
+        self.calibration_button = QPushButton("View pixel probability calibration", enabled=False)
+        self.calibration_button.setToolTip("Compares pixel probabilities with labelled test images; this is not whole-view confidence.")
+        self.calibration_button.clicked.connect(self.PlotCalibration)
+        perception_layout.addWidget(self.calibration_button)
         self.perception_metrics_label = QLabel(wordWrap=True)
         perception_layout.addWidget(self.perception_metrics_label)
         self.perception_load_button = QPushButton("Load instrument model")
@@ -643,7 +648,8 @@ class SimulatorWindow(QMainWindow):
         perception_layout.addWidget(self.perception_load_button)
         self.perception_train_button = QPushButton("Train from capture folder")
         self.perception_train_button.setToolTip(
-            "Needs at least eight distinct camera/tool snapshots in the capture folder. Saves instrument.npz there.")
+            "Needs at least eight distinct camera/tool snapshots. Uses calibration/ captures when present, "
+            "otherwise reserves separate snapshots. Saves instrument.npz in the capture folder.")
         self.perception_train_button.clicked.connect(self.TrainPerception)
         perception_layout.addWidget(self.perception_train_button)
         self.perception_cancel_button = QPushButton("Cancel training", enabled=False)
@@ -776,7 +782,7 @@ class SimulatorWindow(QMainWindow):
         self.load_scenario(self.scenario_combo.currentIndex())
         self.scenario_combo.currentIndexChanged.connect(self.load_scenario)
         for setting in (self.motion_amplitude, self.motion_frequency):
-            setting.valueChanged.connect(lambda _: self.load_scenario(self.scenario_combo.currentIndex()))
+            setting.valueChanged.connect(lambda _: self.UpdateRespiratoryMotion(reset=True))
         self.navigation_mode_combo.currentIndexChanged.connect(self.stop_path)
         self.navigation_mode_combo.currentIndexChanged.connect(self.update_sensor_readouts)
         self.planning_mode_combo.currentIndexChanged.connect(self.stop_path)
@@ -850,7 +856,7 @@ class SimulatorWindow(QMainWindow):
                 annotations = any(actor is not None and actor.GetVisibility() for actor in (
                     self.label_actor, self.path_actor, self.tool_measurement_actor,
                     self.target_measurement_actor, self.tool_estimate_actor, self.target_estimate_actor))
-                overlay = self.UpdatePerception(image, annotated=annotations, view_image=view_image)
+                overlay = self.UpdatePerception(image, annotated=annotations, view_image=view_image, quality=result)
                 preview = QImage(overlay.data, overlay.shape[1], overlay.shape[0], overlay.strides[0],
                                  QImage.Format.Format_RGB888)
                 self.sight_preview.setPixmap(QPixmap.fromImage(preview).scaled(
@@ -900,6 +906,9 @@ class SimulatorWindow(QMainWindow):
     def TrainPerception(self):
         if self.perception_future is not None:
             return
+        if self.capture_future is not None:
+            self.perception_status_label.setText("Finish the camera capture before training.")
+            return
         if self.capture_folder is None:
             self.ChooseCaptureFolder()
         if self.capture_folder is None:
@@ -923,7 +932,11 @@ class SimulatorWindow(QMainWindow):
         if not path:
             return
         self.perception_model = None
+        self.perception_report = None
+        self.perception_report_json = None
         self.perception_metrics_label.clear()
+        if self.calibration_dialog is not None:
+            self.calibration_dialog.close()
         try:
             self.perception_model = LoadInstrument(path)
         except Exception as error:
@@ -931,9 +944,98 @@ class SimulatorWindow(QMainWindow):
         else:
             self.perception_status_label.setText(f"Loaded experimental pixel baseline: {Path(path).name}")
         self.perception_checkbox.setEnabled(self.perception_model is not None)
+        self.calibration_button.setEnabled(self.perception_model is not None and int(self.perception_model["version"]) == 3)
         self.UpdateSafeSight(reset=True)
 
-    def UpdatePerception(self, image=None, annotated=False, view_image=None):
+    def PlotCalibration(self):
+        if self.perception_model is None or int(self.perception_model["version"]) != 3:
+            return
+        report = (self.perception_report if self.perception_report_json is self.perception_model["report_json"]
+                  else json.loads(str(self.perception_model["report_json"].item())))
+        calibration = report["calibration"]
+        if self.calibration_dialog is None:
+            self.calibration_dialog = QDialog(self)
+            self.calibration_dialog.setWindowTitle("Pixel probability calibration")
+            self.calibration_dialog.resize(940, 760)
+            calibration_layout = QVBoxLayout(self.calibration_dialog)
+            self.calibration_heading = QLabel(wordWrap=True)
+            calibration_layout.addWidget(self.calibration_heading)
+            self.calibration_canvas = FigureCanvasQTAgg(Figure(facecolor="white", layout="constrained"))
+            calibration_layout.addWidget(self.calibration_canvas, 1)
+            self.calibration_table = QTableWidget(4, 7)
+            self.calibration_table.setHorizontalHeaderLabels(
+                ["Images", "Scores", "Brier ↓", "Log loss ↓", "ECE ↓", "Tool Brier ↓", "Other Brier ↓"])
+            for column, tooltip in enumerate((
+                    "Held-out image variant", "Original or calibrated probabilities",
+                    "Mean squared probability error across all pixels; lower is better.",
+                    "Penalises confident mistakes; lower is better.",
+                    "Weighted gap between predicted and observed tool fraction in ten bins; lower is better.",
+                    "Mean squared error on tool pixels only; prevents the background majority hiding misses.",
+                    "Mean squared error on all other pixels.")):
+                self.calibration_table.horizontalHeaderItem(column).setToolTip(tooltip)
+            self.calibration_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.calibration_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+            self.calibration_table.verticalHeader().setVisible(False)
+            calibration_layout.addWidget(self.calibration_table)
+            calibration_layout.addWidget(QLabel(
+                "All held-out test images are included, even when predictions are withheld. "
+                "Pixel counts are correlated within snapshots; these plots do not measure whole-view safety.", wordWrap=True))
+        self.calibration_heading.setText(
+            f"Fitted on {calibration['groups']} separate calibration snapshots; "
+            f"tested on {report['validation_groups']} other snapshots. "
+            "Curves compare predicted tool-pixel probability with the observed tool-pixel fraction.")
+        self.calibration_canvas.figure.clear()
+        axes = self.calibration_canvas.figure.subplots(2, 2)
+        row = 0
+        for column, variant in enumerate(("clean", "degraded")):
+            curve_axis, count_axis = axes[:, column]
+            curve_axis.plot([0, 1], [0, 1], color="#9babb7", linestyle="--", linewidth=1)
+            for index, (key, label, colour) in enumerate((
+                    ("raw", "Original", "#286e9f"), ("calibrated", "Calibrated", "#bc681d"))):
+                metrics = calibration[variant][key]
+                if metrics is None:
+                    for table_column, value in enumerate([variant.capitalize(), label] + ["—"] * 5):
+                        self.calibration_table.setItem(row, table_column, QTableWidgetItem(value))
+                    row += 1
+                    continue
+                mean_probability = np.array([np.nan if value is None else value
+                                             for value in metrics["bin_mean_probability"]])
+                observed = np.array([np.nan if value is None else value
+                                     for value in metrics["bin_positive_fraction"]])
+                curve_axis.plot(mean_probability, observed, "o-", color=colour, label=label, markersize=4)
+                edges = np.asarray(metrics["bin_edges"])
+                centres = (edges[:-1] + edges[1:]) / 2
+                width = (edges[1] - edges[0]) * 0.35
+                positions = centres + (index - 0.5) * width
+                count_axis.bar(positions, metrics["bin_counts"], width=width, color=colour, alpha=0.65, label=label)
+                count_axis.scatter(positions, metrics["bin_positive_counts"], color=colour, marker="_", s=75)
+                values = [variant.capitalize(), label] + [
+                    "—" if metrics[name] is None else f"{metrics[name]:.5g}"
+                    for name in ("brier", "nll", "ece", "positive_brier", "negative_brier")]
+                for table_column, value in enumerate(values):
+                    self.calibration_table.setItem(row, table_column, QTableWidgetItem(value))
+                row += 1
+            curve_axis.set(title=variant.capitalize() + " test images", xlim=(0, 1), ylim=(0, 1),
+                           xlabel="Predicted P(tool pixel)", ylabel="Observed tool fraction")
+            if calibration[variant]["raw"] is None:
+                for axis in (curve_axis, count_axis):
+                    axis.text(0.5, 0.5, f"No held-out {variant} captures", ha="center", va="center",
+                              transform=axis.transAxes)
+            else:
+                curve_axis.legend(fontsize=8)
+            curve_axis.grid(alpha=0.2)
+            count_axis.set(xlim=(0, 1), xlabel="Probability bin", ylabel="Pixel count",
+                           title="Bars: all pixels · ticks: tool pixels")
+            count_axis.set_yscale("symlog", linthresh=1)
+            count_axis.grid(axis="y", alpha=0.2)
+        self.calibration_dialog.show()
+        self.calibration_table.setFixedHeight(
+            self.calibration_table.horizontalHeader().height()
+            + self.calibration_table.verticalHeader().length() + 2 * self.calibration_table.frameWidth())
+        self.calibration_canvas.draw_idle()
+        self.calibration_dialog.raise_()
+
+    def UpdatePerception(self, image=None, annotated=False, view_image=None, quality=None):
         # polls CPU training separately from route planning and capture saving
         if self.perception_future is not None and self.perception_future.done():
             try:
@@ -944,13 +1046,17 @@ class SimulatorWindow(QMainWindow):
                     + (" Previous model retained." if self.perception_model is not None else ""))
             else:
                 self.perception_model = model
+                if self.calibration_dialog is not None:
+                    self.calibration_dialog.close()
                 self.perception_status_label.setText("Trained experimental pixel baseline; saved instrument.npz in the capture folder.")
                 self.perception_checkbox.setEnabled(True)
             self.perception_future = None
             self.perception_train_button.setEnabled(True)
             self.perception_load_button.setEnabled(True)
             self.perception_cancel_button.setEnabled(False)
-        if self.perception_model is not None:
+            self.calibration_button.setEnabled(self.perception_model is not None and int(self.perception_model["version"]) == 3)
+        if (self.perception_model is not None
+                and self.perception_report_json is not self.perception_model["report_json"]):
             report = json.loads(str(self.perception_model["report_json"].item()))
             lines = [f"Held-out simulator snapshots: {report['validation_groups']}"]
             for variant in ("clean", "degraded"):
@@ -962,7 +1068,7 @@ class SimulatorWindow(QMainWindow):
             negative_rate = report.get("negative_false_positive_fraction")
             if negative_rate is not None:
                 lines.append(f"False positive pixels without a tool: {negative_rate:.2%}")
-            support = report.get("support") if int(self.perception_model["version"]) == 2 else None
+            support = report.get("support") if int(self.perception_model["version"]) >= 2 else None
             if support is not None:
                 for variant in ("clean", "degraded"):
                     result = support[variant]
@@ -970,6 +1076,8 @@ class SimulatorWindow(QMainWindow):
                     lines.append(f"{variant.capitalize()} shown: {result['accepted']}/{result['frames']} · "
                                  f"shown-only IoU {accepted_iou}")
             self.perception_metrics_label.setText("\n".join(lines))
+            self.perception_report = report
+            self.perception_report_json = self.perception_model["report_json"]
         self.perception_result = None
         if not self.perception_checkbox.isChecked():
             self.perception_prediction_label.setText("Prediction off")
@@ -981,7 +1089,8 @@ class SimulatorWindow(QMainWindow):
             try:
                 height, width = image.shape[:2]
                 # checks full RGB before the preview crop, matching the recorded reference
-                gate = AssessPrediction(image if view_image is None else view_image, self.perception_model)
+                gate = AssessPrediction(image if view_image is None else view_image, self.perception_model,
+                                        quality=quality)
                 reasons = (*gate["reasons"], *(("annotations",) if annotated else ()))
                 messages = {"dark": "dark image", "bright": "washed-out image", "low_detail": "low image detail",
                             "appearance_shift": "appearance differs from training examples",
@@ -1033,6 +1142,8 @@ class SimulatorWindow(QMainWindow):
             return
         try:
             if self.capture_future is None:
+                # aligns the visual meshes with the target before freezing their shared snapshot
+                self.UpdateRespiratoryMotion()
                 # freezes image effects alongside the physical scene snapshot
                 self.capture_effects = ({"blur": self.sight_blur.value() / 100,
                                          "exposure": self.sight_exposure.value(),
@@ -1259,7 +1370,7 @@ class SimulatorWindow(QMainWindow):
         self.margin_mesh.points = self.vessel_axis + (
             self.structure_radius + self.required_clearance) * self.vessel_radial
         self.margin_actor = self.viewport.add_mesh(
-            self.margin_mesh, color="#ce7a7e", opacity=0.045, lighting=False)
+            self.margin_mesh, color="#ce7a7e", opacity=0.045, lighting=False, render=False)
         # samples the original segments without rounding their centreline away from the collision model
         lengths = np.linalg.norm(np.diff(self.structure_points, axis=0), axis=1)
         distances = np.r_[0.0, np.cumsum(lengths)]
@@ -1303,7 +1414,7 @@ class SimulatorWindow(QMainWindow):
         vessel.point_data["colour"] = np.rint(colour).astype(np.uint8)
         self.vessel_actor = self.viewport.add_mesh(
             vessel, scalars="colour", rgb=True, show_scalar_bar=False,
-            smooth_shading=True, ambient=0.18, pbr=True, metallic=0.0, roughness=0.58)
+            smooth_shading=True, ambient=0.18, pbr=True, metallic=0.0, roughness=0.58, render=False)
         blend = np.sin(np.pi * samples / distances[-1]) ** 2
         angles = np.linspace(0, 2 * np.pi, 48, endpoint=False)
         fold_radius = self.structure_radius + self.required_clearance - 0.3
@@ -1447,7 +1558,7 @@ class SimulatorWindow(QMainWindow):
             for axis in range(3)])).astype(np.uint8)
         self.section_actor = self.viewport.add_mesh(
             section, scalars="colour", rgb=True, show_scalar_bar=False,
-            smooth_shading=True, pbr=True, roughness=0.65)
+            smooth_shading=True, pbr=True, roughness=0.65, render=False)
         self.section_actor.user_matrix = self.scene_matrix
         attachments = []
         # anchors the vessel bed to its nearest host instead of stretching a ribbon across the cavity
@@ -1588,19 +1699,19 @@ class SimulatorWindow(QMainWindow):
         (self.organ_actor, self.posterior_actor, self.tissue_actor, self.cavity_actor, self.body_actor,
          self.stomach_actor, self.duodenum_actor, self.bowel_actor, self.peritoneum_actor) = [
             self.viewport.add_mesh(mesh, scalars="colour", rgb=True, show_scalar_bar=False,
-                                   smooth_shading=True, pbr=True, metallic=0.0, roughness=0.4)
+                                   smooth_shading=True, pbr=True, metallic=0.0, roughness=0.4, render=False)
             for mesh in (organ, posterior, tissue, cavity, body, stomach, duodenum, bowel, peritoneum)]
         self.duct_actor = self.viewport.add_mesh(
-            duct, color="#b6b28b", smooth_shading=True, pbr=True, roughness=0.46)
+            duct, color="#b6b28b", smooth_shading=True, pbr=True, roughness=0.46, render=False)
         self.vascular_actor = self.viewport.add_mesh(
             vascular, scalars="colour", rgb=True, show_scalar_bar=False,
-            smooth_shading=True, pbr=True, metallic=0.0, roughness=0.43)
+            smooth_shading=True, pbr=True, metallic=0.0, roughness=0.43, render=False)
         diaphragm = self.anatomy_meshes["diaphragm"].copy()
         diaphragm.points = diaphragm.points @ anatomy_rotation.T + self.rest_target
         self.diaphragm_actor = self.viewport.add_mesh(
-            diaphragm, color="#f4bfc0", smooth_shading=True, pbr=True, roughness=0.55)
+            diaphragm, color="#f4bfc0", smooth_shading=True, pbr=True, roughness=0.55, render=False)
         self.wall_actor = self.viewport.add_mesh(
-            wall, scalars="colour", rgb=True, show_scalar_bar=False, pbr=True, roughness=0.65)
+            wall, scalars="colour", rgb=True, show_scalar_bar=False, pbr=True, roughness=0.65, render=False)
         # builds a hollow housing that pivots around the fixed entry point
         port = CreateRevolvedMesh([(-18, 5.8), (-17.5, 7), (-14, 7), (-13, 5.2),
                                    (-11.5, 3.4), (-4, 3.4), (-3.5, 3.1),
@@ -1611,7 +1722,7 @@ class SimulatorWindow(QMainWindow):
         port.cell_data["colour"][port.cell_centers().points[:, 0] > 0] = [167, 180, 189]
         self.port_actor = self.viewport.add_mesh(
             port, scalars="colour", rgb=True, show_scalar_bar=False, smooth_shading=True,
-            ambient=0.2, specular=0.3, specular_power=25)
+            ambient=0.2, specular=0.3, specular_power=25, render=False)
 
         # separates the anchored housing from sliding laparoscope
         rear = self.scope_length - self.scope_depth
@@ -1652,7 +1763,7 @@ class SimulatorWindow(QMainWindow):
         scope_port.cell_data["colour"][scope_port.cell_centers().points[:, 0] > 0] = [167, 180, 189]
         self.scope_port_actor = self.viewport.add_mesh(
             scope_port, scalars="colour", rgb=True, show_scalar_bar=False, smooth_shading=True,
-            ambient=0.2, specular=0.45, specular_power=35)
+            ambient=0.2, specular=0.45, specular_power=35, render=False)
         self.scope_port_actor.user_matrix = self.scene_matrix @ self.scope_matrix
         scope_parts = []
         for mesh, colour in ((shaft, [176, 188, 197]), (head, [35, 43, 50]),
@@ -1683,7 +1794,7 @@ class SimulatorWindow(QMainWindow):
         scope.points -= [self.scope_depth, 0.0, 0.0]
         self.scope_actor = self.viewport.add_mesh(
             scope, scalars="colour", rgb=True, show_scalar_bar=False, smooth_shading=True,
-            ambient=0.2, specular=0.45, specular_power=35)
+            ambient=0.2, specular=0.45, specular_power=35, render=False)
         matrix = self.scope_matrix.copy()
         matrix[:3, 3] += self.scope_depth * self.scope_direction
         self.scope_actor.user_matrix = self.scene_matrix @ matrix
@@ -1692,11 +1803,11 @@ class SimulatorWindow(QMainWindow):
         self.shaft_actor = self.viewport.add_mesh(
             pv.Cylinder(center=(0.5, 0, 0), direction=(1, 0, 0),
                         radius=self.tool_radius, height=1, resolution=64),
-            color="#2c343b", smooth_shading=True, ambient=0.22, specular=0.65, specular_power=65)
+            color="#2c343b", smooth_shading=True, ambient=0.22, specular=0.65, specular_power=65, render=False)
         self.external_shaft_actor = self.viewport.add_mesh(
             pv.Cylinder(center=(-0.5, 0, 0), direction=(1, 0, 0),
                         radius=self.tool_radius, height=1, resolution=64),
-            color="#2c343b", smooth_shading=True, ambient=0.22, specular=0.65, specular_power=65)
+            color="#2c343b", smooth_shading=True, ambient=0.22, specular=0.65, specular_power=65, render=False)
         grip = CreateRevolvedMesh([(-9.5, 1.5), (-9, 2.7), (-7.5, 3.6),
                                    (-3.5, 3.6), (-2, 2.7), (-1.5, 1.5)])
         grip.points[:, 1:] *= [0.65, 0.85]
@@ -1729,7 +1840,7 @@ class SimulatorWindow(QMainWindow):
         self.handle_actor = self.viewport.add_mesh(
             handle_parts[0].merge(handle_parts[1:], merge_points=False),
             scalars="colour", rgb=True, show_scalar_bar=False, smooth_shading=True,
-            ambient=0.25, specular=0.2, specular_power=25)
+            ambient=0.25, specular=0.2, specular_power=25, render=False)
         knob = CreateRevolvedMesh([(-4, 2.5), (-3.8, 3.4), (-3.5, 3.8),
                                    (-0.6, 3.8), (-0.3, 3.3), (0, 2.7)], resolution=96)
         angles = np.arctan2(knob.points[:, 2], knob.points[:, 1])
@@ -1744,7 +1855,7 @@ class SimulatorWindow(QMainWindow):
         collar.cell_data["colour"][collar.cell_centers().points[:, 0] < -4] = [135, 144, 153]
         self.collar_actor = self.viewport.add_mesh(
             collar, scalars="colour", rgb=True, show_scalar_bar=False, smooth_shading=True,
-            ambient=0.25, specular=0.35, specular_power=30)
+            ambient=0.25, specular=0.35, specular_power=30, render=False)
         # keeps closed jaws inside the existing shaft clearance envelope
         sleeve = CreateRevolvedMesh([(-self.tip_length, self.tool_radius),
                                       (-14.8, self.tool_radius), (-14.6, 1.38),
@@ -1801,7 +1912,7 @@ class SimulatorWindow(QMainWindow):
             part.point_data["Normals"] = part.point_normals.copy()
         self.tip_actor = self.viewport.add_mesh(
             jaw_parts[0].merge(jaw_parts[1:], merge_points=False), scalars="colour", rgb=True, show_scalar_bar=False,
-            smooth_shading=True, ambient=0.18, specular=0.7, specular_power=65)
+            smooth_shading=True, ambient=0.18, specular=0.7, specular_power=65, render=False)
 
         # maps material detail in local millimetres so breathing + view changes cannot slide it
         for actor, material, scale, roughness, grain, coat in (
@@ -1819,6 +1930,8 @@ class SimulatorWindow(QMainWindow):
                 (self.cavity_actor, "tissue", 75.0, 0.5, 0.12, 0.14),
                 (self.wall_actor, "skin", 60.0, 0.68, 0.22, 0.0),
                 (self.body_actor, "skin", 60.0, 0.68, 0.22, 0.0)):
+            # resolves colour selection without rendering each incomplete actor
+            actor.mapper.GetInputAlgorithm().Update()
             mesh = actor.mapper.dataset.triangulate()
             coordinates = mesh.points[:, 1:].copy()
             if actor is self.vessel_actor:
@@ -1868,12 +1981,26 @@ class SimulatorWindow(QMainWindow):
             actor.prop.SetCoatRoughness(0.24 if actor in (self.organ_actor, self.posterior_actor) else 0.3)
         self.rest_tissue_points = self.tissue_actor.mapper.dataset.points.copy()
         self.rest_tissue_tangents = self.tissue_actor.mapper.dataset.point_data["Tangents"].copy()
+        # caches fixed topology so only stretching attachments need new shading
+        tissue = self.tissue_actor.mapper.dataset
+        triangles = tissue.faces.reshape(-1, 4)[:, 1:]
+        self.tissue_triangles = triangles.copy()
+        self.tissue_deforming_cells = np.flatnonzero(np.ptp(tissue["breathing"][triangles], axis=1) != 0)
+        self.tissue_deforming_points = np.unique(triangles[self.tissue_deforming_cells])
+        point_index = np.full(tissue.n_points, -1, dtype=int)
+        point_index[self.tissue_deforming_points] = np.arange(len(self.tissue_deforming_points))
+        self.tissue_normal_cells = np.flatnonzero(np.any(point_index[triangles] >= 0, axis=1))
+        point_index = point_index[triangles[self.tissue_normal_cells]].ravel()
+        self.tissue_normal_mask = point_index >= 0
+        self.tissue_normal_points = point_index[self.tissue_normal_mask]
+        self.motion_visual_offset = np.zeros(3)
         # derives the external inspection window from the same fully textured enclosure
         sections = []
         for actor in (self.body_actor, self.cavity_actor, self.wall_actor):
             mesh = actor.mapper.dataset.clip_scalar(scalars="section", value=0.0, invert=False)
             section_actor = self.viewport.add_mesh(
-                mesh, scalars="colour", rgb=True, show_scalar_bar=False, smooth_shading=True)
+                mesh, scalars="colour", rgb=True, show_scalar_bar=False, smooth_shading=True, render=False)
+            section_actor.mapper.GetInputAlgorithm().Update()
             for setting in ("Interpolation", "Metallic", "Roughness", "CoatStrength",
                             "CoatRoughness", "CoatIOR", "NormalScale"):
                 getattr(section_actor.prop, f"Set{setting}")(getattr(actor.prop, f"Get{setting}")())
@@ -1902,7 +2029,7 @@ class SimulatorWindow(QMainWindow):
         (self.tool_measurement_actor, self.target_measurement_actor,
          self.tool_estimate_actor, self.target_estimate_actor) = [
             self.viewport.add_mesh(marker, color=color, line_width=width,
-                                   render_lines_as_tubes=True, lighting=False)
+                                   render_lines_as_tubes=True, lighting=False, render=False)
             for color, width in [("#287dc0", 2), ("#b050a2", 2), ("#12536e", 3), ("#723d76", 3)]]
         for actor in (self.tool_measurement_actor, self.target_measurement_actor):
             actor.SetVisibility(self.measurements_checkbox.isChecked())
@@ -1927,21 +2054,34 @@ class SimulatorWindow(QMainWindow):
         self.label_actor = self.viewport.add_point_labels(
             self.label_points, "labels",
             font_size=12, text_color="#25384b", point_size=0, shape_opacity=0.0,
-            always_visible=True, show_points=False)
+            always_visible=True, show_points=False, render=False)
         self.label_actor.SetVisibility(self.labels_checkbox.isChecked())
+        for actor in self.viewport.renderer.actors.values():
+            if isinstance(actor, pv.Actor):
+                actor.mapper.GetInputAlgorithm().Update()
         self.viewport.add_axes(color="#62788c")
 
-    def UpdateRespiratoryMotion(self, now=None):
+    def UpdateRespiratoryMotion(self, now=None, *, visual=True, reset=False):
         now = perf_counter() if now is None else now
+        if reset:
+            self.stop_path()
+            self.pressed_keys.clear()
+            self.camera_mouse_position = None
+            self.camera_command = self.camera_configuration.copy()
+            self.motion_started_time = now
+            self.UpdateRespiratoryMotion(now)
+            self.reset_measurements()
+            self.message_label.setText("Breathing settings updated. Tool and scope poses retained; tracking restarted.")
+            return
         if self.motion_started_time is None:
             self.motion_started_time = now
         self.motion_displacement, self.motion_velocity = GetRespiratoryMotion(
             self.motion_amplitude.value(), self.motion_frequency.value(), now - self.motion_started_time)
         offset = np.array([0.0, 0.0, self.motion_displacement])
-        target = self.rest_target + offset
-        if np.array_equal(target, self.target):
+        self.target = self.rest_target + offset
+        if not visual or np.array_equal(offset, self.motion_visual_offset):
             return
-        self.target = target
+        self.motion_visual_offset = offset.copy()
         # translates persistent meshes and labels without changing camera framing
         for actor in (self.organ_actor, self.posterior_actor, self.duct_actor, self.vascular_actor, self.diaphragm_actor,
                       self.stomach_actor, self.duodenum_actor, self.bowel_actor, self.peritoneum_actor):
@@ -1949,20 +2089,27 @@ class SimulatorWindow(QMainWindow):
         # keeps the vessel edge anchored while its tissue attachments follow the liver
         tissue = self.tissue_actor.mapper.dataset
         tissue.points = self.rest_tissue_points + tissue["breathing"][:, None] * offset
-        for attributes in (tissue.point_data, tissue.cell_data):
-            if "Normals" in attributes:
-                del attributes["Normals"]
-        tissue.compute_normals(consistent_normals=True, split_vertices=False, inplace=True)
-        tangents = self.rest_tissue_tangents.copy()
-        tangents -= tissue.point_normals * np.sum(tangents * tissue.point_normals, axis=1)[:, None]
-        invalid = np.linalg.norm(tangents, axis=1) < 1e-6
-        fallback = np.cross(tissue.point_normals[invalid], [1.0, 0.0, 0.0])
-        parallel = np.linalg.norm(fallback, axis=1) < 1e-6
-        fallback[parallel] = np.cross(tissue.point_normals[invalid][parallel], [0.0, 1.0, 0.0])
-        tangents[invalid] = fallback
-        tissue.point_data["Tangents"] = tangents / np.linalg.norm(tangents, axis=1)[:, None]
-        # refreshes the rendered colour pipeline after replacing normal + tangent arrays
-        self.tissue_actor.mapper.GetInputAlgorithm().Update()
+        if len(self.tissue_deforming_cells):
+            points = tissue.points[self.tissue_triangles[self.tissue_deforming_cells]]
+            normals = np.cross(points[:, 1] - points[:, 0], points[:, 2] - points[:, 0])
+            length = np.linalg.norm(normals, axis=1)
+            normals /= np.maximum(length, np.finfo(float).tiny)[:, None]
+            tissue.cell_data["Normals"][self.tissue_deforming_cells] = normals
+            # averages incident unit face normals in the same cell order as VTK
+            normals = np.zeros((len(self.tissue_deforming_points), 3), dtype=np.float32)
+            neighbours = np.repeat(tissue.cell_normals[self.tissue_normal_cells], 3, axis=0)
+            np.add.at(normals, self.tissue_normal_points, neighbours[self.tissue_normal_mask])
+            normals /= np.maximum(np.linalg.norm(normals, axis=1), np.finfo(np.float32).tiny)[:, None]
+            tissue.point_data["Normals"][self.tissue_deforming_points] = normals
+            tangents = self.rest_tissue_tangents[self.tissue_deforming_points].copy()
+            tangents -= normals * np.sum(tangents * normals, axis=1)[:, None]
+            invalid = np.linalg.norm(tangents, axis=1) < 1e-6
+            fallback = np.cross(normals[invalid], [1.0, 0.0, 0.0])
+            parallel = np.linalg.norm(fallback, axis=1) < 1e-6
+            fallback[parallel] = np.cross(normals[invalid][parallel], [0.0, 1.0, 0.0])
+            tangents[invalid] = fallback
+            tissue.point_data["Tangents"][self.tissue_deforming_points] = (
+                tangents / np.linalg.norm(tangents, axis=1)[:, None])
         self.label_points.points[1] = self.scene_rotation @ self.target
         self.label_points.points[3] = self.scene_rotation @ (
             self.organ_label_point + offset)
@@ -2204,7 +2351,10 @@ class SimulatorWindow(QMainWindow):
         completed = sum(len(comparison["trials"]) for comparison in comparisons)
         total = 3 * len(result["seeds"]) * (len(result["levels"]) if study else 1)
         state = "Stopped" if result["cancelled"] else "Completed"
-        self.comparison_status_label.setText(f"{state} · {completed} / {total} trials.")
+        reused = sum(trial.get("reused", False) for comparison in comparisons for trial in comparison["trials"])
+        self.comparison_status_label.setText(
+            f"{state} · {completed} / {total} trials."
+            + (f" {reused} control results reused." if reused else ""))
         if not completed:
             return
         self.comparison_level.blockSignals(True)
@@ -2275,7 +2425,9 @@ class SimulatorWindow(QMainWindow):
             f"World bias XYZ (mm): tool {world_offsets['tool_bias']} / target {world_offsets['target_bias']}\n"
             f"World drift XYZ (mm/s): tool {world_offsets['tool_drift']} / target {world_offsets['target_drift']}\n"
             f"Breathing: {settings['motion_amplitude']:g} mm / {settings['motion_frequency']:g} Hz · "
-            f"Proximity weight {settings['proximity_weight']:g} · {uncertainty_label}")
+            f"Proximity weight {settings['proximity_weight']:g} · {uncertainty_label}"
+            + ("\nControl results and their original planning times are reused."
+               if any(trial.get("reused", False) for trial in result["trials"]) else ""))
         metrics = self.comparison_metrics
         labels = ["Completed trials", "True arrivals", "False arrivals", "Outcomes"]
         self.comparison_table.setRowCount(len(labels) + len(metrics))
@@ -2639,6 +2791,12 @@ class SimulatorWindow(QMainWindow):
         # allows the constant-velocity model to follow peak breathing acceleration
         self.target_acceleration = max(1.0, self.motion_amplitude.value()
                                       * (2 * np.pi * self.motion_frequency.value()) ** 2)
+        self.sensor_baseline.setText(
+            "Constant-velocity filtering.\n"
+            f"Motion σa: tool 20 / target {self.target_acceleration:.2f} mm/s².\n"
+            "Errors use true positions for evaluation.\n"
+            "Motion uses known configuration + obstacle geometry.\n"
+            "The selected tracking source supplies target + guide/arrival feedback.")
         self.tool_measurement = None
         self.target_measurement = None
         self.tool_estimate = None
@@ -2666,7 +2824,7 @@ class SimulatorWindow(QMainWindow):
     def update_measurements(self):
         route_active = self.route_feedback_active
         sample_time = perf_counter()
-        self.UpdateRespiratoryMotion(sample_time)
+        self.UpdateRespiratoryMotion(sample_time, visual=False)
         self.sampled_target = self.target.copy()
         self.sampled_motion = (self.motion_displacement, self.motion_velocity)
         if self.last_measurement_time is not None and sample_time - self.last_measurement_time > self.tracking_timeout:
@@ -3350,6 +3508,9 @@ class SimulatorWindow(QMainWindow):
         self.readout_timer.stop()
         self.capture_timer.stop()
         self.sight_timer.stop()
+        if self.calibration_dialog is not None:
+            self.calibration_dialog.close()
+            self.calibration_canvas.close()
         self.perception_cancel.set()
         if self.perception_future is not None:
             self.perception_future.cancel()

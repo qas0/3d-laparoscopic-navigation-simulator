@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 import numpy as np
 
 from astar import find_path, get_uncertainty_margin
@@ -369,7 +371,7 @@ def RunTrial(scenario="Direct insertion", mode="conventional", seed=0, *,
 
 
 def CompareMethods(scenario="Direct insertion", seeds=range(10), *,
-                   cancel_event=None, progress=None, **settings):
+                   cancel_event=None, progress=None, _controls=None, **settings):
     seeds = list(seeds)
     if (not seeds or any(isinstance(seed, (bool, np.bool_))
                          or not isinstance(seed, (int, np.integer)) or seed < 0 for seed in seeds)):
@@ -385,11 +387,24 @@ def CompareMethods(scenario="Direct insertion", seeds=range(10), *,
         for seed in seeds:
             if cancelled:
                 break
-            trial = RunTrial(scenario, mode, seed, cancel_event=cancel_event, **settings)
+            # reuses fixed controls only within one uncertainty-factor study
+            reusable = _controls is not None and mode != "uncert_aware"
+            if reusable and cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                break
+            if reusable and (mode, seed) in _controls:
+                trial = deepcopy(_controls[mode, seed])
+                trial["settings"]["uncertainty_scale"] = float(settings["uncertainty_scale"])
+                # retains the measured planning time rather than claiming a fresh measurement
+                trial["reused"] = True
+            else:
+                trial = RunTrial(scenario, mode, seed, cancel_event=cancel_event, **settings)
             resolved_settings = trial["settings"]
             if trial["status"] == "cancelled":
                 cancelled = True
                 break
+            if reusable and (mode, seed) not in _controls:
+                _controls[mode, seed] = deepcopy(trial)
             runs.append(trial)
             trials.append(trial)
             if progress is not None:
@@ -460,6 +475,7 @@ def RunSensitivityStudy(scenario="Direct insertion", levels=None, seeds=range(10
     comparisons = []
     completed, total = 0, 3 * len(seeds) * len(levels)
     cancelled = False
+    controls = {} if parameter == "uncertainty_scale" else None
     for level in levels:
         level_settings = dict(settings)
         level_settings[parameter] = bool(level) if parameter == "reject_outliers" else level
@@ -470,6 +486,7 @@ def RunSensitivityStudy(scenario="Direct insertion", levels=None, seeds=range(10
 
         comparison = CompareMethods(scenario, seeds, cancel_event=cancel_event,
                                     progress=ReportProgress if progress is not None else None,
+                                    _controls=controls,
                                     **level_settings)
         if comparison["trials"]:
             comparisons.append(comparison)

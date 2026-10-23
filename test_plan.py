@@ -1,5 +1,6 @@
 import unittest
 from threading import Event
+from unittest.mock import patch
 
 import numpy as np
 
@@ -421,6 +422,58 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(result["cost"], 0.0)
         self.assertEqual(result["length"], 0.0)
         self.assertEqual(result["clearance_penalty"], 0.0)
+
+    def test_OversizedOrOverflowingGridsStopBeforeAxisAllocation(self):
+        for step in ([np.deg2rad(0.5), np.deg2rad(0.5), 0.5],
+                     [1e-100, 0.1, 5.0], [0.1, 0.1, np.nextafter(0.0, 1.0)]):
+            with self.subTest(step=step), patch("astar.np.arange") as allocate:
+                result = find_path(start=[0, 0, 35], grid_step=step, **self.settings)
+            allocate.assert_not_called()
+            self.assertEqual(result["status"], "budget_exceeded")
+            self.assertEqual(result["expanded"], 0)
+            self.assertIsNone(result["path"])
+
+    def test_AnExpiredDeadlineStopsBeforeAxisAllocation(self):
+        with patch("astar.perf_counter", side_effect=[0.0, 6.0, 6.0]), patch(
+                "astar.np.arange") as allocate:
+            result = find_path(start=[0, 0, 35], **self.settings)
+        allocate.assert_not_called()
+        self.assertEqual(result["status"], "budget_exceeded")
+        self.assertEqual(result["expanded"], 0)
+
+    def test_CancellationDuringGeometryChecksStopsBeforeAxisAllocation(self):
+        cancelled = Event()
+
+        def CancelGeometry(*args, **settings):
+            cancelled.set()
+            return shaft_clearance(*args, **settings)
+
+        with patch("astar.shaft_clearance", side_effect=CancelGeometry), patch(
+                "astar.np.arange") as allocate:
+            result = find_path(start=[0, 0, 35], cancel_event=cancelled, **self.settings)
+        allocate.assert_not_called()
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(result["expanded"], 0)
+
+    def test_CancellationAfterTheAxesStopsBeforeFullGridAllocation(self):
+        cancelled = Event()
+        original = np.arange
+        allocations = 0
+
+        def AllocateAxis(*args, **settings):
+            nonlocal allocations
+            result = original(*args, **settings)
+            allocations += 1
+            if allocations == 3:
+                cancelled.set()
+            return result
+
+        with patch("astar.np.arange", side_effect=AllocateAxis), patch(
+                "astar.np.meshgrid") as allocate:
+            result = find_path(start=[0, 0, 35], cancel_event=cancelled, **self.settings)
+        allocate.assert_not_called()
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(allocations, 3)
 
 
 if __name__ == "__main__":

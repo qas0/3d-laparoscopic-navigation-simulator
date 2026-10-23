@@ -7,6 +7,7 @@ from zipfile import BadZipFile
 import numpy as np
 from PIL import Image
 
+from calibration import CalibrationMetrics, FitCalibration
 from safesight import AssessView
 
 
@@ -16,14 +17,26 @@ _FEATURE_NAMES = np.array([
 _MODEL_KEYS = {"version", "feature_names", "weights", "mean", "scale", "threshold",
                "train_groups", "validation_groups", "report_json"}
 _APPEARANCE_KEYS = {"appearance_references", "appearance_groups", "appearance_limit"}
+_CALIBRATION_KEYS = {"calibration_temperature", "calibration_bias", "calibration_groups"}
+_CALIBRATION_METRIC_KEYS = {
+    "pixels", "positives", "weight", "positive_weight", "prevalence", "brier", "nll", "ece",
+    "positive_brier", "negative_brier", "positive_nll", "negative_nll", "bins", "bin_edges",
+    "bin_counts", "bin_positive_counts", "bin_mean_probability", "bin_positive_fraction"}
 
 
-def ImageFeatures(image):
+def ImageFeatures(image, positions=None):
     if (not isinstance(image, np.ndarray) or image.dtype != np.uint8
             or image.ndim != 3 or image.shape[2] != 3
             or min(image.shape[:2]) < 16):
         raise ValueError("Invalid RGB image.")
-    pixels = image.reshape(-1, 3).astype(np.float32) / 255
+    pixels = image.reshape(-1, 3)
+    if positions is not None:
+        positions = np.asarray(positions)
+        if (positions.ndim != 1 or positions.dtype.kind not in "iu"
+                or np.any(positions < 0) or np.any(positions >= len(pixels))):
+            raise ValueError("Invalid pixel positions.")
+        pixels = pixels[positions]
+    pixels = pixels.astype(np.float32) / 255
     fractions = pixels / np.maximum(pixels.sum(axis=1, keepdims=True), 1e-6)
     products = pixels[:, [0, 0, 1]] * pixels[:, [1, 2, 2]]
     return np.concatenate((pixels, fractions, pixels * pixels, products), axis=1)
@@ -74,19 +87,39 @@ def FitAppearance(images, groups):
             "appearance_limit": np.array(limit)}
 
 
-def AssessPrediction(image, model):
+def AssessPrediction(image, model, quality=None):
     appearance = AppearanceFeatures(image)
     height, width = image.shape[:2]
     # keeps tiny inputs large enough for the quality check
     vertical = min(height // 10, (height - 16) // 2)
     horizontal = min(width // 10, (width - 16) // 2)
-    quality = AssessView(image[vertical:height - vertical, horizontal:width - horizontal])
+    if quality is None:
+        quality = AssessView(image[vertical:height - vertical, horizontal:width - horizontal])
+    else:
+        keys = {"status", "issues", "mean_luminance", "dark_fraction", "bright_fraction", "detail"}
+        if (not isinstance(quality, dict) or set(quality) != keys
+                or any(isinstance(quality[key], (bool, np.bool_))
+                       or not isinstance(quality[key], (int, float, np.integer, np.floating))
+                       or not np.isfinite(quality[key]) or not 0 <= quality[key] <= upper
+                       for key, upper in (("mean_luminance", 1), ("dark_fraction", 1),
+                                          ("bright_fraction", 1), ("detail", 4)))):
+            raise ValueError("Invalid view assessment.")
+        expected = []
+        if quality["mean_luminance"] < 0.15 or quality["dark_fraction"] > 0.60:
+            expected.append("dark")
+        if quality["mean_luminance"] > 0.85 or quality["bright_fraction"] > 0.50:
+            expected.append("bright")
+        if quality["detail"] < 0.006:
+            expected.append("low_detail")
+        if (quality["issues"] != tuple(expected)
+                or quality["status"] != ("limited" if expected else "no_issue")):
+            raise ValueError("Invalid view assessment.")
     reasons = list(quality["issues"])
     distance = limit = None
     if (not isinstance(model, dict) or not _APPEARANCE_KEYS.issubset(model)
             or np.asarray(model.get("version")).shape != ()
             or np.asarray(model.get("version")).dtype.kind not in "iu"
-            or int(model["version"]) != 2):
+            or int(model["version"]) not in (2, 3)):
         reasons.append("profile_missing")
     else:
         try:
@@ -114,15 +147,19 @@ def AssessPrediction(image, model):
             "limit": limit, "quality": quality}
 
 
-def PredictInstrument(image, model):
+def PredictInstrument(image, model, calibrated=False, return_logits=False):
     features = ImageFeatures(image)
     try:
         if not isinstance(model, dict):
             raise ValueError("Invalid instrument model.")
         version = np.asarray(model.get("version"))
-        if version.shape != () or version.dtype.kind not in "iu" or version not in (1, 2):
+        if (version.shape != () or version.dtype.kind not in "iu" or version not in (1, 2, 3)
+                or not isinstance(calibrated, (bool, np.bool_))
+                or not isinstance(return_logits, (bool, np.bool_))):
             raise ValueError("Invalid instrument model.")
-        expected_keys = _MODEL_KEYS | _APPEARANCE_KEYS if version == 2 else _MODEL_KEYS
+        expected_keys = _MODEL_KEYS | (_APPEARANCE_KEYS if version >= 2 else set())
+        if version == 3:
+            expected_keys |= _CALIBRATION_KEYS
         if set(model) != expected_keys:
             raise ValueError("Invalid instrument model.")
         weights = np.asarray(model["weights"])
@@ -134,19 +171,47 @@ def PredictInstrument(image, model):
                 or any(value.dtype.kind != "f" or not np.all(np.isfinite(value))
                        for value in (weights, mean, scale, threshold))
                 or np.any(scale <= 0) or threshold.shape != () or not 0 < threshold < 1
-                or version.shape != () or version.dtype.kind not in "iu" or version not in (1, 2)
+                or version.shape != () or version.dtype.kind not in "iu" or version not in (1, 2, 3)
                 or not np.array_equal(model["feature_names"], _FEATURE_NAMES)):
             raise ValueError("Invalid instrument model.")
-        # produces classifier scores; these are not calibrated safety probabilities
+        # retains raw scores for every mask decision, including calibrated models
         logits = ((features - mean) / scale) @ weights[1:] + weights[0]
+        logits = np.clip(logits, -35, 35)
+        raw_logits = logits
+        if calibrated:
+            if version != 3:
+                raise ValueError("This model has no pixel calibration.")
+            temperature = np.asarray(model["calibration_temperature"])
+            bias = np.asarray(model["calibration_bias"])
+            if (temperature.shape != () or bias.shape != ()
+                    or temperature.dtype.kind != "f" or bias.dtype.kind != "f"
+                    or not np.isfinite(temperature) or temperature <= 0 or not np.isfinite(bias)):
+                raise ValueError("Invalid pixel calibration.")
+            logits = logits / float(temperature) + float(bias)
         scores = 1 / (1 + np.exp(-np.clip(logits, -35, 35)))
     except (KeyError, TypeError, ValueError, OverflowError):
         raise ValueError("Invalid instrument model.") from None
-    return scores.reshape(image.shape[:2])
+    scores = scores.reshape(image.shape[:2])
+    return (scores, raw_logits.reshape(image.shape[:2])) if return_logits else scores
 
 
-def EvaluateInstrument(image, mask, model):
-    scores = PredictInstrument(image, model)
+def EvaluateInstrument(image, mask, model, scores=None):
+    if scores is None:
+        scores = PredictInstrument(image, model)
+    else:
+        if (not isinstance(image, np.ndarray) or image.dtype != np.uint8
+                or image.ndim != 3 or image.shape[2] != 3 or min(image.shape[:2]) < 16
+                or not isinstance(scores, np.ndarray) or scores.shape != image.shape[:2]
+                or scores.dtype.kind != "f" or not np.all(np.isfinite(scores))
+                or np.any(scores < 0) or np.any(scores > 1)):
+            raise ValueError("Invalid instrument scores.")
+        try:
+            threshold = np.asarray(model["threshold"])
+            if (threshold.shape != () or threshold.dtype.kind != "f"
+                    or not np.isfinite(threshold) or not 0 < threshold < 1):
+                raise ValueError("Invalid instrument model.")
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise ValueError("Invalid instrument model.") from None
     if (not isinstance(mask, np.ndarray) or mask.dtype not in (np.dtype(bool), np.dtype(np.uint8))
             or mask.shape != scores.shape):
         raise ValueError("Invalid instrument mask.")
@@ -168,9 +233,11 @@ def LoadInstrument(path):
         with np.load(path, allow_pickle=False) as saved:
             model = {key: saved[key].copy() for key in saved.files}
         version = model["version"]
-        if version.shape != () or version.dtype.kind not in "iu" or version not in (1, 2):
+        if version.shape != () or version.dtype.kind not in "iu" or version not in (1, 2, 3):
             raise ValueError("Invalid instrument model.")
-        expected_keys = _MODEL_KEYS | _APPEARANCE_KEYS if version == 2 else _MODEL_KEYS
+        expected_keys = _MODEL_KEYS | (_APPEARANCE_KEYS if version >= 2 else set())
+        if version == 3:
+            expected_keys |= _CALIBRATION_KEYS
         if set(model) != expected_keys:
             raise ValueError("Invalid instrument model.")
         for key in ("weights", "mean", "scale", "threshold"):
@@ -180,7 +247,7 @@ def LoadInstrument(path):
                 or model["scale"].shape != (12,) or np.any(model["scale"] <= 0)
                 or model["threshold"].shape != () or not 0 < model["threshold"] < 1
                 or model["version"].shape != () or model["version"].dtype.kind not in "iu"
-                or model["version"] not in (1, 2) or model["feature_names"].dtype.kind != "U"
+                or model["version"] not in (1, 2, 3) or model["feature_names"].dtype.kind != "U"
                 or not np.array_equal(model["feature_names"], _FEATURE_NAMES)
                 or model["report_json"].shape != () or model["report_json"].dtype.kind != "U"):
             raise ValueError("Invalid instrument model.")
@@ -190,11 +257,23 @@ def LoadInstrument(path):
                 or validation.dtype.kind != "U" or not len(train) or not len(validation)):
             raise ValueError("Invalid instrument model.")
         groups = list(train) + list(validation)
+        calibration_groups = np.array([], dtype=str)
+        if version == 3:
+            calibration_groups = model["calibration_groups"]
+            temperature = model["calibration_temperature"]
+            bias = model["calibration_bias"]
+            if (calibration_groups.ndim != 1 or calibration_groups.dtype.kind != "U"
+                    or len(calibration_groups) < 2
+                    or temperature.shape != () or temperature.dtype.kind != "f"
+                    or not np.isfinite(temperature) or temperature <= 0
+                    or bias.shape != () or bias.dtype.kind != "f" or not np.isfinite(bias)):
+                raise ValueError("Invalid instrument model.")
+            groups += list(calibration_groups)
         if (len(groups) < 8 or len(set(groups)) != len(groups)
                 or any(len(group) != 64 or any(char not in "0123456789abcdef" for char in group)
                        for group in groups)):
             raise ValueError("Invalid instrument model.")
-        if version == 2:
+        if version >= 2:
             references = model["appearance_references"]
             profile_groups = model["appearance_groups"]
             appearance_limit = model["appearance_limit"]
@@ -227,8 +306,9 @@ def LoadInstrument(path):
             for category in ("clean", "degraded")}
         assignments = {group: "train" for group in train}
         assignments.update({group: "validation" for group in validation})
+        assignments.update({group: "calibration" for group in calibration_groups})
         represented = set()
-        frame_counts = {"train": 0, "validation": 0}
+        frame_counts = {"train": 0, "validation": 0, "calibration": 0}
         negative_fp = negative_pixels = 0
         for frame in report["frames"]:
             if (not isinstance(frame, dict) or not isinstance(frame.get("frame_id"), str)
@@ -252,7 +332,7 @@ def LoadInstrument(path):
                     raise ValueError("Invalid instrument model.")
                 if measured != value:
                     raise ValueError("Invalid instrument model.")
-            if version == 2:
+            if version >= 2:
                 reasons = frame.get("reasons")
                 distance = frame.get("distance")
                 if (type(frame.get("supported")) is not bool or not isinstance(reasons, list)
@@ -271,7 +351,7 @@ def LoadInstrument(path):
                 if tp + fn == 0:
                     negative_fp += fp
                     negative_pixels += fp + tn
-                if version == 2:
+                if version >= 2:
                     accepted = support_totals[frame["variant"]]
                     accepted["frames"] += 1
                     accepted["accepted" if frame["supported"] else "withheld"] += 1
@@ -308,7 +388,7 @@ def LoadInstrument(path):
         if negative_rate != (
                 negative_fp / negative_pixels if negative_pixels else None):
             raise ValueError("Invalid instrument model.")
-        if version == 2:
+        if version >= 2:
             support = report["support"]
             if (not isinstance(support, dict) or not isinstance(support.get("method"), str)
                     or not support["method"] or type(support.get("limit")) not in (int, float)
@@ -332,6 +412,94 @@ def LoadInstrument(path):
                         raise ValueError("Invalid instrument model.")
                     if measured != value:
                         raise ValueError("Invalid instrument model.")
+        if version == 3:
+            calibration = report["calibration"]
+            if (not isinstance(calibration, dict) or not isinstance(calibration.get("method"), str)
+                    or not calibration["method"] or calibration.get("source") not in ("external", "reserved")
+                    or type(calibration.get("groups")) is not int
+                    or calibration["groups"] != len(calibration_groups)
+                    or type(calibration.get("frames")) is not int
+                    or calibration["frames"] != frame_counts["calibration"]
+                    or type(calibration.get("samples")) is not int or calibration["samples"] <= 1
+                    or type(calibration.get("positive_samples")) is not int
+                    or not 0 < calibration["positive_samples"] < calibration["samples"]
+                    or type(calibration.get("temperature")) not in (int, float)
+                    or calibration["temperature"] != float(temperature)
+                    or type(calibration.get("bias")) not in (int, float)
+                    or calibration["bias"] != float(bias)):
+                raise ValueError("Invalid instrument model.")
+            for category in ("clean", "degraded"):
+                section = calibration[category]
+                if not isinstance(section, dict) or set(section) != {"raw", "calibrated"}:
+                    raise ValueError("Invalid instrument model.")
+                counts = totals[category]
+                pixels = sum(counts[key] for key in ("tp", "fp", "fn", "tn"))
+                positives = counts["tp"] + counts["fn"]
+                for kind in ("raw", "calibrated"):
+                    metrics = section[kind]
+                    if not pixels:
+                        if metrics is not None:
+                            raise ValueError("Invalid instrument model.")
+                        continue
+                    if (not isinstance(metrics, dict) or set(metrics) != _CALIBRATION_METRIC_KEYS
+                            or type(metrics["pixels"]) is not int or metrics["pixels"] != pixels
+                            or type(metrics["positives"]) is not int or metrics["positives"] != positives
+                            or type(metrics["bins"]) is not int or metrics["bins"] != 10
+                            or type(metrics["weight"]) not in (int, float) or metrics["weight"] != pixels
+                            or type(metrics["positive_weight"]) not in (int, float)
+                            or metrics["positive_weight"] != positives):
+                        raise ValueError("Invalid instrument model.")
+                    for key in ("prevalence", "brier", "nll", "ece"):
+                        value = metrics[key]
+                        if (type(value) not in (int, float) or not np.isfinite(value)
+                                or value < 0 or (key != "nll" and value > 1)):
+                            raise ValueError("Invalid instrument model.")
+                    if not np.isclose(metrics["prevalence"], positives / pixels, rtol=0, atol=1e-12):
+                        raise ValueError("Invalid instrument model.")
+                    for suffix in ("brier", "nll"):
+                        total_error = 0.0
+                        for label, mass in (("positive", positives), ("negative", pixels - positives)):
+                            value = metrics[label + "_" + suffix]
+                            if not mass:
+                                if value is not None:
+                                    raise ValueError("Invalid instrument model.")
+                            elif (type(value) not in (int, float) or not np.isfinite(value)
+                                  or value < 0 or (suffix == "brier" and value > 1)):
+                                raise ValueError("Invalid instrument model.")
+                            else:
+                                total_error += value * mass
+                        if not np.isclose(metrics[suffix], total_error / pixels, rtol=1e-10, atol=1e-12):
+                            raise ValueError("Invalid instrument model.")
+                    edges = metrics["bin_edges"]
+                    if (not isinstance(edges, list) or len(edges) != 11
+                            or any(type(value) not in (int, float) for value in edges)
+                            or not np.allclose(edges, np.linspace(0, 1, 11), rtol=0, atol=1e-12)):
+                        raise ValueError("Invalid instrument model.")
+                    for key in ("bin_counts", "bin_positive_counts", "bin_mean_probability", "bin_positive_fraction"):
+                        if not isinstance(metrics[key], list) or len(metrics[key]) != 10:
+                            raise ValueError("Invalid instrument model.")
+                    bin_pixels = bin_positives = 0
+                    ece = 0.0
+                    for index, (count, positive, mean_probability, fraction) in enumerate(zip(
+                            metrics["bin_counts"], metrics["bin_positive_counts"],
+                            metrics["bin_mean_probability"], metrics["bin_positive_fraction"])):
+                        if type(count) is not int or type(positive) is not int or not 0 <= positive <= count:
+                            raise ValueError("Invalid instrument model.")
+                        bin_pixels += count
+                        bin_positives += positive
+                        if not count:
+                            if mean_probability is not None or fraction is not None:
+                                raise ValueError("Invalid instrument model.")
+                            continue
+                        if (type(mean_probability) not in (int, float) or not np.isfinite(mean_probability)
+                                or not edges[index] - 1e-12 <= mean_probability <= edges[index + 1] + 1e-12
+                                or type(fraction) not in (int, float) or not np.isfinite(fraction)
+                                or not np.isclose(fraction, positive / count, rtol=0, atol=1e-12)):
+                            raise ValueError("Invalid instrument model.")
+                        ece += count / pixels * abs(mean_probability - fraction)
+                    if (bin_pixels != pixels or bin_positives != positives
+                            or not np.isclose(metrics["ece"], ece, rtol=1e-10, atol=1e-12)):
+                        raise ValueError("Invalid instrument model.")
     except (OSError, EOFError, BadZipFile, AttributeError, TypeError, ValueError, KeyError, OverflowError):
         raise ValueError("Invalid instrument model.") from None
     return model
@@ -346,86 +514,118 @@ def TrainInstrument(folder, output=None, seed=7, cancel=None):
         raise ValueError("Invalid capture folder.") from None
     if not (folder / "images").is_dir() or not (folder / "labels").is_dir():
         raise ValueError("Invalid capture folder.")
-    groups = {}
-    seen_images = {}
-    # groups matching physical snapshots before selecting any pixels or fitting a model
-    for label_path in sorted((folder / "labels").glob("frame_*.npz")):
-        if cancel is not None and cancel.is_set():
-            raise InterruptedError("Training cancelled.")
-        try:
-            with np.load(label_path, allow_pickle=False) as labels:
-                scenario = labels["scenario"]
-                camera = labels["camera_configuration"]
-                tool = labels["tool_configuration"]
-                breathing = labels["breathing_displacement_mm"]
-                mask = labels["semantic_mask"]
-                class_ids = labels["class_ids"]
-                class_names = labels["class_names"]
-                if (scenario.shape != () or scenario.dtype.kind != "U" or not str(scenario)
-                        or camera.shape != (3,) or tool.shape != (3,) or breathing.shape != ()
-                        or any(value.dtype.kind not in "fiu" or not np.all(np.isfinite(value))
-                               for value in (camera, tool, breathing))
-                        or mask.dtype != np.uint8 or mask.ndim != 2 or min(mask.shape) < 16
-                        or class_ids.ndim != 1 or class_ids.dtype.kind not in "iu"
-                        or class_names.shape != class_ids.shape or class_names.dtype.kind != "U"
-                        or len(np.unique(class_ids)) != len(class_ids)
-                        or len(np.unique(class_names)) != len(class_names)
-                        or np.any(class_ids < 0) or np.any(class_ids > 255)
-                        or list(class_names).count("instrument") != 1
-                        or int(class_ids[np.flatnonzero(class_names == "instrument")[0]]) != 1
-                        or not np.all(np.isin(mask, class_ids))):
-                    raise ValueError("Invalid training frame.")
-                camera = camera.astype(float)
-                tool = tool.astype(float)
-                camera[camera == 0] = 0.0
-                tool[tool == 0] = 0.0
-                snapshot = [str(scenario), camera.tolist(), tool.tolist(),
-                            float(breathing) if breathing != 0 else 0.0]
-            group_id = hashlib.sha256(json.dumps(snapshot, separators=(",", ":")).encode()).hexdigest()
-            group = groups.setdefault(group_id, [])
-            seen = seen_images.setdefault(group_id, set())
-            for variant, image_folder in (("clean", "images"), ("degraded", "degraded")):
-                image_path = folder / image_folder / (label_path.stem + ".png")
-                if variant == "degraded" and not image_path.exists():
-                    continue
-                if variant == "clean" and any(frame["variant"] == "clean" for frame in group):
-                    continue
-                with Image.open(image_path) as source:
-                    if source.mode != "RGB" or source.size != (mask.shape[1], mask.shape[0]):
+    calibration_folder = folder / "calibration"
+    external_calibration = calibration_folder.exists()
+    datasets = [("pool", folder)]
+    if external_calibration:
+        datasets.append(("calibration", calibration_folder))
+    groups_by_source = {}
+    physical_groups_by_source = {}
+    for source_name, capture_folder in datasets:
+        if not (capture_folder / "images").is_dir() or not (capture_folder / "labels").is_dir():
+            raise ValueError("Invalid calibration capture folder.")
+        groups = {}
+        seen_images = {}
+        # groups matching physical snapshots before selecting any pixels or fitting a model
+        for label_path in sorted((capture_folder / "labels").glob("frame_*.npz")):
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError("Training cancelled.")
+            try:
+                with np.load(label_path, allow_pickle=False) as labels:
+                    scenario = labels["scenario"]
+                    camera = labels["camera_configuration"]
+                    tool = labels["tool_configuration"]
+                    breathing = labels["breathing_displacement_mm"]
+                    mask = labels["semantic_mask"]
+                    class_ids = labels["class_ids"]
+                    class_names = labels["class_names"]
+                    if (scenario.shape != () or scenario.dtype.kind != "U" or not str(scenario)
+                            or camera.shape != (3,) or tool.shape != (3,) or breathing.shape != ()
+                            or any(value.dtype.kind not in "fiu" or not np.all(np.isfinite(value))
+                                   for value in (camera, tool, breathing))
+                            or mask.dtype != np.uint8 or mask.ndim != 2 or min(mask.shape) < 16
+                            or class_ids.ndim != 1 or class_ids.dtype.kind not in "iu"
+                            or class_names.shape != class_ids.shape or class_names.dtype.kind != "U"
+                            or len(np.unique(class_ids)) != len(class_ids)
+                            or len(np.unique(class_names)) != len(class_names)
+                            or np.any(class_ids < 0) or np.any(class_ids > 255)
+                            or list(class_names).count("instrument") != 1
+                            or int(class_ids[np.flatnonzero(class_names == "instrument")[0]]) != 1
+                            or not np.all(np.isin(mask, class_ids))):
                         raise ValueError("Invalid training frame.")
-                    pixels = np.asarray(source)
-                    digest = hashlib.sha256(pixels.tobytes()).hexdigest()
-                if digest in seen:
-                    continue
-                seen.add(digest)
-                group.append({"frame_id": label_path.stem, "group_id": group_id,
-                              "variant": variant, "image_path": image_path, "label_path": label_path,
-                              "image_digest": digest})
-        except (OSError, EOFError, BadZipFile, AttributeError, ValueError, TypeError, KeyError, IndexError, OverflowError):
-            raise ValueError("Invalid training frame.") from None
-    # also merges identical clean images whose metadata names a different snapshot
-    merged = {}
-    clean_groups = {}
-    merged_images = {}
-    for group_id, frames in groups.items():
-        clean_digest = next(frame["image_digest"] for frame in frames if frame["variant"] == "clean")
-        canonical = clean_groups.setdefault(clean_digest, group_id)
-        combined = merged.setdefault(canonical, [])
-        seen = merged_images.setdefault(canonical, set())
-        for frame in frames:
-            if frame["image_digest"] not in seen:
-                frame["group_id"] = canonical
-                combined.append(frame)
-                seen.add(frame["image_digest"])
-    groups = merged
+                    camera = camera.astype(float)
+                    tool = tool.astype(float)
+                    camera[camera == 0] = 0.0
+                    tool[tool == 0] = 0.0
+                    snapshot = [str(scenario), camera.tolist(), tool.tolist(),
+                                float(breathing) if breathing != 0 else 0.0]
+                group_id = hashlib.sha256(json.dumps(snapshot, separators=(",", ":")).encode()).hexdigest()
+                group = groups.setdefault(group_id, [])
+                seen = seen_images.setdefault(group_id, set())
+                for variant, image_folder in (("clean", "images"), ("degraded", "degraded")):
+                    image_path = capture_folder / image_folder / (label_path.stem + ".png")
+                    if variant == "degraded" and not image_path.exists():
+                        continue
+                    if variant == "clean" and any(frame["variant"] == "clean" for frame in group):
+                        continue
+                    with Image.open(image_path) as source:
+                        if source.mode != "RGB" or source.size != (mask.shape[1], mask.shape[0]):
+                            raise ValueError("Invalid training frame.")
+                        pixels = np.asarray(source)
+                        digest = hashlib.sha256(pixels.tobytes()).hexdigest()
+                    if digest in seen:
+                        continue
+                    seen.add(digest)
+                    group.append({"frame_id": (label_path.stem if source_name == "pool" else "calibration/" + label_path.stem),
+                                  "group_id": group_id, "source": source_name,
+                                  "variant": variant, "image_path": image_path, "label_path": label_path,
+                                  "image_digest": digest})
+            except (OSError, EOFError, BadZipFile, AttributeError, ValueError, TypeError, KeyError, IndexError, OverflowError):
+                raise ValueError("Invalid training frame.") from None
+        physical_groups_by_source[source_name] = set(groups)
+        # also merges identical clean images whose metadata names a different snapshot
+        merged = {}
+        clean_groups = {}
+        merged_images = {}
+        for group_id, frames in groups.items():
+            clean_digest = next(frame["image_digest"] for frame in frames if frame["variant"] == "clean")
+            canonical = clean_groups.setdefault(clean_digest, group_id)
+            combined = merged.setdefault(canonical, [])
+            seen = merged_images.setdefault(canonical, set())
+            for frame in frames:
+                if frame["image_digest"] not in seen:
+                    frame["group_id"] = canonical
+                    combined.append(frame)
+                    seen.add(frame["image_digest"])
+        groups = merged
+        groups_by_source[source_name] = groups
+    groups = groups_by_source["pool"]
     group_ids = sorted(groups)
-    if len(group_ids) < 8:
+    if external_calibration:
+        designated = groups_by_source["calibration"]
+        pool_digests = {frame["image_digest"] for frames in groups.values() for frame in frames}
+        calibration_digests = {frame["image_digest"] for frames in designated.values() for frame in frames}
+        if (physical_groups_by_source["pool"] & physical_groups_by_source["calibration"]
+                or pool_digests & calibration_digests):
+            raise ValueError("Calibration captures overlap the fitting or held-out pool.")
+        if len(group_ids) < 6 or len(designated) < 2:
+            raise ValueError("Need six pool groups and two distinct calibration groups.")
+    elif len(group_ids) < 8:
         raise ValueError("Need eight distinct snapshot groups.")
     rng = np.random.default_rng(seed)
     order = rng.permutation(len(group_ids))
     validation_count = max(1, int(np.ceil(len(group_ids) * 0.25)))
     validation_groups = sorted(group_ids[index] for index in order[:validation_count])
-    train_groups = sorted(group_ids[index] for index in order[validation_count:])
+    remaining = order[validation_count:]
+    if external_calibration:
+        calibration_groups = sorted(designated)
+        train_groups = sorted(group_ids[index] for index in remaining)
+        groups.update(designated)
+    else:
+        calibration_count = max(2, int(np.ceil(len(remaining) * 0.25)))
+        calibration_groups = sorted(group_ids[index] for index in remaining[:calibration_count])
+        train_groups = sorted(group_ids[index] for index in remaining[calibration_count:])
+    group_ids = sorted(groups)
     features = []
     targets = []
     # bounds sampling per group so repeated or augmented frames cannot dominate training
@@ -439,13 +639,12 @@ def TrainInstrument(folder, output=None, seed=7, cancel=None):
                 image = np.asarray(source)
             with np.load(frame["label_path"], allow_pickle=False) as labels:
                 truth = labels["semantic_mask"].reshape(-1) == 1
-            frame_features = ImageFeatures(image)
             for label in (False, True):
                 positions = np.flatnonzero(truth == label)
                 limit = quota + int(frame_index < remainder)
                 selected = rng.choice(positions, min(limit, len(positions)), replace=False)
                 if len(selected):
-                    features.append(frame_features[selected])
+                    features.append(ImageFeatures(image, positions=selected))
                     targets.append(np.full(len(selected), label, dtype=float))
     features = np.concatenate(features).astype(float)
     targets = np.concatenate(targets)
@@ -499,6 +698,38 @@ def TrainInstrument(folder, output=None, seed=7, cancel=None):
             appearance_groups.append(group_id)
     model.update(FitAppearance(appearance_images, appearance_groups))
     model["version"] = np.array(2, dtype=np.int64)
+    calibration_rng = np.random.default_rng([seed, 19571])
+    calibration_logits, calibration_labels, calibration_weights = [], [], []
+    for group_id in calibration_groups:
+        frames = groups[group_id]
+        quota, remainder = divmod(4000, len(frames))
+        for frame_index, frame in enumerate(frames):
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError("Training cancelled.")
+            with Image.open(frame["image_path"]) as source:
+                image = np.asarray(source)
+            with np.load(frame["label_path"], allow_pickle=False) as labels:
+                truth = labels["semantic_mask"].reshape(-1) == 1
+            logits = np.clip(((ImageFeatures(image) - mean) / scale) @ weights[1:] + weights[0], -35, 35)
+            for label in (False, True):
+                positions = np.flatnonzero(truth == label)
+                limit = quota + int(frame_index < remainder)
+                selected = calibration_rng.choice(positions, min(limit, len(positions)), replace=False)
+                if len(selected):
+                    calibration_logits.append(logits[selected])
+                    calibration_labels.append(np.full(len(selected), label, dtype=bool))
+                    # corrects class sampling while giving each physical group equal mass
+                    mass = len(positions) / len(selected) / truth.size / len(frames)
+                    calibration_weights.append(np.full(len(selected), mass))
+    calibration_logits = np.concatenate(calibration_logits)
+    calibration_labels = np.concatenate(calibration_labels)
+    calibration_weights = np.concatenate(calibration_weights)
+    parameters = FitCalibration(calibration_logits, calibration_labels,
+                                weights=calibration_weights, cancel=cancel)
+    model.update(calibration_temperature=np.array(parameters["temperature"]),
+                 calibration_bias=np.array(parameters["bias"]),
+                 calibration_groups=np.array(calibration_groups))
+    model["version"] = np.array(3, dtype=np.int64)
     report = {"version": 1, "seed": int(seed), "training_groups": len(train_groups),
               "validation_groups": len(validation_groups), "training_pixels": len(targets),
               "training_frames": sum(len(groups[group]) for group in train_groups),
@@ -506,7 +737,7 @@ def TrainInstrument(folder, output=None, seed=7, cancel=None):
               "features": _FEATURE_NAMES.tolist(), "threshold": float(model["threshold"]),
               "threshold_rule": "maximum aggregate training-frame IoU among eight fixed thresholds",
               "frames": [],
-              "note": "Experimental image-only pixel baseline; scores are not calibrated safety probabilities."}
+              "note": "Experimental image-only pixel baseline; pixel calibration does not establish surgical safety."}
     for category in ("clean", "degraded"):
         report[category] = {"frames": 0, "tp": 0, "fp": 0, "fn": 0, "tn": 0}
     report["support"] = {"method": "95th percentile leave-one-group-out RGB histogram distance",
@@ -515,9 +746,25 @@ def TrainInstrument(folder, output=None, seed=7, cancel=None):
     for category in ("clean", "degraded"):
         report["support"][category] = {"frames": 0, "accepted": 0, "withheld": 0,
                                        "tp": 0, "fp": 0, "fn": 0, "tn": 0}
+    report["calibration"] = {
+        "method": "Positive-slope logistic calibration on separate groups; class-sampling corrected, equal group weight",
+        "source": "external" if external_calibration else "reserved",
+        "groups": len(calibration_groups),
+        "frames": sum(len(groups[group]) for group in calibration_groups),
+        "samples": len(calibration_labels), "positive_samples": int(calibration_labels.sum()),
+        "temperature": parameters["temperature"], "bias": parameters["bias"]}
+    calibration_sums = {category: {kind: {
+        "pixels": 0, "positives": 0, "weight": 0.0, "positive_weight": 0.0,
+        "brier": 0.0, "nll": 0.0, "positive_brier": 0.0, "negative_brier": 0.0,
+        "positive_nll": 0.0, "negative_nll": 0.0,
+        "bin_counts": np.zeros(10, dtype=np.int64),
+        "bin_positive_counts": np.zeros(10, dtype=np.int64),
+        "bin_probability_sum": np.zeros(10)} for kind in ("raw", "calibrated")}
+        for category in ("clean", "degraded")}
     negative_fp = negative_pixels = 0
     for group_id in group_ids:
-        split = "validation" if group_id in validation_groups else "train"
+        split = ("validation" if group_id in validation_groups else
+                 "calibration" if group_id in calibration_groups else "train")
         for frame in groups[group_id]:
             if cancel is not None and cancel.is_set():
                 raise InterruptedError("Training cancelled.")
@@ -525,7 +772,8 @@ def TrainInstrument(folder, output=None, seed=7, cancel=None):
                 image = np.asarray(source)
             with np.load(frame["label_path"], allow_pickle=False) as labels:
                 mask = labels["semantic_mask"]
-            metrics = EvaluateInstrument(image, mask, model)
+            scores, logits = PredictInstrument(image, model, return_logits=True)
+            metrics = EvaluateInstrument(image, mask, model, scores=scores)
             assessment = AssessPrediction(image, model)
             report["frames"].append({"frame_id": frame["frame_id"], "group_id": group_id,
                                      "split": split, "variant": frame["variant"], **metrics,
@@ -533,6 +781,27 @@ def TrainInstrument(folder, output=None, seed=7, cancel=None):
                                      "reasons": list(assessment["reasons"]),
                                      "distance": assessment["distance"]})
             if split == "validation":
+                for kind in ("raw", "calibrated"):
+                    probabilities = (scores if kind == "raw" else 1 / (1 + np.exp(-np.clip(
+                        logits / parameters["temperature"] + parameters["bias"], -35, 35))))
+                    measured = CalibrationMetrics(probabilities.reshape(-1), (mask == 1).reshape(-1))
+                    sums = calibration_sums[frame["variant"]][kind]
+                    for key in ("pixels", "positives", "weight", "positive_weight"):
+                        sums[key] += measured[key]
+                    for key in ("brier", "nll"):
+                        sums[key] += measured[key] * measured["weight"]
+                    for label in ("positive", "negative"):
+                        mass = (measured["positive_weight"] if label == "positive" else
+                                measured["weight"] - measured["positive_weight"])
+                        for suffix in ("brier", "nll"):
+                            key = label + "_" + suffix
+                            sums[key] += 0 if measured[key] is None else measured[key] * mass
+                    counts = np.array(measured["bin_counts"])
+                    sums["bin_counts"] += counts
+                    sums["bin_positive_counts"] += measured["bin_positive_counts"]
+                    means = np.array([0 if value is None else value
+                                      for value in measured["bin_mean_probability"]])
+                    sums["bin_probability_sum"] += means * counts
                 aggregate = report[frame["variant"]]
                 aggregate["frames"] += 1
                 for key in ("tp", "fp", "fn", "tn"):
@@ -561,6 +830,34 @@ def TrainInstrument(folder, output=None, seed=7, cancel=None):
                         "recall": tp / (tp + fn) if tp + fn else None,
                         "iou": tp / (tp + fp + fn) if tp + fp + fn else None,
                         "false_positive_fraction": fp / (fp + tn) if fp + tn else None})
+        report["calibration"][category] = {}
+        for kind in ("raw", "calibrated"):
+            sums = calibration_sums[category][kind]
+            if not sums["pixels"]:
+                report["calibration"][category][kind] = None
+                continue
+            measured = {key: sums[key] for key in ("pixels", "positives", "weight", "positive_weight")}
+            measured["prevalence"] = sums["positive_weight"] / sums["weight"]
+            for key in ("brier", "nll"):
+                measured[key] = sums[key] / sums["weight"]
+            for label in ("positive", "negative"):
+                mass = (sums["positive_weight"] if label == "positive" else
+                        sums["weight"] - sums["positive_weight"])
+                for suffix in ("brier", "nll"):
+                    key = label + "_" + suffix
+                    measured[key] = sums[key] / mass if mass else None
+            counts, positives = sums["bin_counts"], sums["bin_positive_counts"]
+            means = np.divide(sums["bin_probability_sum"], counts,
+                              out=np.zeros(10), where=counts != 0)
+            fractions = np.divide(positives, counts, out=np.zeros(10), where=counts != 0)
+            measured.update(bins=10, bin_edges=np.linspace(0, 1, 11).tolist(),
+                            bin_counts=counts.tolist(), bin_positive_counts=positives.tolist(),
+                            bin_mean_probability=[float(value) if count else None
+                                                  for value, count in zip(means, counts)],
+                            bin_positive_fraction=[float(value) if count else None
+                                                   for value, count in zip(fractions, counts)],
+                            ece=float(np.sum(counts * np.abs(means - fractions)) / sums["pixels"]))
+            report["calibration"][category][kind] = measured
     report["negative_false_positive_fraction"] = negative_fp / negative_pixels if negative_pixels else None
     model["report_json"] = np.array(json.dumps(report, allow_nan=False, separators=(",", ":")))
     if output is not None:

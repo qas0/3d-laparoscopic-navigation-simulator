@@ -1,5 +1,5 @@
-from contextlib import ExitStack
 from pathlib import Path
+import tempfile
 
 import numpy as np
 import pyvista as pv
@@ -296,24 +296,43 @@ def SaveCapture(folder, rgb, labels, effects=None):
     while True:
         image_path = image_folder / f"frame_{index:06d}.png"
         label_path = label_folder / f"frame_{index:06d}.npz"
-        paths = [image_path, label_path]
+        # publishes labels last so readers discover only complete image-label pairs
+        paths = [image_path]
         if degraded is not None:
             paths.append(degraded_folder / image_path.name)
-        created = []
+        paths.append(label_path)
+        reservation = label_folder / f".frame_{index:06d}.reserve"
         try:
-            with ExitStack() as stack:
-                files = []
-                for path in paths:
-                    files.append(stack.enter_context(path.open("xb")))
-                    created.append(path)
-                Image.fromarray(rgb).save(files[0], format="PNG")
-                if degraded is not None:
-                    Image.fromarray(degraded).save(files[2], format="PNG")
-                np.savez_compressed(files[1], **labels)
+            with reservation.open("xb"):
+                pass
+        except FileExistsError:
+            index += 1
+            continue
+        temporary = []
+        created = []
+        publishing = False
+        try:
+            if any(path.exists() for path in paths):
+                index += 1
+                continue
+            for path in paths:
+                with tempfile.NamedTemporaryFile(dir=path.parent, prefix="." + path.stem,
+                                                 suffix=".tmp", delete=False) as saved:
+                    temporary.append(Path(saved.name))
+                    if path == label_path:
+                        np.savez_compressed(saved, **labels)
+                    else:
+                        Image.fromarray(rgb if path == image_path else degraded).save(saved, format="PNG")
+            publishing = True
+            for source, path in zip(temporary, paths):
+                if path.exists():
+                    raise FileExistsError(path)
+                source.rename(path)
+                created.append(path)
         except FileExistsError:
             for path in created:
                 path.unlink(missing_ok=True)
-            if len(created) == len(paths):
+            if not publishing:
                 raise
             index += 1
             continue
@@ -321,4 +340,8 @@ def SaveCapture(folder, rgb, labels, effects=None):
             for path in created:
                 path.unlink(missing_ok=True)
             raise
+        finally:
+            for path in temporary:
+                path.unlink(missing_ok=True)
+            reservation.unlink(missing_ok=True)
         return image_path, label_path

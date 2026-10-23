@@ -165,10 +165,33 @@ def find_path(start, target, port, tool_radius, structure_points, structure_radi
             or target_clearance + target_tolerance < required_clearance):
         return finish("invalid_target")
 
+    if cancel_event is not None and cancel_event.is_set():
+        return finish("cancelled")
+    if perf_counter() - started >= time_limit:
+        return finish("budget_exceeded")
+    # budgets 256 MiB at 512 bytes per node for arrays, goals + search bookkeeping
+    max_nodes = 256 * 1024 * 1024 // 512
+    counts, node_bound = [], 1
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        steps = (upper_limits - lower_limits) / grid_step
+    for step in steps:
+        if not np.isfinite(step) or step > max_nodes:
+            return finish("budget_exceeded")
+        count = int(np.floor(step + 1e-9))
+        counts.append(count)
+        # allows an upper endpoint, the actual start + an optional target
+        node_bound *= count + 3 + bool(include_target)
+        if node_bound > max_nodes:
+            return finish("budget_exceeded")
+
     axes = []
     start_node = []
     for axis in range(3):
-        count = int(np.floor((upper_limits[axis] - lower_limits[axis]) / grid_step[axis] + 1e-9))
+        if cancel_event is not None and cancel_event.is_set():
+            return finish("cancelled")
+        if perf_counter() - started >= time_limit:
+            return finish("budget_exceeded")
+        count = counts[axis]
         values = lower_limits[axis] + np.arange(count + 1) * grid_step[axis]
         if np.isclose(values[-1], upper_limits[axis], atol=1e-12, rtol=0):
             values[-1] = upper_limits[axis]
@@ -187,10 +210,22 @@ def find_path(start, target, port, tool_radius, structure_points, structure_radi
         axes.append(values)
         start_node.append(int(np.argmin(abs(values - start[axis]))))
     start_node = tuple(start_node)
+    if cancel_event is not None and cancel_event.is_set():
+        return finish("cancelled")
+    if perf_counter() - started >= time_limit:
+        return finish("budget_exceeded")
     configurations = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1)
+    if cancel_event is not None and cancel_event.is_set():
+        return finish("cancelled")
+    if perf_counter() - started >= time_limit:
+        return finish("budget_exceeded")
     directions = np.moveaxis(instrument_direction(configurations[..., 0],
                                                  configurations[..., 1]), 0, -1)
     tips = port + configurations[..., 2, None] * directions
+    if cancel_event is not None and cancel_event.is_set():
+        return finish("cancelled")
+    if perf_counter() - started >= time_limit:
+        return finish("budget_exceeded")
     distances = np.linalg.norm(tips - target, axis=-1)
     # uses straight-line distance to the target region as a lower bound on travel
     heuristic = np.maximum(0.0, distances - target_tolerance - 1e-9)

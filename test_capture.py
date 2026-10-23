@@ -1,8 +1,9 @@
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from multiprocessing import get_context
 from pathlib import Path
 import pickle
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -564,6 +565,101 @@ class CaptureTests(unittest.TestCase):
                 self.assertEqual(list(degraded_folder.iterdir()), [existing])
                 self.assertEqual(list((Path(folder) / "images").iterdir()), [])
                 self.assertEqual(list((Path(folder) / "labels").iterdir()), [])
+
+    def test_LabelsAppearOnlyAfterCompleteImagesAndArchiveHaveBeenWritten(self):
+        rgb = np.arange(24 * 32 * 3, dtype=np.uint8).reshape(24, 32, 3)
+        labels = {"marker": np.array(17)}
+        rename = Path.rename
+        saved = np.savez_compressed
+        observed = []
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+
+            def write_labels(output, **values):
+                self.assertEqual(list((root / "labels").glob("frame_*.npz")), [])
+                self.assertNotEqual(Path(output.name).suffix, ".npz")
+                saved(output, **values)
+
+            def publish(source, target):
+                target = Path(target)
+                if target.parent.name == "labels":
+                    self.assertFalse(target.exists())
+                    with np.load(source, allow_pickle=False) as archive:
+                        self.assertEqual(int(archive["marker"]), 17)
+                    for name in ("images", "degraded"):
+                        with Image.open(root / name / (target.stem + ".png")) as image:
+                            np.testing.assert_array_equal(np.asarray(image), rgb)
+                    observed.append(target)
+                return rename(source, target)
+
+            with patch("capture.np.savez_compressed", side_effect=write_labels), \
+                    patch.object(Path, "rename", publish):
+                _, label_path = SaveCapture(root, rgb, labels, effects={})
+            self.assertEqual(observed, [label_path])
+            self.assertFalse(list(root.rglob("*.tmp")))
+            self.assertFalse(list(root.rglob("*.reserve")))
+
+    def test_ConcurrentWritersKeepMatchingPayloadsWithoutOverwriting(self):
+        barrier = threading.Barrier(2)
+        saved = np.savez_compressed
+
+        def write_labels(output, **values):
+            barrier.wait(timeout=5)
+            saved(output, **values)
+
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(Path, "glob", return_value=[]), \
+                    patch("capture.np.savez_compressed", side_effect=write_labels), \
+                    ThreadPoolExecutor(max_workers=2) as workers:
+                futures = [workers.submit(SaveCapture, folder,
+                                          np.full((24, 32, 3), value, dtype=np.uint8),
+                                          {"marker": np.array(value)}, {}) for value in (30, 190)]
+                paths = [future.result(timeout=10) for future in futures]
+            self.assertEqual({image.stem for image, _ in paths}, {"frame_000001", "frame_000002"})
+            for image_path, label_path in paths:
+                with np.load(label_path, allow_pickle=False) as labels:
+                    value = int(labels["marker"])
+                for path in (image_path, Path(folder) / "degraded" / image_path.name):
+                    with Image.open(path) as image:
+                        np.testing.assert_array_equal(np.asarray(image), value)
+            self.assertEqual(len(list(Path(folder).rglob("*.*"))), 6)
+
+    def test_LabelPublicationFailureRemovesImagesAndPrivateFiles(self):
+        rgb = np.zeros((24, 32, 3), dtype=np.uint8)
+        rename = Path.rename
+
+        def publish(source, target):
+            if Path(target).parent.name == "labels":
+                raise OSError("label publication failed")
+            return rename(source, target)
+
+        with tempfile.TemporaryDirectory() as folder, patch.object(Path, "rename", publish):
+            with self.assertRaisesRegex(OSError, "publication"):
+                SaveCapture(folder, rgb, {}, effects={})
+            self.assertTrue(all(path.is_dir() for path in Path(folder).rglob("*")))
+
+    def test_PublicationCollisionKeepsCompetingLabelsAndRetriesAtTheNextIndex(self):
+        rgb = np.zeros((24, 32, 3), dtype=np.uint8)
+        rename = Path.rename
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            competing = root / "labels" / "frame_000001.npz"
+
+            def publish(source, target):
+                result = rename(source, target)
+                if Path(target) == root / "images" / "frame_000001.png":
+                    competing.write_bytes(b"keep competing labels")
+                return result
+
+            with patch.object(Path, "rename", publish):
+                image_path, label_path = SaveCapture(folder, rgb, {}, effects={})
+            self.assertEqual(competing.read_bytes(), b"keep competing labels")
+            self.assertEqual(image_path.stem, "frame_000002")
+            self.assertEqual(label_path.stem, image_path.stem)
+            self.assertFalse((root / "images" / "frame_000001.png").exists())
+            self.assertFalse((root / "degraded" / "frame_000001.png").exists())
+            self.assertFalse(list(root.rglob("*.tmp")))
+            self.assertFalse(list(root.rglob("*.reserve")))
 
     def test_InvalidDegradationSettingsFailBeforeCreatingCaptureFolders(self):
         rgb = np.zeros((24, 32, 3), dtype=np.uint8)

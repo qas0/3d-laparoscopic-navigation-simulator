@@ -675,11 +675,12 @@ class SensitivityStudyTests(unittest.TestCase):
         settings = dict(tracking="filtered", tool_noise=1.0, target_noise=0.5,
                         tool_bias=(0.2, 0.0, 0.0), warmup=0.5, duration=0.6,
                         planning_time_limit=30.0)
-        with patch("experiments.find_path", side_effect=RecordPlanning):
+        with patch("experiments.find_path", side_effect=RecordPlanning) as planner:
             study = RunSensitivityStudy(levels=[0.0, 0.5, 1.0, 2.0], seeds=[5],
                                         parameter="uncertainty_scale", **settings)
         self.assertEqual(len(study["comparisons"]), 4)
         self.assertEqual(len(margins), 4)
+        self.assertEqual(planner.call_count, 6)
         first = study["comparisons"][0]
         offset, covariance = margins[0]
         offset_allowance = float(np.linalg.norm(offset))
@@ -710,6 +711,61 @@ class SensitivityStudyTests(unittest.TestCase):
                 for key, value in trial["plan"].items():
                     if key not in ("path", "time"):
                         self.assertEqual(value, control["plan"][key], key)
+                self.assertEqual(trial["settings"]["uncertainty_scale"], level)
+                self.assertEqual(trial["plan"]["time"], control["plan"]["time"])
+                self.assertEqual(trial.get("reused", False), level != study["levels"][0])
+                if level != study["levels"][0]:
+                    self.assertIsNot(trial["settings"], control["settings"])
+                    self.assertFalse(np.shares_memory(trial["configuration"],
+                                                      control["configuration"]))
+                    self.assertFalse(np.shares_memory(trial["plan"]["path"],
+                                                      control["plan"]["path"]))
+
+    def test_ControlReuseIsLimitedToOneUncertaintyStudy(self):
+        settings = dict(warmup=0.0, duration=0.2, target_noise=0.0)
+        with patch("experiments.RunTrial", wraps=RunTrial) as trial:
+            for noise in (0.0, 1.0):
+                trial.reset_mock()
+                study = RunSensitivityStudy("Inaccessible target", seeds=[2, 5],
+                                            parameter="uncertainty_scale", levels=[0.0, 1.0],
+                                            tool_noise=noise, **settings)
+                self.assertEqual(trial.call_count, 8)
+                self.assertTrue(all(result["settings"]["tool_noise"] == noise
+                                    for comparison in study["comparisons"]
+                                    for result in comparison["trials"]))
+            for parameter in ("tool_noise", "reject_outliers"):
+                trial.reset_mock()
+                study = RunSensitivityStudy("Inaccessible target", seeds=[2, 5],
+                                            parameter=parameter, levels=[0.0, 1.0], **settings)
+                self.assertEqual(trial.call_count, 12)
+                self.assertFalse(any(result.get("reused", False)
+                                     for comparison in study["comparisons"]
+                                     for result in comparison["trials"]))
+
+    def test_CancellationDuringReusedControlsRetainsProgressAndStopsBeforeTheNextCopy(self):
+        cancelled, progress = Event(), []
+
+        def StopStudy(update):
+            progress.append(update)
+            if update[0] == 4:
+                cancelled.set()
+
+        with patch("experiments.RunTrial", wraps=RunTrial) as trial:
+            study = RunSensitivityStudy("Inaccessible target", seeds=[4],
+                                        parameter="uncertainty_scale", levels=[0.0, 1.0],
+                                        progress=StopStudy, cancel_event=cancelled,
+                                        warmup=0.0, duration=0.2, target_noise=0.0)
+        self.assertEqual(trial.call_count, 3)
+        self.assertTrue(study["cancelled"])
+        self.assertEqual(len(study["comparisons"]), 2)
+        self.assertEqual(progress, [(1, 6, "conventional", 4), (2, 6, "prox_aware", 4),
+                                    (3, 6, "uncert_aware", 4), (4, 6, "conventional", 4)])
+        partial = study["comparisons"][1]
+        self.assertTrue(partial["cancelled"])
+        self.assertEqual(len(partial["trials"]), 1)
+        self.assertTrue(partial["trials"][0]["reused"])
+        self.assertEqual(partial["summary"]["conventional"]["trials"], 1)
+        self.assertEqual(partial["summary"]["prox_aware"]["trials"], 0)
 
     def test_DefaultLevelsMatchTheSelectedParameter(self):
         for parameter, levels in (("tool_noise", [0.0, 1.0, 2.0, 4.0]),
